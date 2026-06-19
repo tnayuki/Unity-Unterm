@@ -164,6 +164,22 @@ pub extern "C" fn unterm_scroll(id: u64, delta: i32) {
     with_term(id, (), |t| t.scroll(delta));
 }
 
+/// Clear scrollback and redraw a fresh prompt (emulator-level clear).
+#[no_mangle]
+pub extern "C" fn unterm_clear(id: u64) {
+    with_term(id, (), |t| t.clear());
+}
+
+/// Paste UTF-8 text (honors bracketed-paste mode).
+#[no_mangle]
+pub unsafe extern "C" fn unterm_paste(id: u64, text: *const c_char) {
+    if text.is_null() {
+        return;
+    }
+    let s = cstr(text);
+    with_term(id, (), |t| t.paste(&s));
+}
+
 /// Render the current grid into the IOSurface and clear the dirty flag.
 #[no_mangle]
 pub extern "C" fn unterm_render(id: u64) {

@@ -218,6 +218,38 @@ impl Terminal {
         self.renderer.read_rgba()
     }
 
+    /// Clear the scrollback and ask the shell to redraw a fresh prompt — the
+    /// emulator-level "clear" (Terminal.app's Cmd-K): drop history, jump to the
+    /// bottom, then send Ctrl-L so the shell repaints a clean prompt.
+    pub fn clear(&mut self) {
+        if let Ok(mut t) = self.term.lock() {
+            t.grid_mut().clear_history();
+            t.scroll_display(Scroll::Bottom);
+        }
+        self.send(&[0x0c]);
+    }
+
+    /// Paste text. Honors bracketed-paste mode (so editors/REPLs can tell a
+    /// paste from typing and won't auto-run pasted newlines); otherwise newlines
+    /// are normalized to CR so each line submits like Enter.
+    pub fn paste(&mut self, text: &str) {
+        let bracketed = self
+            .term
+            .lock()
+            .map(|t| t.mode().contains(TermMode::BRACKETED_PASTE))
+            .unwrap_or(false);
+        if bracketed {
+            let mut bytes = Vec::with_capacity(text.len() + 12);
+            bytes.extend_from_slice(b"\x1b[200~");
+            bytes.extend_from_slice(text.as_bytes());
+            bytes.extend_from_slice(b"\x1b[201~");
+            self.send(&bytes);
+        } else {
+            let normalized = text.replace("\r\n", "\r").replace('\n', "\r");
+            self.send(normalized.as_bytes());
+        }
+    }
+
     /// Change the HiDPI scale, keeping the pixel size (re-derives the grid).
     pub fn set_scale(&mut self, scale: f32) {
         let (w, h) = self.renderer.size();

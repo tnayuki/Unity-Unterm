@@ -55,7 +55,8 @@ namespace Unterm.Editor
         private CreateFn _create; private ExistsFn _exists; private IdFn _destroy; private ResizeFn _resize;
         private SetScaleFn _setScale; private SetFontFn _setFont; private SetFontSizeFn _setFontSize;
         private SetColorsFn _setColors; private SetFocusFn _setFocus; private SendTextFn _sendText;
-        private SendKeyFn _sendKey; private ScrollFn _scroll; private IdFn _render; private BoolFn _dirty;
+        private SendKeyFn _sendKey; private SendTextFn _paste; private IdFn _clear;
+        private ScrollFn _scroll; private IdFn _render; private BoolFn _dirty;
         private BoolFn _isAlive; private PtrFn _iosurface; private PtrFn _rawTexture; private PixelsFn _getPixels;
         private SizeFn _size; private SizeFn _gridSize; private TitleFn _title;
 
@@ -98,6 +99,8 @@ namespace Unterm.Editor
             _setFocus = Sym<SetFocusFn>("unterm_set_focus");
             _sendText = Sym<SendTextFn>("unterm_send_text");
             _sendKey = Sym<SendKeyFn>("unterm_send_key");
+            _paste = Sym<SendTextFn>("unterm_paste");
+            _clear = Sym<IdFn>("unterm_clear");
             _scroll = Sym<ScrollFn>("unterm_scroll");
             _render = Sym<IdFn>("unterm_render");
             _dirty = Sym<BoolFn>("unterm_dirty");
@@ -139,6 +142,8 @@ namespace Unterm.Editor
         public void SetFocus(ulong id, bool focused) => _setFocus(id, focused);
         public void SendText(ulong id, string text) { if (!string.IsNullOrEmpty(text)) _sendText(id, text); }
         public void SendKey(ulong id, string name, bool ctrl, bool alt, bool shift) => _sendKey(id, name, ctrl, alt, shift);
+        public void Paste(ulong id, string text) { if (!string.IsNullOrEmpty(text)) _paste(id, text); }
+        public void Clear(ulong id) => _clear(id);
         public void Scroll(ulong id, int delta) => _scroll(id, delta);
         public void Render(ulong id) => _render(id);
         public bool Dirty(ulong id) => _dirty(id);

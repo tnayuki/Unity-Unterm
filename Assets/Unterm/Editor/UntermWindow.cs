@@ -299,9 +299,12 @@ namespace Unterm.Editor
             }
         }
 
-        private void ChangeFont(float delta)
+        private void ChangeFont(float delta) => SetFont(_fontPt + delta);
+        private void ResetFont() => SetFont(DefaultFontPt);
+
+        private void SetFont(float points)
         {
-            _fontPt = Mathf.Clamp(_fontPt + delta, 8f, 32f);
+            _fontPt = Mathf.Clamp(points, 8f, 32f);
             if (_native != null && Tid != 0)
             {
                 _native.SetFontSize(Tid, _fontPt);
@@ -353,15 +356,37 @@ namespace Unterm.Editor
 
             if (e.type != EventType.KeyDown) return;
 
-            // Cmd shortcuts: paste / (future) copy. Don't forward Cmd to the PTY.
+            // While the terminal is focused it claims the keyboard: handle the
+            // emulator-level Cmd shortcuts and swallow every other Cmd combo so
+            // Unity's global shortcuts don't fire underneath. (macOS menu-bar
+            // accelerators such as Cmd-S/W/Q are taken by the OS before the
+            // window, so those still reach Unity. Cmd isn't a PTY modifier, so
+            // unmapped combos simply stop here rather than going to the shell.)
             if (e.command)
             {
-                if (e.keyCode == KeyCode.V)
+                switch (e.keyCode)
                 {
-                    string clip = EditorGUIUtility.systemCopyBuffer;
-                    if (!string.IsNullOrEmpty(clip)) _native.SendText(Tid, clip);
-                    e.Use();
+                    case KeyCode.V:
+                        _native.Paste(Tid, EditorGUIUtility.systemCopyBuffer);
+                        break;
+                    case KeyCode.K:
+                        _native.Clear(Tid);
+                        break;
+                    case KeyCode.Equals:      // Cmd-= and Cmd-+ (shifted '=')
+                    case KeyCode.Plus:
+                    case KeyCode.KeypadPlus:
+                        ChangeFont(+1f);
+                        break;
+                    case KeyCode.Minus:
+                    case KeyCode.KeypadMinus:
+                        ChangeFont(-1f);
+                        break;
+                    case KeyCode.Alpha0:
+                    case KeyCode.Keypad0:
+                        ResetFont();
+                        break;
                 }
+                e.Use();
                 return;
             }
 
