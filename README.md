@@ -4,6 +4,8 @@ A native terminal window for the Unity Editor on macOS — a real PTY-backed
 shell rendered by a Rust/wgpu engine (zero-copy via IOSurface/Metal) and
 hosted inside an `EditorWindow`.
 
+![Unterm running inside the Unity Editor](docs/demo.gif)
+
 ## Why
 
 Editor work constantly bounces out to a terminal — `git`, build scripts,
