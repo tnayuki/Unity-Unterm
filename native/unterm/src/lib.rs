@@ -80,7 +80,27 @@ pub unsafe extern "C" fn unterm_create(
 ) -> u64 {
     init_log();
     let cwd = cstr(cwd);
-    let terminal = Terminal::new(width, height, scale, &cwd);
+    let terminal = Terminal::new(width, height, scale, &cwd, "");
+    let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    registry().lock().unwrap().insert(id, Box::new(terminal));
+    id
+}
+
+/// Like `unterm_create`, but launches `command` directly in the PTY (via the
+/// login+interactive `$SHELL`) instead of an interactive shell. Used to start
+/// `claude` without typing into a shell. Returns a stable id (0 on error).
+#[no_mangle]
+pub unsafe extern "C" fn unterm_create_command(
+    width: u32,
+    height: u32,
+    scale: f32,
+    cwd: *const c_char,
+    command: *const c_char,
+) -> u64 {
+    init_log();
+    let cwd = cstr(cwd);
+    let command = cstr(command);
+    let terminal = Terminal::new(width, height, scale, &cwd, &command);
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
     registry().lock().unwrap().insert(id, Box::new(terminal));
     id

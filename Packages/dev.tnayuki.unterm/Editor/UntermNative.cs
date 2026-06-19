@@ -31,6 +31,7 @@ namespace Unterm.Editor
 
         // --- terminal registry C ABI (id-based; survives reload) ---
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate ulong CreateFn(uint w, uint h, float scale, [MarshalAs(UnmanagedType.LPUTF8Str)] string cwd);
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate ulong CreateCommandFn(uint w, uint h, float scale, [MarshalAs(UnmanagedType.LPUTF8Str)] string cwd, [MarshalAs(UnmanagedType.LPUTF8Str)] string command);
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)] [return: MarshalAs(UnmanagedType.I1)] private delegate bool ExistsFn(ulong id);
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate void IdFn(ulong id);
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate void ResizeFn(ulong id, uint w, uint h, float scale);
@@ -56,7 +57,7 @@ namespace Unterm.Editor
         private string _shadowPath;
         private bool _stable;
 
-        private CreateFn _create; private ExistsFn _exists; private IdFn _destroy; private ResizeFn _resize;
+        private CreateFn _create; private CreateCommandFn _createCommand; private ExistsFn _exists; private IdFn _destroy; private ResizeFn _resize;
         private SetScaleFn _setScale; private SetFontFn _setFont; private SetFontSizeFn _setFontSize;
         private SetColorsFn _setColors; private SetFocusFn _setFocus; private SendTextFn _sendText;
         private SendKeyFn _sendKey; private SendTextFn _paste; private IdFn _clear;
@@ -94,6 +95,7 @@ namespace Unterm.Editor
                 throw new Exception($"dlopen failed: {ReadDlError()}");
 
             _create = Sym<CreateFn>("unterm_create");
+            _createCommand = Sym<CreateCommandFn>("unterm_create_command");
             _exists = Sym<ExistsFn>("unterm_exists");
             _destroy = Sym<IdFn>("unterm_destroy");
             _resize = Sym<ResizeFn>("unterm_resize");
@@ -142,6 +144,9 @@ namespace Unterm.Editor
             p == IntPtr.Zero ? string.Empty : Marshal.PtrToStringUTF8(p, (int)len.ToUInt64());
 
         public ulong Create(uint w, uint h, float scale, string cwd) => _create(w, h, scale, cwd ?? string.Empty);
+        /// Create a terminal that launches `command` directly in the PTY (no shell prompt / typed input).
+        public ulong CreateCommand(uint w, uint h, float scale, string cwd, string command) =>
+            _createCommand(w, h, scale, cwd ?? string.Empty, command ?? string.Empty);
         public bool Exists(ulong id) => id != 0 && _exists(id);
         public void Destroy(ulong id) { if (id != 0) _destroy(id); }
         public void Resize(ulong id, uint w, uint h, float scale) => _resize(id, w, h, scale);
@@ -202,7 +207,7 @@ namespace Unterm.Editor
                 dlclose(_handle);
                 _handle = IntPtr.Zero;
             }
-            _create = null; _exists = null; _destroy = null; _resize = null; _setScale = null;
+            _create = null; _createCommand = null; _exists = null; _destroy = null; _resize = null; _setScale = null;
             _setFont = null; _setFontSize = null; _setColors = null; _setFocus = null;
             _sendText = null; _sendKey = null; _scroll = null; _render = null; _dirty = null;
             _selStart = null; _selUpdate = null; _selClear = null; _selText = null;

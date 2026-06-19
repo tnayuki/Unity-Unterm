@@ -20,9 +20,13 @@ pub struct PtyHandles {
     pub writer: Box<dyn Write + Send>,
 }
 
-/// Spawn `shell` on a fresh PTY of `cols`x`rows`, rooted at `cwd`.
+/// Spawn `shell` (with `args`) on a fresh PTY of `cols`x`rows`, rooted at `cwd`.
+/// `args` is empty for a plain interactive shell; the command-launch path passes
+/// `-lic "exec <command>"` so the shell sources rc (resolving PATH) then execs
+/// the program directly as the PTY leader.
 pub fn spawn(
     shell: &str,
+    args: &[String],
     cwd: &str,
     cols: u16,
     rows: u16,
@@ -35,6 +39,9 @@ pub fn spawn(
     })?;
 
     let mut cmd = CommandBuilder::new(shell);
+    for a in args {
+        cmd.arg(a);
+    }
     if !cwd.is_empty() {
         cmd.cwd(cwd);
     }

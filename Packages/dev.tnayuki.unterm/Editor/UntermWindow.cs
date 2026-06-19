@@ -69,6 +69,9 @@ namespace Unterm.Editor
         private Texture2D _imeBgTex;
 
         private static bool s_reloading;
+        // A one-shot command for the next terminal created by CreateRunning; null
+        // for a plain interactive shell. Consumed in LoadNative on fresh create.
+        private static string s_pendingCommand;
 
         // The native terminal is macOS-only (IOSurface/Metal zero-copy path), so
         // only register the menu item when the Editor itself runs on macOS.
@@ -81,6 +84,28 @@ namespace Unterm.Editor
             w.minSize = new Vector2(240, 120);
             w.Show();
             w.Focus();
+        }
+
+        // Open a terminal that launches `command` directly in the PTY (not typed
+        // into a shell). The terminal is created synchronously in OnEnable during
+        // CreateWindow, so the command is handed to LoadNative via s_pendingCommand
+        // and consumed there for the fresh terminal. Used by the Claude Code menu.
+        internal static UntermWindow CreateRunning(string title, string command)
+        {
+            s_pendingCommand = command;
+            try
+            {
+                var w = CreateWindow<UntermWindow>();
+                w.titleContent = new GUIContent(title);
+                w.minSize = new Vector2(240, 120);
+                w.Show();
+                w.Focus();
+                return w;
+            }
+            finally
+            {
+                s_pendingCommand = null;
+            }
         }
 #endif
 
@@ -150,9 +175,14 @@ namespace Unterm.Editor
                 var (w, h) = CurrentPixelSize();
 
                 // Re-adopt the existing terminal across reload, else create one.
+                // A pending command (e.g. Claude Code) launches directly in the
+                // PTY; otherwise a plain interactive shell. Re-adoption skips this,
+                // so a running command survives reloads without relaunching.
                 if (Tid == 0 || !_native.Exists(Tid))
                 {
-                    _termIdRaw = (long)_native.Create(w, h, ppp, ProjectRoot);
+                    _termIdRaw = string.IsNullOrEmpty(s_pendingCommand)
+                        ? (long)_native.Create(w, h, ppp, ProjectRoot)
+                        : (long)_native.CreateCommand(w, h, ppp, ProjectRoot, s_pendingCommand);
                     ApplyFont();
                     _native.SetFontSize(Tid, _fontPt);
                 }

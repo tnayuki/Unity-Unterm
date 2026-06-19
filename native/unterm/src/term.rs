@@ -112,15 +112,23 @@ pub struct Terminal {
 
 impl Terminal {
     /// Create a terminal sized to `width`x`height` physical pixels at `scale`,
-    /// rooted at `cwd` (empty = inherit), running `$SHELL`.
-    pub fn new(width: u32, height: u32, scale: f32, cwd: &str) -> Self {
+    /// rooted at `cwd` (empty = inherit). With an empty `command` it runs an
+    /// interactive `$SHELL`; otherwise it launches `command` directly in the PTY
+    /// via `$SHELL -lic "exec <command>"`, so rc is sourced (PATH resolves) and
+    /// the program replaces the shell as the PTY leader — no typed-ahead input.
+    pub fn new(width: u32, height: u32, scale: f32, cwd: &str, command: &str) -> Self {
         let scale = scale.max(0.5);
         let mut renderer = Renderer::new(width.max(1), height.max(1));
         renderer.set_scale(scale);
         let (cols, rows) = renderer.cell_grid_size();
 
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
-        let handles = pty::spawn(&shell, cwd, cols as u16, rows as u16)
+        let args: Vec<String> = if command.is_empty() {
+            Vec::new()
+        } else {
+            vec!["-lic".to_string(), format!("exec {command}")]
+        };
+        let handles = pty::spawn(&shell, &args, cwd, cols as u16, rows as u16)
             .expect("unterm: failed to spawn shell on PTY");
 
         let writer = Arc::new(Mutex::new(handles.writer));
