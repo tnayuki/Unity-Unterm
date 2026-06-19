@@ -25,7 +25,7 @@ for arch in "${ARCHS[@]}"; do
   cargo build -p unterm "${CARGO_FLAGS[@]}" --target "$arch"
 done
 
-DEST="../Assets/Unterm/Plugins/macOS/unterm.bundle"
+DEST="../Packages/dev.tnayuki.unterm/Editor/Plugins/macOS/unterm.bundle"
 mkdir -p "$(dirname "$DEST")"
 
 LIBS=()

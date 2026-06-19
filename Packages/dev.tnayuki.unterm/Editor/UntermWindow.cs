@@ -72,8 +72,36 @@ namespace Unterm.Editor
         }
 #endif
 
-        private static string BundlePath =>
-            Path.Combine(Application.dataPath, "Unterm/Plugins/macOS/unterm.bundle");
+        // GUID of unterm.bundle.meta. Resolving by GUID makes the loader agnostic
+        // to where the plugin lives: embedded under Assets/, an embedded package
+        // under Packages/, or a git/registry package cached in Library/PackageCache.
+        private const string BundleGuid = "54ea61c3e6ad54b688596fae0846fc88";
+
+        private static string BundlePath
+        {
+            get
+            {
+                var assetPath = AssetDatabase.GUIDToAssetPath(BundleGuid);
+                if (string.IsNullOrEmpty(assetPath))
+                {
+                    // Fallback to the in-repo source layout.
+                    return Path.Combine(Application.dataPath, "Unterm/Plugins/macOS/unterm.bundle");
+                }
+
+                // Map the virtual asset path to a physical one. For packages cached
+                // under Library/PackageCache the "Packages/<name>" prefix is virtual,
+                // so resolve it through PackageInfo.resolvedPath.
+                var pkg = UnityEditor.PackageManager.PackageInfo.FindForAssetPath(assetPath);
+                if (pkg != null)
+                {
+                    var prefix = "Packages/" + pkg.name;
+                    var rel = assetPath.Substring(prefix.Length).TrimStart('/');
+                    return Path.Combine(pkg.resolvedPath, rel);
+                }
+
+                return Path.GetFullPath(assetPath);
+            }
+        }
 
         private static string ProjectRoot =>
             Directory.GetParent(Application.dataPath)?.FullName ?? Application.dataPath;

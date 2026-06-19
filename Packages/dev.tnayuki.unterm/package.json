@@ -1,0 +1,19 @@
+{
+  "name": "dev.tnayuki.unterm",
+  "displayName": "Unterm",
+  "version": "0.1.0",
+  "unity": "6000.5",
+  "description": "A native (Rust/wgpu) terminal window for the Unity Editor on macOS. Runs a real PTY-backed shell inside an EditorWindow, with IME input, mouse selection, copy/paste, and survival across domain reloads.",
+  "author": {
+    "name": "tnayuki",
+    "url": "https://github.com/tnayuki"
+  },
+  "license": "MIT",
+  "keywords": [
+    "editor",
+    "terminal",
+    "pty",
+    "shell",
+    "macos"
+  ]
+}

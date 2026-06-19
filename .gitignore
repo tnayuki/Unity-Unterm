@@ -107,7 +107,8 @@ InitTestScene*.unity*
 
 # === Unterm native (Rust) ===
 # Rust intermediate build output (not distributed). The built .bundle under
-# Assets/Unterm/Plugins/macOS is committed so the plugin ships with the project.
+# Packages/dev.tnayuki.unterm/Editor/Plugins/macOS is committed so the plugin
+# ships with the package.
 /native/target/
 # Headless example output
 /native/unterm.png
