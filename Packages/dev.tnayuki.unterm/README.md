@@ -21,6 +21,8 @@ start in the project root.
 - **Selection** — drag to select; double/triple-click for word/line.
 - **Copy / Paste** — right-click menu, or the usual editor shortcuts;
   bracketed paste is supported.
+- **Scrollback** — scroll the wheel to page back through history; an overlay
+  scrollbar appears on the right edge and can be dragged to any position.
 - **Domain reloads** — the shell and scrollback live in the native plugin,
   so they survive C# recompiles. The window re-adopts its terminal after a
   reload instead of restarting the shell.
