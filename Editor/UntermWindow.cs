@@ -37,10 +37,14 @@ namespace Unterm.Editor
         // IME engages. Plain typing + committed IME text land in `_imeBuffer`
         // and are flushed to the PTY each frame; the in-progress composition is
         // drawn at the cursor. `_composing` is snapshotted at Layout so key
-        // handling is stable within a frame.
+        // handling is stable within a frame. `_composeJustEnded` marks the frame
+        // a composition was committed so the Enter that committed it is swallowed
+        // instead of being forwarded to the PTY ahead of the committed text.
         private const string InputControl = "UntermInput";
         private string _imeBuffer = "";
         private bool _composing;
+        private bool _prevComposing;
+        private bool _composeJustEnded;
         private bool _refocus;
 
         // Mouse selection: a drag from MouseDown extends the highlight; a plain
@@ -324,8 +328,16 @@ namespace Unterm.Editor
         private void OnGUI()
         {
             // Snapshot IME composition once per frame for stable key handling.
+            // A non-empty -> empty transition means a composition was just
+            // committed; the OS clears compositionString in the same event that
+            // delivers the committing Enter, so flag that frame to swallow it.
             if (Event.current.type == EventType.Layout)
-                _composing = !string.IsNullOrEmpty(Input.compositionString);
+            {
+                bool now = !string.IsNullOrEmpty(Input.compositionString);
+                _composeJustEnded = _prevComposing && !now;
+                _prevComposing = now;
+                _composing = now;
+            }
 
             DrawToolbar();
 
@@ -605,6 +617,17 @@ namespace Unterm.Editor
                         ResetFont();
                         break;
                 }
+                e.Use();
+                return;
+            }
+
+            // The Enter that commits an IME composition arrives after the Layout
+            // that cleared compositionString, so `_composing` no longer guards it.
+            // Swallow it here: the committed phrase is in `_imeBuffer` and flushes
+            // this frame, and forwarding the Enter would send a CR ahead of it.
+            if (_composeJustEnded &&
+                (e.keyCode == KeyCode.Return || e.keyCode == KeyCode.KeypadEnter))
+            {
                 e.Use();
                 return;
             }
