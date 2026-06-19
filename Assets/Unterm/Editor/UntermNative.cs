@@ -42,6 +42,8 @@ namespace Unterm.Editor
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate void SendTextFn(ulong id, [MarshalAs(UnmanagedType.LPUTF8Str)] string text);
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate void SendKeyFn(ulong id, [MarshalAs(UnmanagedType.LPUTF8Str)] string name, [MarshalAs(UnmanagedType.I1)] bool ctrl, [MarshalAs(UnmanagedType.I1)] bool alt, [MarshalAs(UnmanagedType.I1)] bool shift);
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate void ScrollFn(ulong id, int delta);
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate void SelStartFn(ulong id, float x, float y, byte mode);
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate void SelUpdateFn(ulong id, float x, float y);
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)] [return: MarshalAs(UnmanagedType.I1)] private delegate bool BoolFn(ulong id);
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate IntPtr PtrFn(ulong id);
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate IntPtr PixelsFn(ulong id, out UIntPtr len);
@@ -58,6 +60,7 @@ namespace Unterm.Editor
         private SetColorsFn _setColors; private SetFocusFn _setFocus; private SendTextFn _sendText;
         private SendKeyFn _sendKey; private SendTextFn _paste; private IdFn _clear;
         private ScrollFn _scroll; private IdFn _render; private BoolFn _dirty;
+        private SelStartFn _selStart; private SelUpdateFn _selUpdate; private IdFn _selClear; private TitleFn _selText;
         private BoolFn _isAlive; private PtrFn _iosurface; private PtrFn _rawTexture; private PixelsFn _getPixels;
         private SizeFn _size; private SizeFn _gridSize; private CursorPxFn _cursorPx; private TitleFn _title;
 
@@ -103,6 +106,10 @@ namespace Unterm.Editor
             _paste = Sym<SendTextFn>("unterm_paste");
             _clear = Sym<IdFn>("unterm_clear");
             _scroll = Sym<ScrollFn>("unterm_scroll");
+            _selStart = Sym<SelStartFn>("unterm_selection_start");
+            _selUpdate = Sym<SelUpdateFn>("unterm_selection_update");
+            _selClear = Sym<IdFn>("unterm_selection_clear");
+            _selText = Sym<TitleFn>("unterm_selection_text");
             _render = Sym<IdFn>("unterm_render");
             _dirty = Sym<BoolFn>("unterm_dirty");
             _isAlive = Sym<BoolFn>("unterm_is_alive");
@@ -147,6 +154,15 @@ namespace Unterm.Editor
         public void Paste(ulong id, string text) { if (!string.IsNullOrEmpty(text)) _paste(id, text); }
         public void Clear(ulong id) => _clear(id);
         public void Scroll(ulong id, int delta) => _scroll(id, delta);
+        // mode: 0 = by character, 1 = by word (double-click), 2 = by line.
+        public void SelectionStart(ulong id, float x, float y, byte mode) => _selStart(id, x, y, mode);
+        public void SelectionUpdate(ulong id, float x, float y) => _selUpdate(id, x, y);
+        public void SelectionClear(ulong id) => _selClear(id);
+        public string SelectionText(ulong id)
+        {
+            var p = _selText(id, out UIntPtr len);
+            return Utf8(p, len);
+        }
         public void Render(ulong id) => _render(id);
         public bool Dirty(ulong id) => _dirty(id);
         public bool IsAlive(ulong id) => _isAlive(id);
@@ -183,6 +199,7 @@ namespace Unterm.Editor
             _create = null; _exists = null; _destroy = null; _resize = null; _setScale = null;
             _setFont = null; _setFontSize = null; _setColors = null; _setFocus = null;
             _sendText = null; _sendKey = null; _scroll = null; _render = null; _dirty = null;
+            _selStart = null; _selUpdate = null; _selClear = null; _selText = null;
             _isAlive = null; _iosurface = null; _rawTexture = null; _getPixels = null;
             _paste = null; _clear = null;
             _size = null; _gridSize = null; _cursorPx = null; _title = null;

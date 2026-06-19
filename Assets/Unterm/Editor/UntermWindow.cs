@@ -42,6 +42,15 @@ namespace Unterm.Editor
         private string _imeBuffer = "";
         private bool _composing;
         private bool _refocus;
+
+        // Mouse selection: a drag from MouseDown extends the highlight; a plain
+        // click (down+up with no drag) clears it. `_selecting` is live between
+        // down and up; `_dragged` records whether the mouse actually moved.
+        private bool _selecting;
+        private bool _dragged;
+        // The selection mode set at MouseDown (0 = char, 1 = word, 2 = line).
+        // MouseUp can't read clickCount reliably, so we keep it here.
+        private byte _selectMode;
         private Color32 _bg = new Color32(24, 24, 24, 255);
         private Color32 _fg = new Color32(208, 208, 212, 255);
         private GUIStyle _imeStyle;
@@ -468,11 +477,55 @@ namespace Unterm.Editor
                 return;
             }
 
-            // Take keyboard focus when clicked (route it to the hidden IME sink).
-            if (e.type == EventType.MouseDown && rect.Contains(e.mousePosition))
+            // Right-click (or Ctrl-click) inside the grid: a Copy/Paste menu.
+            // Keeps the current selection intact so Copy has something to act on.
+            if (e.type == EventType.ContextClick && rect.Contains(e.mousePosition))
+            {
+                ShowContextMenu();
+                e.Use();
+                return;
+            }
+
+            // Mouse selection (left button). MouseDown takes keyboard focus and
+            // anchors a selection — single click by character, double by word,
+            // triple by line; MouseDrag extends it; MouseUp finalizes (a plain
+            // click with no drag clears any prior selection).
+            if (e.type == EventType.MouseDown && e.button == 0 && rect.Contains(e.mousePosition))
             {
                 Focus();
                 _refocus = true;
+                _selecting = true;
+                _dragged = false;
+                _selectMode = e.clickCount >= 3 ? (byte)2 : e.clickCount == 2 ? (byte)1 : (byte)0;
+                var (px, py) = ToTermPx(rect, e.mousePosition);
+                _native.SelectionStart(Tid, px, py, _selectMode);
+                RenderNow();
+                Repaint();
+                e.Use();
+                return;
+            }
+            if (e.type == EventType.MouseDrag && e.button == 0 && _selecting)
+            {
+                _dragged = true;
+                var (px, py) = ToTermPx(rect, e.mousePosition);
+                _native.SelectionUpdate(Tid, px, py);
+                RenderNow();
+                Repaint();
+                e.Use();
+                return;
+            }
+            if (e.type == EventType.MouseUp && e.button == 0 && _selecting)
+            {
+                _selecting = false;
+                // A plain single click (no drag) clears the selection; a word/
+                // line click or a drag keeps what it selected. (clickCount isn't
+                // reliable on MouseUp, so use the mode recorded at MouseDown.)
+                if (!_dragged && _selectMode == 0)
+                {
+                    _native.SelectionClear(Tid);
+                    RenderNow();
+                    Repaint();
+                }
                 e.Use();
                 return;
             }
@@ -493,6 +546,13 @@ namespace Unterm.Editor
             {
                 switch (e.keyCode)
                 {
+                    case KeyCode.C:
+                        // Copy the current selection (no-op if nothing selected;
+                        // Ctrl-C for SIGINT is handled separately below).
+                        string sel = _native.SelectionText(Tid);
+                        if (!string.IsNullOrEmpty(sel))
+                            EditorGUIUtility.systemCopyBuffer = sel;
+                        break;
                     case KeyCode.V:
                         _native.Paste(Tid, EditorGUIUtility.systemCopyBuffer);
                         break;
@@ -540,6 +600,38 @@ namespace Unterm.Editor
 
             // Plain printable input is left for the hidden IME field, which
             // accumulates it (and any committed composition) for FlushIme().
+        }
+
+        // Right-click context menu: Copy the current selection (disabled when
+        // nothing is selected) and Paste the system clipboard into the shell.
+        private void ShowContextMenu()
+        {
+            if (_native == null || Tid == 0) return;
+            var menu = new GenericMenu();
+
+            string sel = _native.SelectionText(Tid);
+            if (!string.IsNullOrEmpty(sel))
+                menu.AddItem(new GUIContent("Copy"), false,
+                    () => EditorGUIUtility.systemCopyBuffer = sel);
+            else
+                menu.AddDisabledItem(new GUIContent("Copy"));
+
+            menu.AddItem(new GUIContent("Paste"), false, () =>
+            {
+                if (_native != null && Tid != 0)
+                    _native.Paste(Tid, EditorGUIUtility.systemCopyBuffer);
+            });
+
+            menu.ShowAsContext();
+        }
+
+        // Map a GUI-point mouse position to physical pixels relative to the
+        // terminal draw area's top-left (the coordinate space the native
+        // selection/cursor APIs use).
+        private static (float, float) ToTermPx(Rect rect, Vector2 mouse)
+        {
+            float ppp = EditorGUIUtility.pixelsPerPoint;
+            return ((mouse.x - rect.x) * ppp, (mouse.y - rect.y) * ppp);
         }
 
         private static string SpecialKeyName(KeyCode k)

@@ -14,8 +14,20 @@ pub struct Theme {
     pub fg: [u8; 3],
     pub bg: [u8; 3],
     pub cursor: [u8; 3],
+    /// Selection highlight background (derived from bg/fg, see [`selection_bg`]).
+    pub selection: [u8; 3],
     /// The 16 base ANSI colors (0..7 normal, 8..15 bright).
     pub ansi: [[u8; 3]; 16],
+}
+
+/// Derive a selection-highlight background from the terminal background: blend
+/// it toward a blue accent so the result adapts to dark/light themes while
+/// staying a distinct, legible tint under the (unchanged) cell text color.
+pub fn selection_bg(bg: [u8; 3]) -> [u8; 3] {
+    const ACCENT: [u8; 3] = [0x4d, 0x7a, 0xc7];
+    const T: f32 = 0.55;
+    let mix = |a: u8, b: u8| (a as f32 * (1.0 - T) + b as f32 * T).round() as u8;
+    [mix(bg[0], ACCENT[0]), mix(bg[1], ACCENT[1]), mix(bg[2], ACCENT[2])]
 }
 
 impl Default for Theme {
@@ -24,6 +36,7 @@ impl Default for Theme {
             fg: [0xd0, 0xd0, 0xd4],
             bg: [0x12, 0x12, 0x12],
             cursor: [0xd0, 0xd0, 0xd4],
+            selection: selection_bg([0x12, 0x12, 0x12]),
             // A classic, legible 16-color set.
             ansi: [
                 [0x1d, 0x1f, 0x21], // black

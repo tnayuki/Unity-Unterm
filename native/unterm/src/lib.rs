@@ -180,6 +180,43 @@ pub unsafe extern "C" fn unterm_paste(id: u64, text: *const c_char) {
     with_term(id, (), |t| t.paste(&s));
 }
 
+/// Begin a selection at physical-pixel point (x, y). `mode`: 0 = by character,
+/// 1 = by word (double-click), 2 = by line (triple-click).
+#[no_mangle]
+pub extern "C" fn unterm_selection_start(id: u64, x: f32, y: f32, mode: u8) {
+    with_term(id, (), |t| t.selection_start(x, y, mode));
+}
+
+/// Extend the active selection to physical-pixel point (x, y) (mouse drag).
+#[no_mangle]
+pub extern "C" fn unterm_selection_update(id: u64, x: f32, y: f32) {
+    with_term(id, (), |t| t.selection_update(x, y));
+}
+
+/// Clear the active selection (drops the highlight).
+#[no_mangle]
+pub extern "C" fn unterm_selection_clear(id: u64) {
+    with_term(id, (), |t| t.selection_clear());
+}
+
+/// The selected text as a stable NUL-terminated UTF-8 string, valid until the
+/// next call on this terminal (empty if nothing is selected). Writes the length.
+#[no_mangle]
+pub unsafe extern "C" fn unterm_selection_text(id: u64, out_len: *mut usize) -> *const c_char {
+    let mut map = registry().lock().unwrap();
+    let Some(t) = map.get_mut(&id) else {
+        if !out_len.is_null() {
+            unsafe { *out_len = 0 };
+        }
+        return std::ptr::null();
+    };
+    let c = t.selection_text_cstr();
+    if !out_len.is_null() {
+        unsafe { *out_len = c.to_bytes().len() };
+    }
+    c.as_ptr()
+}
+
 /// Render the current grid into the IOSurface and clear the dirty flag.
 #[no_mangle]
 pub extern "C" fn unterm_render(id: u64) {

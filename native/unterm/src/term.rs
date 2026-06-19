@@ -15,7 +15,9 @@ use std::thread::JoinHandle;
 
 use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::grid::{Dimensions, Scroll};
-use alacritty_terminal::term::{Config, Term, TermMode};
+use alacritty_terminal::index::{Column, Point as GridPoint, Side};
+use alacritty_terminal::selection::{Selection, SelectionType};
+use alacritty_terminal::term::{viewport_to_point, Config, Term, TermMode};
 use alacritty_terminal::vte::ansi::Processor;
 
 use crate::keys;
@@ -103,6 +105,8 @@ pub struct Terminal {
     focused: bool,
     /// Stable storage for the title returned across the C ABI.
     title_snap: CString,
+    /// Stable storage for the selected text returned across the C ABI.
+    sel_snap: CString,
     _reader: JoinHandle<()>,
 }
 
@@ -148,6 +152,7 @@ impl Terminal {
             scale,
             focused: true,
             title_snap: CString::default(),
+            sel_snap: CString::default(),
             _reader: reader,
         }
     }
@@ -158,9 +163,10 @@ impl Terminal {
             let _ = w.write_all(bytes);
             let _ = w.flush();
         }
-        // Any keypress jumps back to the live prompt.
+        // Any keypress jumps back to the live prompt and drops the selection.
         if let Ok(mut t) = self.term.lock() {
             t.scroll_display(Scroll::Bottom);
+            t.selection = None;
         }
         self.shared.dirty.store(true, Ordering::Relaxed);
     }
@@ -202,6 +208,7 @@ impl Terminal {
         self.theme.fg = fg;
         self.theme.bg = bg;
         self.theme.cursor = cursor;
+        self.theme.selection = crate::palette::selection_bg(bg);
         self.shared.dirty.store(true, Ordering::Relaxed);
     }
 
@@ -248,6 +255,68 @@ impl Terminal {
             let normalized = text.replace("\r\n", "\r").replace('\n', "\r");
             self.send(normalized.as_bytes());
         }
+    }
+
+    /// Map a physical-pixel point to the grid `Point` it falls on, plus which
+    /// half (left/right) of the cell, anchored to the current scrollback offset.
+    fn px_to_point(&mut self, x: f32, y: f32) -> (GridPoint, Side) {
+        let (line, col, left) = self.renderer.px_to_cell(x, y, self.cols, self.rows);
+        let side = if left { Side::Left } else { Side::Right };
+        let display_offset = self
+            .term
+            .lock()
+            .map(|t| t.grid().display_offset())
+            .unwrap_or(0);
+        let point = viewport_to_point(display_offset, GridPoint::new(line, Column(col)));
+        (point, side)
+    }
+
+    /// Begin a selection at a physical-pixel point. `mode`: 0 = by character,
+    /// 1 = by word (semantic, for double-click), 2 = by line (triple-click).
+    pub fn selection_start(&mut self, x: f32, y: f32, mode: u8) {
+        let (point, side) = self.px_to_point(x, y);
+        let ty = match mode {
+            1 => SelectionType::Semantic,
+            2 => SelectionType::Lines,
+            _ => SelectionType::Simple,
+        };
+        if let Ok(mut t) = self.term.lock() {
+            t.selection = Some(Selection::new(ty, point, side));
+        }
+        self.shared.dirty.store(true, Ordering::Relaxed);
+    }
+
+    /// Extend the active selection to a physical-pixel point (mouse drag).
+    pub fn selection_update(&mut self, x: f32, y: f32) {
+        let (point, side) = self.px_to_point(x, y);
+        if let Ok(mut t) = self.term.lock() {
+            if let Some(sel) = t.selection.as_mut() {
+                sel.update(point, side);
+            }
+        }
+        self.shared.dirty.store(true, Ordering::Relaxed);
+    }
+
+    /// Drop any active selection (clears the highlight).
+    pub fn selection_clear(&mut self) {
+        if let Ok(mut t) = self.term.lock() {
+            if t.selection.take().is_some() {
+                self.shared.dirty.store(true, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// The selected text as a stable C string (empty if nothing is selected).
+    /// Valid until the next call on this terminal.
+    pub fn selection_text_cstr(&mut self) -> &CStr {
+        let s = self
+            .term
+            .lock()
+            .ok()
+            .and_then(|t| t.selection_to_string())
+            .unwrap_or_default();
+        self.sel_snap = CString::new(s.replace('\0', "")).unwrap_or_default();
+        &self.sel_snap
     }
 
     /// Change the HiDPI scale, keeping the pixel size (re-derives the grid).

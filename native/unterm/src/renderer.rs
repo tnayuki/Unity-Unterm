@@ -170,6 +170,22 @@ impl Renderer {
         self.view = view;
     }
 
+    /// Map a physical-pixel coordinate to the (line, column) viewport cell it
+    /// falls on plus whether it's on the cell's left half. Clamped to the grid,
+    /// so points outside the padding/edges snap to the nearest cell.
+    pub fn px_to_cell(&mut self, x: f32, y: f32, cols: usize, rows: usize) -> (usize, usize, bool) {
+        self.ensure_metrics();
+        let pad = PAD_PT * self.scale;
+        let fx = (x - pad) / self.cell_w;
+        let fy = (y - pad) / self.cell_h;
+        let col = (fx.floor().max(0.0) as usize).min(cols.saturating_sub(1));
+        let line = (fy.floor().max(0.0) as usize).min(rows.saturating_sub(1));
+        // Side from the clamped column so points past the row end read as the
+        // right half (extend to end) and points left of the grid as the left.
+        let left = (fx - col as f32) < 0.5;
+        (line, col, left)
+    }
+
     /// The current cell grid size derived from the pixel size and metrics.
     pub fn cell_grid_size(&mut self) -> (usize, usize) {
         self.ensure_metrics();
@@ -264,6 +280,9 @@ impl Renderer {
             spacer: false,
             bg_fill: false,
         };
+        // Active selection range (grid coords), used to tint selected cells.
+        let selection = term.selection.as_ref().and_then(|s| s.to_range(term));
+
         let mut cells = vec![blank; cols * rows];
         for indexed in grid.display_iter() {
             let Some(vp) = point_to_viewport(display_offset, indexed.point) else {
@@ -281,6 +300,10 @@ impl Renderer {
             }
             if flags.contains(Flags::DIM) {
                 fg = [fg[0] / 2 + fg[0] / 4, fg[1] / 2 + fg[1] / 4, fg[2] / 2 + fg[2] / 4];
+            }
+            // Selected cells take the highlight background (text color is kept).
+            if selection.map_or(false, |r| r.contains(indexed.point)) {
+                bg = theme.selection;
             }
             let hidden = flags.contains(Flags::HIDDEN);
             let spacer = flags.contains(Flags::WIDE_CHAR_SPACER);
