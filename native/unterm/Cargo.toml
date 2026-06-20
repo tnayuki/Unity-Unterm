@@ -2,6 +2,7 @@
 name = "unterm"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
 description = "Native wgpu-rendered terminal emulator for Unity (Unterm)"
 
 # Build a C-ABI dynamic library that Unity loads as a native plugin.

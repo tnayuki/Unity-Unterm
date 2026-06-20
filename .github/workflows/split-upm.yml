@@ -36,10 +36,14 @@ jobs:
         with:
           tool: cargo-about
 
-      - name: Generate third-party license notices
+      - name: Generate third-party license notices (license gate)
         working-directory: native
         run: |
-          cargo about generate about.hbs \
+          # --fail: exit non-zero on a license that isn't in about.toml's
+          # `accepted` list (e.g. a GPL/AGPL/LGPL dependency that slips in), or
+          # one we can't resolve at all. This is a single job, so failing here
+          # aborts before the publish step — nothing reaches the `upm` branch.
+          cargo about generate about.hbs --fail \
             -o "../Packages/dev.tnayuki.unterm/Third Party Notices.md"
 
       - name: Publish package to upm branch
