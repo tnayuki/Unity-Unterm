@@ -7,7 +7,6 @@ name: Build native + publish UPM branch
 
 on:
   push:
-    branches: [main]
     tags: ['v*']
 
 permissions:
@@ -66,13 +65,11 @@ jobs:
               commit -q -m "Publish ${GITHUB_SHA} ($(basename "${GITHUB_REF}"))"
 
           REMOTE="https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          TAG="${GITHUB_REF##*/}"
 
-          if [ "${GITHUB_REF}" = "refs/heads/main" ]; then
-            git push --force "$REMOTE" upm:refs/heads/upm
-          fi
-
-          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
-            TAG="${GITHUB_REF##*/}"
-            git tag "upm/${TAG}"
-            git push "$REMOTE" "upm/${TAG}"
-          fi
+          # The floating `upm` branch always points at the latest release, and
+          # `upm/<tag>` pins this specific one. Publishing only on version tags
+          # keeps both honest about the package version they ship.
+          git push --force "$REMOTE" upm:refs/heads/upm
+          git tag "upm/${TAG}"
+          git push "$REMOTE" "upm/${TAG}"
