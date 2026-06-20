@@ -25,7 +25,7 @@ Add to `Packages/manifest.json`:
 }
 ```
 
-Pin a version: `...git#v0.2.0`.
+Pin a version: `...git#upm/v0.2.0` (CI tags the `upm` branch as `upm/<tag>`).
 
 ## Usage
 
@@ -51,12 +51,14 @@ platforms the package contributes nothing.
 
 ## Repository layout
 
-- `Packages/dev.tnayuki.unterm/` — the distributable UPM package (the
-  prebuilt universal `unterm.bundle` is committed here). A GitHub Action
-  subtree-splits it to the `upm` branch that the install URL points at.
+- `Packages/dev.tnayuki.unterm/` — the distributable UPM package. The native
+  `unterm.bundle` is a build artifact and is **not** tracked here; only its
+  `.meta` is. A GitHub Action builds the universal binary on a macOS runner and
+  publishes the package, binary included, to the `upm` branch that the install
+  URL points at.
 - `native/` — the Rust source for the terminal engine. Run
-  `native/build-macos.sh` to rebuild the universal `unterm.bundle` into the
-  package. Not part of the published package.
+  `native/build-macos.sh` to build the universal `unterm.bundle` into the
+  package for in-editor development. Not part of the published source.
 
 ## License
 

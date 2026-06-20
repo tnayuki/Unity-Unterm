@@ -106,10 +106,15 @@ InitTestScene*.unity*
 /[Aa]ssets/[Ss]ceneDependencyCache*
 
 # === Unterm native (Rust) ===
-# Rust intermediate build output (not distributed). The built .bundle under
-# Packages/dev.tnayuki.unterm/Editor/Plugins/macOS is committed so the plugin
-# ships with the package.
+# Rust intermediate build output (not distributed).
 /native/target/
 # Headless example output
 /native/unterm.png
 /native/**/unterm.png
+# Machine-generated artifacts, NOT tracked in source: CI builds them on a macOS
+# runner and injects them into the `upm` distribution branch. The .bundle also
+# can't be merged across branches. Build them locally for in-editor development
+# with `native/build-macos.sh` and `cargo about` (see native/about.toml). Their
+# `.meta` files stay tracked so GUIDs are stable.
+/Packages/dev.tnayuki.unterm/Editor/Plugins/macOS/unterm.bundle
+/Packages/dev.tnayuki.unterm/Editor/Plugins/macOS/THIRD-PARTY-NOTICES.md

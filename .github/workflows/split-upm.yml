@@ -1,4 +1,9 @@
-name: Split UPM branch
+name: Build native + publish UPM branch
+
+# The native .bundle is NOT tracked in source (it bloats the repo and can't be
+# merged across branches). Instead this workflow builds it on a macOS runner and
+# publishes the package — source files plus the freshly built binary — to the
+# `upm` branch that the install URL (`...git#upm`) points at.
 
 on:
   push:
@@ -9,29 +14,65 @@ permissions:
   contents: write
 
 jobs:
-  split:
-    runs-on: ubuntu-latest
+  build-and-publish:
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
         with:
-          fetch-depth: 0
-          persist-credentials: true
+          targets: aarch64-apple-darwin, x86_64-apple-darwin
 
-      - name: Split subtree to upm branch
-        id: split
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: native
+
+      - name: Build universal native bundle
+        run: native/build-macos.sh release
+
+      - name: Install cargo-about
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-about
+
+      - name: Generate third-party license notices
+        working-directory: native
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          SHA=$(git subtree split --prefix=Packages/dev.tnayuki.unterm)
-          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          cargo about generate about.hbs \
+            -o ../Packages/dev.tnayuki.unterm/Editor/Plugins/macOS/THIRD-PARTY-NOTICES.md
 
-      - name: Push upm branch
-        if: github.ref == 'refs/heads/main'
-        run: git push origin ${{ steps.split.outputs.sha }}:refs/heads/upm --force-with-lease
-
-      - name: Tag upm branch on version tag
-        if: startsWith(github.ref, 'refs/tags/v')
+      - name: Publish package to upm branch
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          TAG=${GITHUB_REF##*/}
-          git tag "upm/${TAG}" ${{ steps.split.outputs.sha }}
-          git push origin "upm/${TAG}"
+          set -euo pipefail
+          PKG="Packages/dev.tnayuki.unterm"
+          test -f "$PKG/Editor/Plugins/macOS/unterm.bundle" || { echo "bundle missing"; exit 1; }
+
+          # Stage the package contents (including the just-built, un-tracked
+          # binary) as the root of a fresh orphan commit. The upm branch is a
+          # machine-generated distribution branch, so history is disposable.
+          STAGE="$(mktemp -d)"
+          rsync -a "$PKG/" "$STAGE/"
+
+          cd "$STAGE"
+          git init -q
+          git checkout -q -b upm
+          git add -A
+          git -c user.name="github-actions[bot]" \
+              -c user.email="github-actions[bot]@users.noreply.github.com" \
+              commit -q -m "Publish ${GITHUB_SHA} ($(basename "${GITHUB_REF}"))"
+
+          REMOTE="https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+
+          if [ "${GITHUB_REF}" = "refs/heads/main" ]; then
+            git push --force "$REMOTE" upm:refs/heads/upm
+          fi
+
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            TAG="${GITHUB_REF##*/}"
+            git tag "upm/${TAG}"
+            git push "$REMOTE" "upm/${TAG}"
+          fi
