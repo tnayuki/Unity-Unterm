@@ -53,6 +53,18 @@ namespace Unterm.Editor
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)] [return: MarshalAs(UnmanagedType.I1)] private delegate bool CursorPxFn(ulong id, out float x, out float y, out float w, out float h);
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate IntPtr TitleFn(ulong id, out UIntPtr len);
 
+        // Static helper for importing from the original auto-loaded DLL
+        internal static class UntermOriginal
+        {
+            [DllImport("unterm")]
+            public static extern IntPtr unterm_get_unity_device();
+            [DllImport("unterm")]
+            public static extern IntPtr unterm_get_unity_queue();
+        }
+
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        private delegate void SetUnityDeviceFn(IntPtr device, IntPtr queue);
+
         private IntPtr _handle;
         private string _shadowPath;
         private bool _stable;
@@ -65,6 +77,7 @@ namespace Unterm.Editor
         private SelStartFn _selStart; private SelUpdateFn _selUpdate; private IdFn _selClear; private TitleFn _selText;
         private BoolFn _isAlive; private PtrFn _iosurface; private PtrFn _rawTexture; private PixelsFn _getPixels;
         private SizeFn _size; private SizeFn _gridSize; private ScrollStateFn _scrollState; private CursorPxFn _cursorPx; private TitleFn _title;
+        private SetUnityDeviceFn _setUnityDevice;
 
         public bool IsLoaded => _handle != IntPtr.Zero;
 
@@ -124,6 +137,25 @@ namespace Unterm.Editor
             _scrollState = Sym<ScrollStateFn>("unterm_scroll_state");
             _cursorPx = Sym<CursorPxFn>("unterm_cursor_px");
             _title = Sym<TitleFn>("unterm_title");
+
+            _setUnityDevice = Sym<SetUnityDeviceFn>("unterm_set_unity_device");
+
+            IntPtr originalDevice = IntPtr.Zero;
+            IntPtr originalQueue = IntPtr.Zero;
+            try
+            {
+                originalDevice = UntermOriginal.unterm_get_unity_device();
+                originalQueue = UntermOriginal.unterm_get_unity_queue();
+            }
+            catch (Exception e)
+            {
+                Debug.LogWarning(
+                    "unterm: Failed to read device from original dll "
+                    + "(this is normal if Unity hasn't auto-loaded it yet): "
+                    + e.Message);
+            }
+
+            _setUnityDevice(originalDevice, originalQueue);
         }
 
         private T Sym<T>(string name) where T : Delegate
@@ -214,6 +246,7 @@ namespace Unterm.Editor
             _isAlive = null; _iosurface = null; _rawTexture = null; _getPixels = null;
             _paste = null; _clear = null;
             _size = null; _gridSize = null; _scrollState = null; _cursorPx = null; _title = null;
+            _setUnityDevice = null;
 
             if (!_stable && !string.IsNullOrEmpty(_shadowPath) && File.Exists(_shadowPath))
             {

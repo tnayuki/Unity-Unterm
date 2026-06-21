@@ -33,6 +33,9 @@ foreign-types = "0.5"
 objc = "0.2"
 core-foundation = "0.10"
 core-foundation-sys = "0.8"
+unity-native-plugin = { version = "0.9", features = ["metal"] }
+objc2 = "0.6"
+objc2-metal = { version = "0.3", features = ["MTLDevice", "MTLCommandQueue"] }
 
 [dev-dependencies]
 # Headless verification: dump the rendered terminal to a PNG without the Editor.

@@ -397,3 +397,86 @@ pub unsafe extern "C" fn unterm_title(id: u64, out_len: *mut usize) -> *const c_
 // Keep `c_void` referenced so a header generator records the opaque handle type.
 #[doc(hidden)]
 pub type _UntermHandle = *mut c_void;
+
+// ---- C-ABI Bridge for Unity Device Sharing ----
+
+use std::sync::atomic::AtomicPtr;
+
+use unity_native_plugin::interface::UnityInterfaces;
+use unity_native_plugin::metal::{UnityGraphicsMetalV1, UnityGraphicsMetalV1Interface};
+use unity_native_plugin::metal::{UnityGraphicsMetalV2, UnityGraphicsMetalV2Interface};
+
+use objc2::rc::Retained;
+use objc2::runtime::ProtocolObject;
+use objc2_metal::{MTLDevice, MTLCommandQueue};
+
+// ---- Original auto-loaded DLL: store Retained smart pointers ----
+// Retained holds a +1 refcount; dropping it calls release automatically.
+
+static UNITY_METAL_DEVICE: Mutex<Option<Retained<ProtocolObject<dyn MTLDevice>>>> =
+    Mutex::new(None);
+static UNITY_METAL_QUEUE: Mutex<Option<Retained<ProtocolObject<dyn MTLCommandQueue>>>> =
+    Mutex::new(None);
+
+unity_native_plugin::unity_native_plugin_entry_point! {
+    fn unity_plugin_load(interfaces: &'static UnityInterfaces) {
+        if let Some(metal_v2) = interfaces.interface::<UnityGraphicsMetalV2>() {
+            // metal_device() returns Option<Retained<...>> — already retained.
+            // Storing the Retained keeps our +1 refcount alive.
+            *UNITY_METAL_DEVICE.lock().unwrap() = metal_v2.metal_device();
+            *UNITY_METAL_QUEUE.lock().unwrap() = metal_v2.command_queue();
+        } else if let Some(metal_v1) = interfaces.interface::<UnityGraphicsMetalV1>() {
+            *UNITY_METAL_DEVICE.lock().unwrap() = metal_v1.metal_device();
+            // V1 does not expose the command queue
+        }
+    }
+    fn unity_plugin_unload() {
+        // Setting to None drops the Retained, calling release via Drop trait
+        *UNITY_METAL_DEVICE.lock().unwrap() = None;
+        *UNITY_METAL_QUEUE.lock().unwrap() = None;
+    }
+}
+
+// Expose raw pointers for the C# bridge to read
+#[no_mangle]
+pub extern "C" fn unterm_get_unity_device() -> *mut c_void {
+    UNITY_METAL_DEVICE
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|r| Retained::as_ptr(r) as *const _ as *mut c_void)
+        .unwrap_or(std::ptr::null_mut())
+}
+
+#[no_mangle]
+pub extern "C" fn unterm_get_unity_queue() -> *mut c_void {
+    UNITY_METAL_QUEUE
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|r| Retained::as_ptr(r) as *const _ as *mut c_void)
+        .unwrap_or(std::ptr::null_mut())
+}
+
+// ---- Shadow-copied DLL: receive raw pointers from C# bridge ----
+
+static SHADOW_METAL_DEVICE: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
+static SHADOW_METAL_QUEUE: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
+
+#[no_mangle]
+pub unsafe extern "C" fn unterm_set_unity_device(
+    device: *mut c_void,
+    queue: *mut c_void,
+) {
+    SHADOW_METAL_DEVICE.store(device, Ordering::Release);
+    SHADOW_METAL_QUEUE.store(queue, Ordering::Release);
+}
+
+pub fn shadow_device_ptr() -> *mut c_void {
+    SHADOW_METAL_DEVICE.load(Ordering::Acquire)
+}
+
+pub fn shadow_queue_ptr() -> *mut c_void {
+    SHADOW_METAL_QUEUE.load(Ordering::Acquire)
+}
+
