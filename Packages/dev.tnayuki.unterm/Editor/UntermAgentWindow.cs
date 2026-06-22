@@ -11,12 +11,16 @@ namespace Unterm.Editor
     /// `agentview` module) owns the agent session, the transcript panel, and the
     /// input composer; this <see cref="EditorWindow"/> is a thin host that only
     /// lays the view out, paces per-frame rendering, blits its textures, forwards
-    /// raw input, and drives the OS clipboard + hidden IME field.
+    /// raw input, drives the OS clipboard + hidden IME field, and manages the
+    /// session picker / persistence.
     ///
     /// The view lives in a process-global registry on the native side, so it
-    /// (together with the loaded image) survives C# domain reloads: this window
-    /// re-adopts the view by id after a reload and only tears it down when the
-    /// window actually closes.
+    /// (together with the loaded image and the editor-global MCP server,
+    /// <see cref="UntermMcp"/>) survives C# domain reloads. This window re-adopts
+    /// the view by id after a reload and only tears it down when the window
+    /// actually closes. Sessions are listed in a per-project index
+    /// (<see cref="UntermAgentSessions"/>) so the header dropdown can resume any
+    /// past conversation; opening a window from the menu always starts a fresh one.
     /// </summary>
     public sealed class UntermAgentWindow : EditorWindow
     {
@@ -45,6 +49,14 @@ namespace Unterm.Editor
         [SerializeField] private long _viewId;
         private static bool s_reloading;
         private ulong Vid => (ulong)_viewId;
+        // The conversation's Claude session id once established (empty until then).
+        // Serialized so a domain reload re-adopts and re-registers it as open.
+        [SerializeField] private string _claudeSessionId = "";
+
+        // Claude session ids currently driven by some agent window in this editor
+        // process. The picker greys out (non-selectable, no label) a session open
+        // in another window so two windows never drive the same conversation.
+        private static readonly HashSet<string> s_open = new HashSet<string>();
 
         // Transcript panel texture (zero-copy wrap of the native MTLTexture).
         private Texture2D _tex;
@@ -59,6 +71,7 @@ namespace Unterm.Editor
         private float _scroll; // physical px, 0 = latest
         private bool _selecting;       // dragging a transcript selection
         private bool _inputDragging;   // dragging an input-box selection
+        private double _lastTouch;     // editor time of the last session-index bump (throttle)
 
         // Opened from the "Window/Unterm/Claude Code" menu (registered, and gated
         // on the CLI being installed, by ClaudeCode).
@@ -66,8 +79,7 @@ namespace Unterm.Editor
         {
             // A fresh window each time (CreateWindow, not the singleton GetWindow)
             // so several Claude Code conversations can run side by side; each gets
-            // its own native AgentView and session (a session already open in
-            // another window is skipped by the resume picker). Cascade off the
+            // its own native AgentView and starts a new session. Cascade off the
             // focused one so new windows don't stack exactly on top.
             var from = focusedWindow as UntermAgentWindow;
             var w = CreateWindow<UntermAgentWindow>();
@@ -121,10 +133,33 @@ namespace Unterm.Editor
             if (dirty) { RenderView(measureInput: false); Repaint(); }
             else if ((f & 2) != 0) Repaint();
 
-            // The native side owns the tab title (first user line).
-            string agent = _native.AgentviewTitle(Vid);
-            if (!string.IsNullOrEmpty(agent) && titleContent.text != agent)
-                titleContent = new GUIContent(agent);
+            // Record the Claude session id once established: register it as open
+            // and index it so it can be resumed/listed later. The native side also
+            // owns the tab title.
+            string sid = _native.AgentviewSessionId(Vid);
+            if (!string.IsNullOrEmpty(sid) && sid != _claudeSessionId)
+            {
+                if (!string.IsNullOrEmpty(_claudeSessionId)) s_open.Remove(_claudeSessionId);
+                _claudeSessionId = sid;
+                s_open.Add(sid);
+                UntermAgentSessions.Touch(sid, _native.AgentviewTitle(Vid));
+                _lastTouch = EditorApplication.timeSinceStartup;
+
+                string agent = _native.AgentviewTitle(Vid);
+                if (!string.IsNullOrEmpty(agent) && titleContent.text != agent)
+                    titleContent = new GUIContent(agent);
+            }
+            // Bump the session's last-used time only while a turn is actually running
+            // (we sent a prompt / are receiving a reply), throttled so streaming
+            // doesn't rewrite the index every frame. NOT on open/switch/resume — so
+            // merely selecting a past session doesn't reorder it; the picker lists
+            // conversations most-recently-talked-to first.
+            else if (_native.AgentviewThinking(Vid) && !string.IsNullOrEmpty(_claudeSessionId)
+                     && EditorApplication.timeSinceStartup - _lastTouch > 3.0)
+            {
+                UntermAgentSessions.Touch(_claudeSessionId, _native.AgentviewTitle(Vid));
+                _lastTouch = EditorApplication.timeSinceStartup;
+            }
         }
 
         private void LoadNative()
@@ -140,15 +175,45 @@ namespace Unterm.Editor
                 var (pw, ph) = CurrentPanelSize();
                 var (iw, ih) = CurrentInputSize();
 
-                // Ensure the editor-global in-process MCP server is up (and its
-                // tools published) before the session wires the agent to it.
+                // Ensure the editor-global MCP server is up and its tools published
+                // before the session starts (the session wires the agent to it).
                 UntermMcp.EnsureStarted();
 
-                // Re-adopt the existing view across reload, else start a fresh one.
-                if (_viewId == 0 || !_native.AgentviewExists(Vid))
+                // Re-adopt only when the live native view is genuinely THIS
+                // window's conversation. On a domain reload the view (and its id)
+                // survive, so it is. On an editor restart the native ids restart
+                // from scratch, so a stale serialized id can point at another
+                // window's fresh view — the session-id match rules that out, and we
+                // recreate below instead.
+                bool reAdopt = _viewId != 0 && _native.AgentviewExists(Vid)
+                    && _native.AgentviewSessionId(Vid) == _claudeSessionId;
+                if (!reAdopt)
                 {
-                    _viewId = (long)_native.AgentviewCreate(ProjectRoot, pw, ph, iw, ih, ClaudeCode.ClaudePath);
+                    if (!string.IsNullOrEmpty(_claudeSessionId))
+                    {
+                        // Editor restart: restore THIS window's own conversation
+                        // (its transcript is rebuilt from the session jsonl), or a
+                        // fresh one if it can no longer be loaded.
+                        _viewId = (long)_native.AgentviewLoad(ProjectRoot, _claudeSessionId, pw, ph, iw, ih, ClaudeCode.ClaudePath);
+                        if (_viewId == 0)
+                        {
+                            _claudeSessionId = "";
+                            _viewId = (long)_native.AgentviewCreate(ProjectRoot, pw, ph, iw, ih, ClaudeCode.ClaudePath);
+                        }
+                    }
+                    else
+                    {
+                        // A freshly opened window (from the menu) always starts a
+                        // NEW conversation; resuming a past one is an explicit
+                        // choice via the header session picker.
+                        _viewId = (long)_native.AgentviewCreate(ProjectRoot, pw, ph, iw, ih, ClaudeCode.ClaudePath);
+                    }
                 }
+
+                // Register this window's conversation as open so other windows'
+                // pickers grey it out. A brand-new session has no id yet — it
+                // registers once the id is established (see OnEditorUpdate).
+                if (!string.IsNullOrEmpty(_claudeSessionId)) s_open.Add(_claudeSessionId);
 
                 ApplyFonts();
                 _refocus = true; // park the IME field for typing
@@ -220,6 +285,9 @@ namespace Unterm.Editor
                 if (native != null && vid != 0 && !ownedElsewhere)
                     native.AgentviewDestroy(vid);
                 _viewId = 0;
+                // Free the session for re-adoption only if no sibling still drives it.
+                if (!ownedElsewhere && !string.IsNullOrEmpty(_claudeSessionId))
+                    s_open.Remove(_claudeSessionId);
                 native?.Dispose(); // dlclose on real teardown
             }
             // On reload: drop the managed wrapper WITHOUT dlclose so the native
@@ -945,13 +1013,17 @@ namespace Unterm.Editor
         }
 
         // A thin header with the session picker: the current conversation's title
-        // and a dropdown to start a new one or switch to another (sessions already
-        // open in another window are greyed out).
+        // and a dropdown to start a new one or switch to another past conversation.
         private void DrawHeader()
         {
             using (new GUILayout.HorizontalScope(EditorStyles.toolbar))
             {
-                GUILayout.Label(CurrentTitle(), EditorStyles.toolbarButton);
+                string label = CurrentTitle();
+                if (EditorGUILayout.DropdownButton(new GUIContent(label), FocusType.Passive,
+                    EditorStyles.toolbarDropDown, GUILayout.MaxWidth(position.width - 8f)))
+                {
+                    ShowSessionMenu(GUILayoutUtility.GetLastRect());
+                }
                 GUILayout.FlexibleSpace();
             }
         }
@@ -960,6 +1032,76 @@ namespace Unterm.Editor
         {
             string t = (_native != null && _viewId != 0) ? _native.AgentviewTitle(Vid) : "";
             return string.IsNullOrEmpty(t) ? "New conversation" : t;
+        }
+
+        // Unity's native popup menu (GenericMenu), so it looks and behaves like one.
+        // Its one quirk is that it keys items by label, so same-titled conversations
+        // would collapse — disambiguate repeats with trailing spaces (see below). A
+        // session already driven by another window is added disabled (greyed,
+        // non-selectable). ('/' is a submenu separator here, so neutralize it.)
+        private void ShowSessionMenu(Rect activator)
+        {
+            var menu = new GenericMenu();
+            menu.AddItem(new GUIContent("New Session"), false, NewSession);
+            var sessions = UntermAgentSessions.All();
+            if (sessions.Count > 0) menu.AddSeparator("");
+
+            var used = new HashSet<string>();
+            foreach (var s in sessions)
+            {
+                string title = string.IsNullOrEmpty(s.title) ? "(untitled)" : s.title;
+                string label = title.Replace('/', '∕');
+                // GenericMenu keys items by label, so same-titled conversations would
+                // collapse into one row. Append a zero-width space until the label is
+                // unique: it's a format char (not whitespace), so unlike a trailing
+                // space it survives the menu's trimming, and it's invisible so the
+                // titles still read identically to the user.
+                while (!used.Add(label)) label += "\u200B";
+
+                bool isCurrent = s.id == _claudeSessionId;
+                if (!isCurrent && s_open.Contains(s.id))
+                {
+                    // Driven by another window: shown but not selectable.
+                    menu.AddDisabledItem(new GUIContent(label));
+                }
+                else
+                {
+                    string id = s.id;
+                    menu.AddItem(new GUIContent(label), isCurrent, () => SwitchTo(id));
+                }
+            }
+            menu.DropDown(activator);
+        }
+
+        // Replace this window's conversation with session `id` (resumed).
+        private void SwitchTo(string id)
+        {
+            if (_native == null || string.IsNullOrEmpty(id) || id == _claudeSessionId) return;
+            if (_viewId != 0) _native.AgentviewDestroy(Vid);
+            if (!string.IsNullOrEmpty(_claudeSessionId)) s_open.Remove(_claudeSessionId);
+            _claudeSessionId = id;
+            s_open.Add(id);
+            _scroll = 0f;
+            var (pw, ph) = CurrentPanelSize();
+            var (iw, ih) = CurrentInputSize();
+            _viewId = (long)_native.AgentviewLoad(ProjectRoot, id, pw, ph, iw, ih, ClaudeCode.ClaudePath);
+            ApplyFonts();
+            RenderView(); Repaint();
+        }
+
+        // Start a brand-new conversation in this window.
+        private void NewSession()
+        {
+            if (_native == null) return;
+            if (_viewId != 0) _native.AgentviewDestroy(Vid);
+            if (!string.IsNullOrEmpty(_claudeSessionId)) s_open.Remove(_claudeSessionId);
+            _claudeSessionId = "";
+            _scroll = 0f;
+            var (pw, ph) = CurrentPanelSize();
+            var (iw, ih) = CurrentInputSize();
+            _viewId = (long)_native.AgentviewCreate(ProjectRoot, pw, ph, iw, ih, ClaudeCode.ClaudePath);
+            ApplyFonts();
+            RenderView(); Repaint();
         }
     }
 }
