@@ -27,10 +27,10 @@ unicode-width = "0.1"
 alacritty_terminal = "0.25"
 portable-pty = "0.8"
 
-# In-process MCP server (HTTP/JSON-RPC) hosted in the plugin so it survives
-# Unity C# domain reloads. Tool defs + execution come from the C# side.
+# In-process MCP server hosted in the plugin so it survives Unity C# domain
+# reloads. No transport/port: the control-protocol driver dispatches the agent's
+# `mcp_message` requests straight in. Tool defs + execution come from the C# side.
 serde_json = "1"
-tiny_http = "0.12"
 
 # IOSurface zero-copy path (macOS). Versions pinned to what wgpu 22 resolves
 # (metal 0.29) so the raw MTLDevice/MTLTexture handed to wgpu-hal matches.

@@ -11,6 +11,7 @@ use std::time::Instant;
 
 use crate::control::{self, Conv, Driver, RS, US};
 use crate::input::InputBox;
+use crate::mcp::McpDispatcher;
 use crate::panel::PanelRenderer;
 
 /// `poll()` result flags.
@@ -47,6 +48,7 @@ pub struct AgentView {
 impl AgentView {
     pub fn new(
         cwd: String,
+        mcp: Option<McpDispatcher>,
         resume: Option<String>,
         panel_w: u32,
         panel_h: u32,
@@ -58,7 +60,7 @@ impl AgentView {
             Some(id) if !id.is_empty() => control::reconstruct_transcript(id, &cwd),
             _ => Conv::new(),
         };
-        let (driver, fail) = match Driver::new(cwd, resume, seed, claude_cmd) {
+        let (driver, fail) = match Driver::new(cwd, mcp, resume, seed, claude_cmd) {
             Ok(d) => (Some(d), String::new()),
             Err(e) => (None, e.to_string()),
         };

@@ -21,6 +21,7 @@ mod input;
 #[cfg(target_os = "macos")]
 mod iosurface;
 mod keys;
+mod mcp;
 mod palette;
 mod panel;
 mod pty;
@@ -529,6 +530,57 @@ pub unsafe extern "C" fn unterm_title(id: u64, out_len: *mut usize) -> *const c_
     c.as_ptr()
 }
 
+// ===========================================================================
+// Shared MCP server, held in native globals so it survives C# domain reloads:
+// the tool catalog and the queued calls stay alive across recompiles. There is
+// one server per editor; the Unity side supplies the tool catalog and executes
+// queued calls on its main thread. The agent connects in-process over the
+// control protocol, so there is no socket and no URL — `mcp_message` requests
+// are dispatched straight into the queue.
+// ===========================================================================
+
+fn mcp_call_snap() -> &'static Mutex<CString> {
+    static C: OnceLock<Mutex<CString>> = OnceLock::new();
+    C.get_or_init(|| Mutex::new(CString::default()))
+}
+
+/// A transport-free handle onto the in-process MCP server's queue for the
+/// control-protocol driver. Dispatches land in the same queue the Unity side
+/// drains over the FFI below. There is no socket to fail to bind, so this never
+/// fails — the `Option` only keeps the driver's signature uniform.
+fn ensure_mcp_dispatcher() -> Option<crate::mcp::McpDispatcher> {
+    Some(crate::mcp::dispatcher())
+}
+
+/// Publish the tool list (JSON array of {name,description,inputSchema}).
+#[no_mangle]
+pub unsafe extern "C" fn unterm_mcp_set_tools(json: *const c_char) {
+    let json = cstr(json);
+    crate::mcp::dispatcher().set_tools(&json);
+}
+
+/// Pop the next queued tool call as `{id,name,args}` JSON, or null if none.
+#[no_mangle]
+pub unsafe extern "C" fn unterm_mcp_next_call(out_len: *mut usize) -> *const c_char {
+    let Some(call) = crate::mcp::dispatcher().next_call() else {
+        return std::ptr::null();
+    };
+    let mut snap = mcp_call_snap().lock().unwrap();
+    *snap = CString::new(call).unwrap_or_default();
+    if !out_len.is_null() {
+        unsafe { *out_len = snap.as_bytes().len() };
+    }
+    let ptr = snap.as_ptr();
+    drop(snap);
+    ptr
+}
+
+/// Answer a tool call (id from next_call) with the MCP tool result JSON.
+#[no_mangle]
+pub unsafe extern "C" fn unterm_mcp_respond(id: u64, result_json: *const c_char) {
+    let result = cstr(result_json);
+    crate::mcp::dispatcher().respond(id, &result);
+}
 static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 
 
@@ -575,8 +627,9 @@ pub unsafe extern "C" fn unterm_agentview_create(
     claude_cmd: *const c_char,
 ) -> u64 {
     init_log();
+    let mcp = ensure_mcp_dispatcher();
     let id = NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed);
-    let v = AgentView::new(cstr(cwd), None, pw.max(1), ph.max(1), iw.max(1), ih.max(1), cstr(claude_cmd));
+    let v = AgentView::new(cstr(cwd), mcp, None, pw.max(1), ph.max(1), iw.max(1), ih.max(1), cstr(claude_cmd));
     views().lock().unwrap().insert(id, Box::new(v));
     id
 }
@@ -596,12 +649,13 @@ pub unsafe extern "C" fn unterm_agentview_load(
     claude_cmd: *const c_char,
 ) -> u64 {
     init_log();
+    let mcp = ensure_mcp_dispatcher();
     let resume = {
         let s = cstr(resume);
         (!s.is_empty()).then_some(s)
     };
     let id = NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed);
-    let v = AgentView::new(cstr(cwd), resume, pw.max(1), ph.max(1), iw.max(1), ih.max(1), cstr(claude_cmd));
+    let v = AgentView::new(cstr(cwd), mcp, resume, pw.max(1), ph.max(1), iw.max(1), ih.max(1), cstr(claude_cmd));
     views().lock().unwrap().insert(id, Box::new(v));
     id
 }

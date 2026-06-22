@@ -38,6 +38,7 @@ use std::sync::{Arc, Mutex};
 
 use serde_json::{json, Value};
 
+use crate::mcp::McpDispatcher;
 
 /// Transcript field separators, mirrored by the C# parser: role-tagged blocks
 /// `role{US}body` joined by `{RS}`. (ASCII record/unit separators.)
@@ -296,6 +297,7 @@ struct State {
     remembered: Mutex<HashMap<String, bool>>, // tool_name -> allow (session "always")
     ready: AtomicBool,
     outbox: Mutex<Vec<String>>, // prompts buffered until `initialize` completes
+    mcp: Option<McpDispatcher>,
     init_id: String,
 }
 
@@ -359,6 +361,7 @@ impl Driver {
     /// [`Conv`] for a fresh session.
     pub fn new(
         cwd: String,
+        mcp: Option<McpDispatcher>,
         resume: Option<String>,
         seed: Conv,
         claude_cmd: String,
@@ -435,6 +438,7 @@ impl Driver {
             remembered: Mutex::new(HashMap::new()),
             ready: AtomicBool::new(false),
             outbox: Mutex::new(Vec::new()),
+            mcp,
             init_id: init_id.clone(),
         });
 
@@ -829,8 +833,30 @@ fn handle_control_request(state: &Arc<State>, v: &Value) {
             }
         }
         Some("mcp_message") => {
-            // No in-process MCP server yet; decline so the engine doesn't hang.
-            state.write_control_error(&request_id, "MCP unavailable");
+            if req["server_name"].as_str() != Some("unity") {
+                state.write_control_error(&request_id, "unknown MCP server");
+                return;
+            }
+            let Some(mcp) = state.mcp.clone() else {
+                state.write_control_error(&request_id, "MCP unavailable");
+                return;
+            };
+            let message = req["message"].clone();
+            let st = state.clone();
+            // `tools/call` blocks on the Unity side — keep it off the reader thread.
+            std::thread::spawn(move || {
+                let mcp_response = mcp
+                    .dispatch(&message)
+                    .unwrap_or_else(|| json!({ "jsonrpc": "2.0", "result": {}, "id": 0 }));
+                st.write_value(&json!({
+                    "type": "control_response",
+                    "response": {
+                        "subtype": "success",
+                        "request_id": request_id,
+                        "response": { "mcp_response": mcp_response }
+                    }
+                }));
+            });
         }
         Some("request_user_dialog") => {
             // We answer AskUserQuestion via the `can_use_tool` result, and stdio

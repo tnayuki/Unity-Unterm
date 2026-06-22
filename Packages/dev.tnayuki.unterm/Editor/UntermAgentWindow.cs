@@ -140,6 +140,10 @@ namespace Unterm.Editor
                 var (pw, ph) = CurrentPanelSize();
                 var (iw, ih) = CurrentInputSize();
 
+                // Ensure the editor-global in-process MCP server is up (and its
+                // tools published) before the session wires the agent to it.
+                UntermMcp.EnsureStarted();
+
                 // Re-adopt the existing view across reload, else start a fresh one.
                 if (_viewId == 0 || !_native.AgentviewExists(Vid))
                 {

@@ -90,6 +90,9 @@ namespace Unterm.Editor
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate IntPtr TitleFn(ulong id, out UIntPtr len);
 
         // --- shared MCP server bridge (editor-global; no terminal id) ---
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate IntPtr McpBufFn(out UIntPtr len);
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate void McpSetToolsFn([MarshalAs(UnmanagedType.LPUTF8Str)] string json);
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate void McpRespondFn(ulong id, [MarshalAs(UnmanagedType.LPUTF8Str)] string resultJson);
 
         // --- agent view (id-based; owns session + transcript panel + input box;
         // survives reload via a process-global registry). All symbols prefixed
@@ -130,6 +133,7 @@ namespace Unterm.Editor
         private SelStartFn _selStart; private SelUpdateFn _selUpdate; private IdFn _selClear; private TitleFn _selText;
         private BoolFn _isAlive; private PtrFn _iosurface; private PtrFn _rawTexture;
         private SizeFn _size; private SizeFn _gridSize; private ScrollStateFn _scrollState; private CursorPxFn _cursorPx; private TitleFn _title;
+        private McpSetToolsFn _mcpSetTools; private McpBufFn _mcpNextCall; private McpRespondFn _mcpRespond;
         private AvCreateFn _avCreate; private AvLoadFn _avLoad; private AvExistsFn _avExists; private AvVoidFn _avDestroy;
         private AvPollFn _avPoll; private AvVoidFn _avRender; private AvResizeFn _avResize; private AvThemeFn _avSetTheme; private AvFontsFn _avSetFonts;
         private AvPtrFn _avPanelTexture; private AvPtrFn _avInputTexture;
@@ -221,6 +225,9 @@ namespace Unterm.Editor
             _cursorPx = Sym<CursorPxFn>("unterm_cursor_px");
             _title = Sym<TitleFn>("unterm_title");
 
+            _mcpSetTools = Sym<McpSetToolsFn>("unterm_mcp_set_tools");
+            _mcpNextCall = Sym<McpBufFn>("unterm_mcp_next_call");
+            _mcpRespond = Sym<McpRespondFn>("unterm_mcp_respond");
 
             _avCreate = Sym<AvCreateFn>("unterm_agentview_create");
             _avLoad = Sym<AvLoadFn>("unterm_agentview_load");
@@ -340,6 +347,15 @@ namespace Unterm.Editor
             return Utf8(p, len);
         }
 
+        // --- shared MCP server (editor-global, survives reloads) ---
+        public void McpSetTools(string json) => _mcpSetTools(json ?? "[]");
+        /// The next queued tool call as `{id,name,args}` JSON, or "" if none.
+        public string McpNextCall()
+        {
+            var p = _mcpNextCall(out UIntPtr len);
+            return Utf8(p, len);
+        }
+        public void McpRespond(ulong id, string resultJson) => _mcpRespond(id, resultJson ?? "{}");
 
         // --- agent view (id-based; owns session + transcript panel + input box) ---
         /// Start a new conversation rooted at `cwd`; returns the view id. Sizes are
@@ -418,6 +434,7 @@ namespace Unterm.Editor
             _isAlive = null; _iosurface = null; _rawTexture = null;
             _paste = null; _clear = null;
             _size = null; _gridSize = null; _scrollState = null; _cursorPx = null; _title = null;
+            _mcpSetTools = null; _mcpNextCall = null; _mcpRespond = null;
             _avCreate = null; _avLoad = null; _avExists = null; _avDestroy = null;
             _avPoll = null; _avRender = null; _avResize = null; _avSetTheme = null; _avSetFonts = null;
             _avPanelTexture = null; _avInputTexture = null;
