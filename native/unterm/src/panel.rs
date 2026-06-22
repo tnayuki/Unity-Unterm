@@ -78,6 +78,23 @@ struct Measured {
     indent: f32,     // left indent in physical px (lists / quotes)
     code: bool,      // a code block: rendered unwrapped + horizontally scrollable
     natural_w: f32,  // unwrapped content width (code blocks only)
+    table: Option<TableMeasured>, // a drawn grid of cells (overrides `buffer`)
+}
+
+/// A measured table: positioned cell buffers plus the grid-line/header rects to
+/// draw behind them (all relative to the block's top-left).
+struct TableMeasured {
+    cells: Vec<TableCell>,
+    lines: Vec<[f32; 4]>, // grid line rects (x, y, w, h)
+    header_h: f32,        // height of the header row (for its background)
+    total_w: f32,
+}
+
+struct TableCell {
+    buffer: Buffer,
+    text: String,
+    dx: f32,
+    dy: f32,
 }
 
 /// A laid-out block kept after render() so mouse hit-testing/selection works
@@ -593,6 +610,43 @@ impl PanelRenderer {
         self.laid.clear();
         let mut live_keys: Vec<u64> = Vec::new();
         for m in measured {
+            // A table draws its own grid + header background, then places each
+            // cell buffer as its own laid block (so selection still works).
+            if let Some(tbl) = m.table {
+                let x0 = pad + m.indent;
+                quads.push(Quad {
+                    x: x0,
+                    y,
+                    w: tbl.total_w,
+                    h: tbl.header_h,
+                    color: [overlay, overlay, overlay, 0.07],
+                    radius: 0.0,
+                });
+                for ln in &tbl.lines {
+                    quads.push(Quad {
+                        x: x0 + ln[0],
+                        y: y + ln[1],
+                        w: ln[2],
+                        h: ln[3],
+                        color: [overlay, overlay, overlay, 0.22],
+                        radius: 0.0,
+                    });
+                }
+                for c in tbl.cells {
+                    self.laid.push(LaidBlock {
+                        buffer: c.buffer,
+                        text: c.text,
+                        tx: x0 + c.dx,
+                        ty: y + c.dy,
+                        hscroll: 0.0,
+                        clip: None,
+                        code_key: None,
+                        max_hscroll: 0.0,
+                    });
+                }
+                y += m.height + gap;
+                continue;
+            }
             let card = m.card_alpha > 0.0;
             let x0 = pad + m.indent;
             if card {
@@ -880,6 +934,7 @@ fn build_plain(
         indent: 0.0,
         code: false,
         natural_w: 0.0,
+        table: None,
     }
 }
 
@@ -953,7 +1008,7 @@ fn build_md(
             let (buffer, text) =
                 shape_spans(fs, spans, content_w, font_size, line_height, false, text_color, faces);
             let height = measure_height(&buffer);
-            Some(Measured { buffer, text, height, card_alpha: 0.0, indent: 0.0, code: false, natural_w: 0.0 })
+            Some(Measured { buffer, text, height, card_alpha: 0.0, indent: 0.0, code: false, natural_w: 0.0, table: None })
         }
         MB::Heading { level, spans } => {
             let scale = match level {
@@ -973,7 +1028,7 @@ fn build_md(
                 faces,
             );
             let height = measure_height(&buffer);
-            Some(Measured { buffer, text, height, card_alpha: 0.0, indent: 0.0, code: false, natural_w: 0.0 })
+            Some(Measured { buffer, text, height, card_alpha: 0.0, indent: 0.0, code: false, natural_w: 0.0, table: None })
         }
         MB::Code { text, lang, diff } => {
             // Code is rendered unwrapped and clipped to the card; the panel
@@ -1039,6 +1094,7 @@ fn build_md(
                 indent: 0.0,
                 code: true,
                 natural_w,
+                table: None,
             })
         }
         MB::ListItem { depth, marker, spans } => {
@@ -1060,7 +1116,7 @@ fn build_md(
                 faces,
             );
             let height = measure_height(&buffer);
-            Some(Measured { buffer, text, height, card_alpha: 0.0, indent, code: false, natural_w: 0.0 })
+            Some(Measured { buffer, text, height, card_alpha: 0.0, indent, code: false, natural_w: 0.0, table: None })
         }
         MB::Quote(spans) => {
             let indent = font_size;
@@ -1075,10 +1131,130 @@ fn build_md(
                 faces,
             );
             let height = measure_height(&buffer);
-            Some(Measured { buffer, text, height, card_alpha: 0.0, indent, code: false, natural_w: 0.0 })
+            Some(Measured { buffer, text, height, card_alpha: 0.0, indent, code: false, natural_w: 0.0, table: None })
+        }
+        MB::Table { headers, rows } => {
+            build_table(fs, headers, rows, content_w, font_size, line_height, faces, text_color)
         }
         MB::Rule => None,
     }
+}
+
+/// Lay out a Markdown table into positioned cell buffers plus grid-line rects.
+/// Columns size to their content, scaled down to fit `content_w` (cells then
+/// wrap). Returns None for an empty table.
+fn build_table(
+    fs: &mut FontSystem,
+    headers: &[Vec<markdown::Span>],
+    rows: &[Vec<Vec<markdown::Span>>],
+    content_w: f32,
+    font_size: f32,
+    line_height: f32,
+    faces: Faces,
+    text_color: Color,
+) -> Option<Measured> {
+    let cols = headers
+        .len()
+        .max(rows.iter().map(|r| r.len()).max().unwrap_or(0));
+    if cols == 0 {
+        return None;
+    }
+    let border = (font_size / 14.0).round().max(1.0);
+    let pad_x = font_size * 0.6;
+    let pad_y = line_height * 0.3;
+
+    // All rows (header first) as cell-span slices, padded to `cols`.
+    let empty: Vec<markdown::Span> = Vec::new();
+    let all: Vec<Vec<&Vec<markdown::Span>>> = std::iter::once(headers)
+        .chain(rows.iter().map(|r| r.as_slice()))
+        .map(|r: &[Vec<markdown::Span>]| (0..cols).map(|i| r.get(i).unwrap_or(&empty)).collect())
+        .collect();
+
+    // Natural column widths (unwrapped cell content), then fit to content_w.
+    let mut col_w = vec![0.0_f32; cols];
+    for row in &all {
+        for (i, cell) in row.iter().enumerate() {
+            let (buf, _) = shape_spans(fs, cell, 1.0e6, font_size, line_height, false, text_color, faces);
+            col_w[i] = col_w[i].max(measure_width(&buf) + pad_x * 2.0);
+        }
+    }
+    let min_col = font_size * 2.0 + pad_x * 2.0;
+    let avail = (content_w - border * (cols as f32 + 1.0)).max(min_col * cols as f32);
+    let sum: f32 = col_w.iter().sum();
+    if sum > avail {
+        let factor = avail / sum;
+        for w in &mut col_w {
+            *w = (*w * factor).max(min_col);
+        }
+    }
+
+    // Shape each cell wrapped to its column, tracking per-row heights.
+    let n_rows = all.len();
+    let mut cells_grid: Vec<Vec<(Buffer, String, f32)>> = Vec::with_capacity(n_rows);
+    let mut row_h = vec![0.0_f32; n_rows];
+    for (r, row) in all.iter().enumerate() {
+        let mut out_row = Vec::with_capacity(cols);
+        for (i, cell) in row.iter().enumerate() {
+            let inner = (col_w[i] - pad_x * 2.0).max(1.0);
+            let header = r == 0;
+            let (buf, text) =
+                shape_spans(fs, cell, inner, font_size, line_height, header, text_color, faces);
+            let h = measure_height(&buf);
+            row_h[r] = row_h[r].max(h);
+            out_row.push((buf, text, h));
+        }
+        row_h[r] += pad_y * 2.0;
+        cells_grid.push(out_row);
+    }
+
+    // Place cells + build grid lines (all relative to the table's top-left).
+    let total_w = border * (cols as f32 + 1.0) + col_w.iter().sum::<f32>();
+    let total_h = border * (n_rows as f32 + 1.0) + row_h.iter().sum::<f32>();
+    let mut cells = Vec::new();
+    let mut lines = Vec::new();
+
+    // Vertical lines.
+    let mut vx = 0.0;
+    for i in 0..=cols {
+        lines.push([vx, 0.0, border, total_h]);
+        if i < cols {
+            vx += border + col_w[i];
+        }
+    }
+    // Horizontal lines + cell placement.
+    let mut hy = 0.0;
+    for r in 0..n_rows {
+        lines.push([0.0, hy, total_w, border]);
+        let cy = hy + border + pad_y;
+        let mut cx = border;
+        for (i, (buf, text, _)) in cells_grid[r].drain(..).enumerate() {
+            cells.push(TableCell {
+                buffer: buf,
+                text,
+                dx: cx + pad_x,
+                dy: cy,
+            });
+            cx += col_w[i] + border;
+        }
+        hy += border + row_h[r];
+    }
+    lines.push([0.0, hy, total_w, border]); // bottom
+
+    Some(Measured {
+        buffer: Buffer::new(fs, Metrics::new(font_size, line_height)),
+        text: String::new(),
+        height: total_h,
+        card_alpha: 0.0,
+        indent: 0.0,
+        code: false,
+        natural_w: 0.0,
+        table: Some(TableMeasured {
+            cells,
+            lines,
+            header_h: border + row_h[0],
+            total_w,
+        }),
+    })
 }
 
 /// Scale a color's alpha (for dimmed thoughts / tool text).

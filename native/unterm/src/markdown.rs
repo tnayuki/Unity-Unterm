@@ -6,7 +6,7 @@
 //! block quotes, and horizontal rules, with inline bold / italic / code / link
 //! styling carried per text span.
 
-use pulldown_cmark::{CodeBlockKind, Event, Parser, Tag, TagEnd};
+use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 
 /// A run of text with uniform inline styling.
 #[derive(Clone, Default)]
@@ -29,6 +29,11 @@ pub enum Block {
     },
     ListItem { depth: u8, marker: String, spans: Vec<Span> },
     Quote(Vec<Span>),
+    /// A table: a header row then body rows; each cell is a run of spans.
+    Table {
+        headers: Vec<Vec<Span>>,
+        rows: Vec<Vec<Vec<Span>>>,
+    },
     Rule,
 }
 
@@ -54,6 +59,12 @@ pub fn parse(md: &str) -> Vec<Block> {
     let mut code_lang: Option<String> = None;
     let mut code_diff = false;
 
+    // GFM tables: collected as rows of styled-span cells (header row first).
+    let mut in_cell = false;
+    let mut table_rows: Vec<Vec<Vec<Span>>> = Vec::new();
+    let mut cur_row: Vec<Vec<Span>> = Vec::new();
+    let mut cur_cell: Vec<Span> = Vec::new();
+
     let push_span = |spans: &mut Vec<Span>, text: String, b: u32, i: u32, c: bool, l: u32| {
         if text.is_empty() {
             return;
@@ -67,7 +78,7 @@ pub fn parse(md: &str) -> Vec<Block> {
         });
     };
 
-    for ev in Parser::new(md) {
+    for ev in Parser::new_ext(md, Options::ENABLE_TABLES) {
         match ev {
             Event::Start(tag) => match tag {
                 Tag::Strong => bold += 1,
@@ -105,6 +116,14 @@ pub fn parse(md: &str) -> Vec<Block> {
                     quote += 1;
                     spans.clear();
                 }
+                Tag::Table(_) => {
+                    table_rows.clear();
+                }
+                Tag::TableHead | Tag::TableRow => cur_row.clear(),
+                Tag::TableCell => {
+                    in_cell = true;
+                    cur_cell = Vec::new();
+                }
                 _ => {}
             },
             Event::End(tag) => match tag {
@@ -137,6 +156,20 @@ pub fn parse(md: &str) -> Vec<Block> {
                     quote = quote.saturating_sub(1);
                     out.push(Block::Quote(std::mem::take(&mut spans)));
                 }
+                TagEnd::TableCell => {
+                    in_cell = false;
+                    cur_row.push(std::mem::take(&mut cur_cell));
+                }
+                TagEnd::TableHead | TagEnd::TableRow => {
+                    table_rows.push(std::mem::take(&mut cur_row));
+                }
+                TagEnd::Table => {
+                    let mut all = std::mem::take(&mut table_rows);
+                    if !all.is_empty() {
+                        let headers = all.remove(0);
+                        out.push(Block::Table { headers, rows: all });
+                    }
+                }
                 TagEnd::Paragraph => {
                     // A paragraph inside a list item or quote keeps its spans for
                     // that container's End to flush; a top-level one is its own block.
@@ -147,26 +180,34 @@ pub fn parse(md: &str) -> Vec<Block> {
                 _ => {}
             },
             Event::Text(t) => {
-                if in_code {
+                if in_cell {
+                    push_span(&mut cur_cell, t.to_string(), bold, italic, false, link);
+                } else if in_code {
                     code_text.push_str(&t);
                 } else {
                     push_span(&mut spans, t.to_string(), bold, italic, false, link);
                 }
             }
             Event::Code(t) => {
-                if !in_code {
+                if in_cell {
+                    push_span(&mut cur_cell, t.to_string(), bold, italic, true, link);
+                } else if !in_code {
                     push_span(&mut spans, t.to_string(), bold, italic, true, link);
                 }
             }
             Event::SoftBreak => {
-                if in_code {
+                if in_cell {
+                    push_span(&mut cur_cell, " ".to_string(), bold, italic, false, link);
+                } else if in_code {
                     code_text.push('\n');
                 } else {
                     push_span(&mut spans, " ".to_string(), bold, italic, false, link);
                 }
             }
             Event::HardBreak => {
-                if in_code {
+                if in_cell {
+                    push_span(&mut cur_cell, " ".to_string(), bold, italic, false, link);
+                } else if in_code {
                     code_text.push('\n');
                 } else {
                     push_span(&mut spans, "\n".to_string(), bold, italic, false, link);
@@ -179,3 +220,4 @@ pub fn parse(md: &str) -> Vec<Block> {
 
     out
 }
+
