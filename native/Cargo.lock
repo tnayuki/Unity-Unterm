@@ -1754,6 +1754,7 @@ dependencies = [
  "bytemuck",
  "core-foundation 0.10.1",
  "core-foundation-sys",
+ "d3d12",
  "env_logger",
  "foreign-types",
  "glyphon",
@@ -1764,6 +1765,7 @@ dependencies = [
  "pollster",
  "portable-pty",
  "wgpu",
+ "winapi",
 ]
 
 [[package]]

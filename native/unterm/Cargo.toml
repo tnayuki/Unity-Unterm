@@ -34,6 +34,28 @@ objc = "0.2"
 core-foundation = "0.10"
 core-foundation-sys = "0.8"
 
+# Windows zero-copy path: create a shared D3D12 render target on wgpu's device
+# and open it on Unity's D3D11/D3D12 device. `d3d12` is pinned to what wgpu 22
+# resolves so the raw ID3D12Resource handed to wgpu-hal matches; `winapi` (the
+# COM crate that `d3d12` is built on) drives the shared-handle calls.
+[target.'cfg(windows)'.dependencies]
+d3d12 = "22"
+winapi = { version = "0.3", features = [
+    "d3d11",
+    "d3d11_1",
+    "d3d12",
+    "dxgi",
+    "dxgi1_4",
+    "dxgiformat",
+    "dxgitype",
+    "winnt",
+    "handleapi",
+    "unknwnbase",
+    "winerror",
+    "guiddef",
+    "minwindef",
+] }
+
 [dev-dependencies]
 # Headless verification: dump the rendered terminal to a PNG without the Editor.
 image = { version = "0.25", default-features = false, features = ["png"] }

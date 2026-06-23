@@ -22,16 +22,19 @@ pub struct Gpu {
 }
 
 fn init_gpu() -> Gpu {
+    // Windows must run on D3D12: the zero-copy surface opens wgpu's render target
+    // on Unity's device via `as_hal::<Dx12>` (see surface::d3d), which only works
+    // if wgpu itself picked the D3D12 backend (PRIMARY could otherwise pick
+    // Vulkan). Elsewhere, PRIMARY (Metal on macOS) is correct.
+    #[cfg(windows)]
+    let backends = wgpu::Backends::DX12;
+    #[cfg(not(windows))]
+    let backends = wgpu::Backends::PRIMARY;
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-        backends: wgpu::Backends::PRIMARY,
+        backends,
         ..Default::default()
     });
-    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-        power_preference: wgpu::PowerPreference::HighPerformance,
-        force_fallback_adapter: false,
-        compatible_surface: None,
-    }))
-    .expect("unterm: no suitable GPU adapter");
+    let adapter = pick_adapter(&instance);
 
     let (device, queue) = pollster::block_on(adapter.request_device(
         &wgpu::DeviceDescriptor {
@@ -50,6 +53,42 @@ fn init_gpu() -> Gpu {
 
     let cache = Cache::new(&device);
     Gpu { device, queue, cache }
+}
+
+/// Pick the GPU adapter. On Windows the zero-copy surface shares a texture handle
+/// between wgpu's device and Unity's, which only works on the *same* physical
+/// adapter — opening the handle on a different adapter (a discrete vs integrated
+/// GPU) yields a garbled image. So match Unity's adapter by PCI vendor/device id
+/// (captured in `UnityPluginLoad`); fall back to high-performance if unknown or
+/// unmatched. Elsewhere there's no cross-device sharing, so just take the
+/// high-performance adapter.
+fn pick_adapter(instance: &wgpu::Instance) -> wgpu::Adapter {
+    #[cfg(windows)]
+    if let Some((vendor, device)) = crate::unity::unity_adapter_ids() {
+        for a in instance.enumerate_adapters(wgpu::Backends::DX12) {
+            let info = a.get_info();
+            if info.vendor == vendor && info.device == device {
+                log::info!(
+                    "unterm: matched wgpu adapter to Unity's: {} (vendor:0x{vendor:04x} device:0x{device:04x})",
+                    info.name
+                );
+                return a;
+            }
+        }
+        log::warn!(
+            "unterm: no wgpu adapter matched Unity's (vendor:0x{vendor:04x} device:0x{device:04x}); \
+             zero-copy may garble across adapters"
+        );
+    } else {
+        log::warn!("unterm: Unity adapter unknown at GPU init; using high-performance adapter");
+    }
+
+    pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::HighPerformance,
+        force_fallback_adapter: false,
+        compatible_surface: None,
+    }))
+    .expect("unterm: no suitable GPU adapter")
 }
 
 /// The shared GPU context, created on first use.

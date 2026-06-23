@@ -15,13 +15,18 @@
 //! ```
 
 mod gpu;
+#[cfg(target_os = "macos")]
 mod iosurface;
 mod keys;
 mod palette;
 mod pty;
 mod quads;
 mod renderer;
+mod shell;
+mod surface;
 mod term;
+#[cfg(windows)]
+mod unity;
 
 use std::collections::HashMap;
 use std::ffi::{c_char, c_void, CStr};
@@ -100,12 +105,13 @@ fn rgb(packed: u32) -> [u8; 3] {
     [(packed >> 16) as u8, (packed >> 8) as u8, packed as u8]
 }
 
-/// Run `f` against the terminal with `id`, returning `default` if absent.
+/// Run `f` against the terminal with `id`, returning `default` if absent or if
+/// `f` panics (the panic is contained so it can't unwind into Unity).
 fn with_term<R>(id: u64, default: R, f: impl FnOnce(&mut Terminal) -> R) -> R {
-    match registry().lock().unwrap().get_mut(&id) {
-        Some(t) => f(t),
-        None => default,
-    }
+    // `None` distinguishes absent/panicked from a real result; both fall back to
+    // `default` without needing it inside the guarded closure.
+    let ran = ffi_guard(None, || lock_registry().get_mut(&id).map(|t| f(t)));
+    ran.unwrap_or(default)
 }
 
 /// Create a terminal sized to `width`x`height` physical px at `scale`, running
@@ -203,7 +209,7 @@ pub unsafe extern "C" fn unterm_create_dead(
 /// Whether a terminal id is still live (used to re-adopt after a reload).
 #[no_mangle]
 pub extern "C" fn unterm_exists(id: u64) -> bool {
-    registry().lock().unwrap().contains_key(&id)
+    lock_registry().contains_key(&id)
 }
 
 /// The whole buffer (scrollback + screen) as truecolor-SGR text. Writes the byte
@@ -237,7 +243,7 @@ pub unsafe extern "C" fn unterm_cwd(id: u64, out_len: *mut usize) -> *const u8 {
 /// Destroy a terminal (kills its shell and frees the GPU surface).
 #[no_mangle]
 pub extern "C" fn unterm_destroy(id: u64) {
-    registry().lock().unwrap().remove(&id);
+    lock_registry().remove(&id);
 }
 
 /// Resize to `width`x`height` physical px at `scale`.
@@ -345,7 +351,7 @@ pub extern "C" fn unterm_selection_clear(id: u64) {
 /// next call on this terminal (empty if nothing is selected). Writes the length.
 #[no_mangle]
 pub unsafe extern "C" fn unterm_selection_text(id: u64, out_len: *mut usize) -> *const c_char {
-    let mut map = registry().lock().unwrap();
+    let mut map = lock_registry();
     let Some(t) = map.get_mut(&id) else {
         if !out_len.is_null() {
             unsafe { *out_len = 0 };
@@ -371,6 +377,14 @@ pub extern "C" fn unterm_dirty(id: u64) -> bool {
     with_term(id, false, |t| t.dirty())
 }
 
+/// Advance the render-target swapchain on a host tick: promotes a finished frame
+/// to the front even while idle (double-buffered zero-copy). Returns true if the
+/// displayed buffer changed, so the host can repaint.
+#[no_mangle]
+pub extern "C" fn unterm_present(id: u64) -> bool {
+    with_term(id, false, |t| t.advance())
+}
+
 /// Whether the shell is still running.
 #[no_mangle]
 pub extern "C" fn unterm_is_alive(id: u64) -> bool {
@@ -389,29 +403,10 @@ pub extern "C" fn unterm_raw_texture(id: u64) -> *mut c_void {
     with_term(id, std::ptr::null_mut(), |t| t.renderer().raw_texture())
 }
 
-/// Pointer to the last rendered RGBA8 pixels (readback fallback). Writes the
-/// byte length; returns null if nothing rendered yet.
-#[no_mangle]
-pub unsafe extern "C" fn unterm_get_pixels(id: u64, out_len: *mut usize) -> *const u8 {
-    let mut map = registry().lock().unwrap();
-    let Some(t) = map.get_mut(&id) else {
-        return std::ptr::null();
-    };
-    let px = t.read_pixels();
-    if !out_len.is_null() {
-        unsafe { *out_len = px.len() };
-    }
-    if px.is_empty() {
-        std::ptr::null()
-    } else {
-        px.as_ptr()
-    }
-}
-
 /// Write the current pixel size into `width`/`height` (either may be null).
 #[no_mangle]
 pub unsafe extern "C" fn unterm_size(id: u64, width: *mut u32, height: *mut u32) {
-    let map = registry().lock().unwrap();
+    let map = lock_registry();
     if let Some(t) = map.get(&id) {
         let (w, h) = t.renderer().size();
         if !width.is_null() {
@@ -433,7 +428,7 @@ pub unsafe extern "C" fn unterm_cursor_px(
     w: *mut f32,
     h: *mut f32,
 ) -> bool {
-    let map = registry().lock().unwrap();
+    let map = lock_registry();
     let Some(t) = map.get(&id) else {
         return false;
     };
@@ -462,7 +457,7 @@ pub unsafe extern "C" fn unterm_cursor_px(
 /// Write the current grid size into `cols`/`rows` (either may be null).
 #[no_mangle]
 pub unsafe extern "C" fn unterm_grid_size(id: u64, cols: *mut u32, rows: *mut u32) {
-    let map = registry().lock().unwrap();
+    let map = lock_registry();
     if let Some(t) = map.get(&id) {
         if !cols.is_null() {
             unsafe { *cols = t.cols() as u32 };
@@ -484,7 +479,7 @@ pub unsafe extern "C" fn unterm_scroll_state(
     offset: *mut u32,
     screen: *mut u32,
 ) {
-    let map = registry().lock().unwrap();
+    let map = lock_registry();
     if let Some(t) = map.get(&id) {
         let (h, o, s) = t.scroll_state();
         unsafe {
@@ -505,7 +500,7 @@ pub unsafe extern "C" fn unterm_scroll_state(
 /// UTF-8 string valid until the next call on this terminal. Writes the length.
 #[no_mangle]
 pub unsafe extern "C" fn unterm_title(id: u64, out_len: *mut usize) -> *const c_char {
-    let mut map = registry().lock().unwrap();
+    let mut map = lock_registry();
     let Some(t) = map.get_mut(&id) else {
         return std::ptr::null();
     };

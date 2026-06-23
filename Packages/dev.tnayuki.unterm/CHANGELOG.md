@@ -4,6 +4,7 @@
 
 ### Added
 
+- **Windows support** — the terminal now runs in the Windows Editor too (PowerShell/cmd over a ConPTY), rendered zero-copy via a shared D3D12 texture handed to Unity's own device.
 - **Session restore** — terminals restore their scrollback across a full editor restart (not just a C# domain reload); a window whose shell had already exited is restored read-only.
 - **Working-directory restore** — a resumed terminal reopens in the shell's last working directory, falling back to the project root if that directory is gone.
 

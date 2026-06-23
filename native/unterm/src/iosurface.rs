@@ -41,7 +41,11 @@ pub struct SharedSurface {
     /// Raw `id<MTLTexture>` (owned by `texture`; valid while it lives).
     /// Stage 2 hands Unity a sibling texture made from the same IOSurface.
     raw_texture: *mut c_void,
-    pub texture: wgpu::Texture,
+    /// Owns the wgpu texture's retain on the IOSurface; never read directly, but
+    /// must outlive the surface (see `Drop`), so it's held for its lifetime.
+    #[allow(dead_code)]
+    texture: wgpu::Texture,
+    view: wgpu::TextureView,
 }
 
 // The IOSurface/MTLTexture raw handles are reference-counted Obj-C objects.
@@ -57,6 +61,28 @@ impl SharedSurface {
 
     pub fn raw_texture(&self) -> *mut c_void {
         self.raw_texture
+    }
+
+    /// The render target view (single-buffered on macOS).
+    pub fn view(&self) -> &wgpu::TextureView {
+        &self.view
+    }
+
+    /// The renderer draws straight into the IOSurface texture, so there's nothing
+    /// to blit afterwards (unlike the Windows copy-into-shared-texture path).
+    pub fn finish_frame(&self, _encoder: &mut wgpu::CommandEncoder) {}
+
+    /// No swapchain on macOS — the IOSurface is sampled directly.
+    pub fn begin_frame(&mut self) {}
+
+    /// Block until the frame is done so Unity samples a finished IOSurface.
+    pub fn present(&mut self) {
+        crate::gpu::gpu().device.poll(wgpu::Maintain::Wait);
+    }
+
+    /// Single-buffered — nothing to advance on idle ticks.
+    pub fn advance(&mut self) -> bool {
+        false
     }
 }
 
@@ -150,11 +176,13 @@ pub fn create_shared_target(
 
     let texture =
         unsafe { device.create_texture_from_hal::<wgpu::hal::api::Metal>(hal_tex, &tex_desc) };
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
 
     SharedSurface {
         surface,
         raw_texture,
         texture,
+        view,
     }
 }
 

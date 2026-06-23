@@ -1,6 +1,7 @@
 # Config for `cargo about` — generates the third-party license notices bundled
-# with unterm.bundle. The bundle is macOS-only, so we filter to that target and
-# drop build/dev-only crates that never end up in the shipped cdylib.
+# with the native plugin. We filter to the shipped targets (macOS + Windows) so
+# the scan covers every crate that ends up in a distributed cdylib and drops
+# build/dev-only and other-platform crates.
 accepted = [
     "MIT",
     "Apache-2.0",
@@ -16,8 +17,11 @@ accepted = [
     "MPL-2.0",
 ]
 
-# Only the macOS aarch64/x86_64 targets matter; this prunes Windows/Linux-only deps.
+# The shipped targets: macOS aarch64/x86_64 and Windows x86_64. This prunes
+# Linux-only deps while still covering the Windows-only crates (windows, d3d12,
+# gpu-allocator, hassle-rs, …) that go into unterm.dll.
 targets = [
     "aarch64-apple-darwin",
     "x86_64-apple-darwin",
+    "x86_64-pc-windows-msvc",
 ]

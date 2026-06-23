@@ -16,7 +16,7 @@ use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::{point_to_viewport, TermMode, Term};
 
 use crate::gpu::{self, FORMAT};
-use crate::iosurface::{IOSurfaceRef, SharedSurface};
+use crate::surface::{IOSurfaceRef, SharedSurface};
 use crate::palette::{self, Theme};
 use crate::quads::{Quad, QuadRenderer};
 use crate::term::EventProxy;
@@ -46,9 +46,9 @@ struct CellVis {
 pub struct Renderer {
     width: u32,
     height: u32,
+    /// The render target. Single-buffered and synchronous on both platforms; the
+    /// renderer drives it through `begin_frame`/`view`/`finish_frame`/`present`.
     shared: SharedSurface,
-    view: wgpu::TextureView,
-    pixels: Vec<u8>,
 
     /// Cursor rect in physical px from the last render (x, y, w, h), if shown.
     /// Exposed so the host can place the IME composition/candidate window.
@@ -78,7 +78,7 @@ impl Renderer {
         let max = g.device.limits().max_texture_dimension_2d;
         let width = width.clamp(1, max);
         let height = height.clamp(1, max);
-        let (shared, view) = create_target(&g.device, width, height);
+        let shared = crate::surface::create_shared_target(&g.device, width, height, FORMAT);
         let viewport = Viewport::new(&g.device, &g.cache);
         let mut atlas = TextAtlas::new(&g.device, &g.queue, &g.cache, FORMAT);
         let text_renderer =
@@ -89,8 +89,6 @@ impl Renderer {
             width,
             height,
             shared,
-            view,
-            pixels: Vec::new(),
             cursor_px: None,
             scale: 1.0,
             font_pt: DEFAULT_FONT_PT,
@@ -172,9 +170,7 @@ impl Renderer {
         }
         self.width = width;
         self.height = height;
-        let (shared, view) = create_target(&g.device, width, height);
-        self.shared = shared;
-        self.view = view;
+        self.shared = crate::surface::create_shared_target(&g.device, width, height, FORMAT);
     }
 
     /// Map a physical-pixel coordinate to the (line, column) viewport cell it
@@ -257,6 +253,12 @@ impl Renderer {
         self.shared.raw_texture()
     }
 
+    /// Idle-tick hook for a swapchain to promote a finished frame; always false on
+    /// the single-buffered targets (kept for the host's polling interface).
+    pub fn advance(&mut self) -> bool {
+        self.shared.advance()
+    }
+
     /// Cursor rect (x, y, w, h) in physical px from the last render, if shown.
     pub fn cursor_px(&self) -> Option<[f32; 4]> {
         self.cursor_px
@@ -265,6 +267,8 @@ impl Renderer {
     /// Render `term`'s visible grid into the IOSurface target.
     pub fn render(&mut self, term: &Term<EventProxy>, theme: &Theme, focused: bool) {
         self.ensure_metrics();
+        // No-op on the single-buffered targets; kept for the surface interface.
+        self.shared.begin_frame();
 
         let grid = term.grid();
         let cols = grid.columns();
@@ -541,7 +545,7 @@ impl Renderer {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("unterm-pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &self.view,
+                    view: self.shared.view(),
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(clear),
@@ -557,71 +561,15 @@ impl Renderer {
                 .render(&self.atlas, &self.viewport, &mut pass)
                 .expect("unterm: glyphon render failed");
         }
+        // Blit the freshly rendered frame into the surface's presented texture.
+        // No-op on macOS (the IOSurface is the render target); on Windows it
+        // copies into the shared D3D texture so Unity sees a clean full frame.
+        self.shared.finish_frame(&mut encoder);
         g.queue.submit([encoder.finish()]);
-        // Force completion so Unity samples a finished frame (zero-copy has no
-        // readback to implicitly synchronize on).
-        g.device.poll(wgpu::Maintain::Wait);
+        // Block until the GPU finishes this frame so Unity samples a complete
+        // texture (synchronous on both platforms).
+        self.shared.present();
         self.atlas.trim();
-    }
-
-    /// Read the rendered framebuffer back as tightly-packed RGBA8 (top-down).
-    /// Used only by the CPU-readback fallback path.
-    pub fn read_rgba(&mut self) -> &[u8] {
-        let g = gpu::gpu();
-        let bpp = 4u32;
-        let unpadded = self.width * bpp;
-        let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
-        let padded = ((unpadded + align - 1) / align) * align;
-
-        let readback = g.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("unterm-readback"),
-            size: (padded * self.height) as u64,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
-        let mut encoder = g
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("unterm-readback-encoder"),
-            });
-        encoder.copy_texture_to_buffer(
-            wgpu::ImageCopyTexture {
-                texture: &self.shared.texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::ImageCopyBuffer {
-                buffer: &readback,
-                layout: wgpu::ImageDataLayout {
-                    offset: 0,
-                    bytes_per_row: Some(padded),
-                    rows_per_image: Some(self.height),
-                },
-            },
-            wgpu::Extent3d {
-                width: self.width,
-                height: self.height,
-                depth_or_array_layers: 1,
-            },
-        );
-        g.queue.submit([encoder.finish()]);
-
-        let slice = readback.slice(..);
-        slice.map_async(wgpu::MapMode::Read, |_| {});
-        g.device.poll(wgpu::Maintain::Wait);
-
-        let data = slice.get_mapped_range();
-        self.pixels.clear();
-        self.pixels.reserve((unpadded * self.height) as usize);
-        for row in 0..self.height {
-            let start = (row * padded) as usize;
-            let end = start + unpadded as usize;
-            self.pixels.extend_from_slice(&data[start..end]);
-        }
-        drop(data);
-        readback.unmap();
-        &self.pixels
     }
 }
 
@@ -636,14 +584,4 @@ fn linear(c: [u8; 3], a: f32) -> [f32; 4] {
         }
     }
     [ch(c[0]), ch(c[1]), ch(c[2]), a]
-}
-
-fn create_target(
-    device: &wgpu::Device,
-    width: u32,
-    height: u32,
-) -> (SharedSurface, wgpu::TextureView) {
-    let shared = crate::iosurface::create_shared_target(device, width, height, FORMAT);
-    let view = shared.texture.create_view(&wgpu::TextureViewDescriptor::default());
-    (shared, view)
 }

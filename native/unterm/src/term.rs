@@ -25,6 +25,7 @@ use crate::keys;
 use crate::palette::{self, Theme};
 use crate::pty::{self, Pty};
 use crate::renderer::Renderer;
+use crate::shell;
 
 /// Terminal grid size in cells. Scrollback is configured separately, so the
 /// `Dimensions` total is just the visible screen.
@@ -123,9 +124,9 @@ pub struct Terminal {
 impl Terminal {
     /// Create a terminal sized to `width`x`height` physical pixels at `scale`,
     /// rooted at `cwd` (empty = inherit). With an empty `command` it runs an
-    /// interactive `$SHELL`; otherwise it launches `command` directly in the PTY
-    /// via `$SHELL -lic "exec <command>"`, so rc is sourced (PATH resolves) and
-    /// the program replaces the shell as the PTY leader — no typed-ahead input.
+    /// interactive shell; otherwise it launches `command` directly in the PTY so
+    /// the program replaces the shell as the PTY leader (no typed-ahead input).
+    /// The shell and its launch arguments are picked per-OS by [`crate::shell`].
     pub fn new(width: u32, height: u32, scale: f32, cwd: &str, command: &str) -> Self {
         Self::build(width, height, scale, cwd, command, "", true)
     }
@@ -175,13 +176,9 @@ impl Terminal {
             Option<Pty>,
             Option<Box<dyn Read + Send>>,
         ) = if spawn {
-            let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
-            let args: Vec<String> = if command.is_empty() {
-                Vec::new()
-            } else {
-                vec!["-lic".to_string(), format!("exec {command}")]
-            };
-            let handles = pty::spawn(&shell, &args, cwd, cols as u16, rows as u16)
+            // Per-OS shell (macOS: $SHELL + `-lic exec`; Windows: PowerShell/cmd).
+            let spec = shell::resolve(command);
+            let handles = pty::spawn(&spec.program, &spec.args, cwd, cols as u16, rows as u16)
                 .expect("unterm: failed to spawn shell on PTY");
             (handles.writer, Some(handles.pty), Some(handles.reader))
         } else {
@@ -288,11 +285,6 @@ impl Terminal {
         let t = self.title();
         self.title_snap = CString::new(t.replace('\0', "")).unwrap_or_default();
         &self.title_snap
-    }
-
-    /// Last rendered frame as RGBA8 (readback fallback). Empty until rendered.
-    pub fn read_pixels(&mut self) -> &[u8] {
-        self.renderer.read_rgba()
     }
 
     /// Clear the scrollback and ask the shell to redraw a fresh prompt — the
@@ -541,6 +533,12 @@ impl Terminal {
         if let Ok(term) = self.term.lock() {
             self.renderer.render(&term, &self.theme, self.focused);
         }
+    }
+
+    /// Advance the render-target swapchain (promotes a finished frame to the front
+    /// on idle ticks). Returns true if the displayed buffer changed.
+    pub fn advance(&mut self) -> bool {
+        self.renderer.advance()
     }
 
     /// Whether new output (or a state change) has arrived since the last render.
