@@ -1,19 +1,51 @@
 name: Build native + publish UPM branch
 
-# The native .bundle is NOT tracked in source (it bloats the repo and can't be
-# merged across branches). Instead this workflow builds it on a macOS runner and
-# publishes the package — source files plus the freshly built binary — to the
-# `upm` branch that the install URL (`...git#upm`) points at.
+# The native binaries are NOT tracked in source (they bloat the repo and can't be
+# merged across branches). Instead this workflow builds the macOS .bundle and the
+# Windows .dll on their respective runners and publishes the package — source
+# files plus the freshly built binaries — to the `upm` branch that the install
+# URL (`...git#upm`) points at.
 
 on:
   push:
     tags: ['v*']
+  workflow_dispatch:
 
 permissions:
   contents: write
 
 jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: native
+
+      - name: Build native DLL
+        shell: pwsh
+        run: native/build-windows.ps1 -Configuration release
+
+      - name: Upload DLL artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: unterm-windows-dll
+          path: Packages/dev.tnayuki.unterm/Editor/Plugins/Windows/x86_64/unterm.dll
+          if-no-files-found: error
+
   build-and-publish:
+    needs: build-windows
+    # Only publish on version tags. Manual runs build (and license-gate)
+    # without touching the upm distribution branch.
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -30,6 +62,12 @@ jobs:
 
       - name: Build universal native bundle
         run: native/build-macos.sh release
+
+      - name: Download the Windows DLL built by the build-windows job
+        uses: actions/download-artifact@v4
+        with:
+          name: unterm-windows-dll
+          path: Packages/dev.tnayuki.unterm/Editor/Plugins/Windows/x86_64
 
       - name: Install cargo-about
         uses: taiki-e/install-action@v2
@@ -53,6 +91,7 @@ jobs:
           set -euo pipefail
           PKG="Packages/dev.tnayuki.unterm"
           test -f "$PKG/Editor/Plugins/macOS/unterm.bundle" || { echo "bundle missing"; exit 1; }
+          test -f "$PKG/Editor/Plugins/Windows/x86_64/unterm.dll" || { echo "dll missing"; exit 1; }
 
           # Stage the package contents (including the just-built, un-tracked
           # binary) as the root of a fresh orphan commit. The upm branch is a

@@ -117,4 +117,5 @@ InitTestScene*.unity*
 # with `native/build-macos.sh` and `cargo about` (see native/about.toml). Their
 # `.meta` files stay tracked so GUIDs are stable.
 /Packages/dev.tnayuki.unterm/Editor/Plugins/macOS/unterm.bundle
+/Packages/dev.tnayuki.unterm/Editor/Plugins/Windows/x86_64/unterm.dll
 /Packages/dev.tnayuki.unterm/Third Party Notices.md
