@@ -43,7 +43,15 @@ pub fn resolve(command: &str) -> ShellSpec {
     let mut args = Vec::new();
     if is_powershell {
         args.push("-NoLogo".to_string());
-        if !command.is_empty() {
+        if command.is_empty() {
+            // Interactive: wrap the prompt to report the working directory via
+            // OSC 9;9 every prompt (PowerShell's Set-Location doesn't change the
+            // process cwd, so this is how the host learns it for resume), then stay
+            // interactive with -NoExit.
+            args.push("-NoExit".to_string());
+            args.push("-Command".to_string());
+            args.push(PS_CWD_PROMPT.to_string());
+        } else {
             args.push("-Command".to_string());
             args.push(command.to_string());
         }
@@ -54,6 +62,13 @@ pub fn resolve(command: &str) -> ShellSpec {
     }
     ShellSpec { program, args }
 }
+
+/// PowerShell snippet (run via `-NoExit -Command`) that wraps `prompt` to emit
+/// the current location as OSC 9;9 each time it renders, so the reader can
+/// capture the cwd for resume. Uses `[char]27`/`[char]7` (valid in both pwsh and
+/// Windows PowerShell) and preserves the user's prompt via `& $__untermPrompt`.
+#[cfg(windows)]
+const PS_CWD_PROMPT: &str = "$__untermPrompt = $function:prompt; function global:prompt { [Console]::Write([char]27 + ']9;9;' + $ExecutionContext.SessionState.Path.CurrentLocation.ProviderPath + [char]7); & $__untermPrompt }";
 
 /// Walk the detection ladder and return the absolute (or PATH-resolvable) path
 /// of the first shell found.
