@@ -31,6 +31,46 @@ namespace Unterm.Editor
         [SerializeField] private float _fontPt = DefaultFontPt;
         private ulong Tid => (ulong)_termIdRaw;
 
+        // Per-project store for the restore files (survives editor restarts). The
+        // buffer is keyed by the window's native terminal id (_termIdRaw), which is
+        // serialized with the window and stable across a restart: a restored window
+        // re-claims its own id, and on a fresh restart the native registry is empty
+        // so ids don't actually churn. This avoids a second persisted key.
+        private static string RestoreDir =>
+            Path.Combine(Path.GetDirectoryName(Application.dataPath), "Library", "Unterm");
+        private static string RestorePath(ulong id) =>
+            Path.Combine(RestoreDir, id + ".unterm");
+
+        // Prune is scheduled (once per session) from the first window's OnEnable, so
+        // it runs a tick AFTER the layout-restore wave has created every window —
+        // never before, which would let it delete files those windows are about to
+        // restore. Guarded by this flag (reset on domain reload, which is fine).
+        private static bool s_pruneScheduled;
+
+        // Manually closing a terminal still writes its buffer (a teardown can't
+        // reliably tell a deliberate close from an editor quit), leaving an orphan
+        // restore file. Every surviving window consumes (deletes) its own file as it
+        // restores, so this one-shot pass deletes any file with no matching open
+        // window, keeping Library/Unterm from accumulating dead buffers. (A terminal
+        // saved only in a different, not-loaded layout would also be pruned —
+        // acceptable for the common case.)
+        private static void PruneOrphanRestoreFiles()
+        {
+            try
+            {
+                if (!Directory.Exists(RestoreDir)) return;
+                var live = new System.Collections.Generic.HashSet<string>();
+                foreach (var win in Resources.FindObjectsOfTypeAll<UntermWindow>())
+                    live.Add(((ulong)win._termIdRaw).ToString());
+                foreach (var path in Directory.GetFiles(RestoreDir, "*.unterm"))
+                {
+                    if (live.Contains(Path.GetFileNameWithoutExtension(path))) continue;
+                    try { File.Delete(path); } catch { /* ignore */ }
+                }
+            }
+            catch { /* ignore */ }
+        }
+
         private Texture2D _tex;
         private IntPtr _externalTexPtr;
         private string _status = "";
@@ -149,19 +189,94 @@ namespace Unterm.Editor
             AssemblyReloadEvents.beforeAssemblyReload += OnBeforeReload;
             EditorApplication.update += OnEditorUpdate;
             LoadNative();
+            // Sweep orphan restore files once per session, deferred a tick so every
+            // layout-restored window has run LoadNative (and consumed its own file)
+            // first — see PruneOrphanRestoreFiles.
+            if (!s_pruneScheduled)
+            {
+                s_pruneScheduled = true;
+                EditorApplication.delayCall += PruneOrphanRestoreFiles;
+            }
         }
 
         private void OnDisable()
         {
             AssemblyReloadEvents.beforeAssemblyReload -= OnBeforeReload;
             EditorApplication.update -= OnEditorUpdate;
-            // On a domain reload keep the native terminal (and the mapped image)
-            // alive so the shell + scrollback survive the recompile; only tear it
-            // all down when the window is actually closing.
+            // Persist the buffer on any real teardown (NOT a domain reload, where the
+            // native terminal survives for re-adoption). This runs per window here
+            // rather than off EditorApplication.quitting: at editor quit, windows tear
+            // down interleaved with that global event, so a quitting-based save misses
+            // windows already gone — which is why some live sessions weren't restored.
+            // (Cost: a deliberate close also saves; its orphan file is pruned on the
+            // next launch — see PruneOrphanRestoreFiles.)
+            if (!s_reloading) SaveBuffer();
             Teardown(keepTerminal: s_reloading);
         }
 
         private static void OnBeforeReload() => s_reloading = true;
+
+        // Persist the terminal's buffer (and whether it was live) to a file so the
+        // session can be restored after a full editor restart. Written on real
+        // teardown / quit (never on a domain reload, where the native terminal
+        // survives). File I/O is immediate, so it doesn't race window serialization.
+        private void SaveBuffer()
+        {
+            if (_native == null || Tid == 0) return;
+            try
+            {
+                string dump = _native.Dump(Tid);
+                if (string.IsNullOrEmpty(dump)) return;
+                bool alive = _native.IsAlive(Tid);
+                // Line 1: live/exited. Line 2: the shell's cwd (to resume there).
+                // Rest: the SGR buffer. Queried here (in OnDisable's teardown, not
+                // the quit handler) where the sysinfo call is fine; guarded so it
+                // can't abort the save.
+                string cwd = "";
+                if (alive)
+                {
+                    try { cwd = _native.Cwd(Tid) ?? ""; }
+                    catch { cwd = ""; }
+                }
+                Directory.CreateDirectory(RestoreDir);
+                File.WriteAllText(RestorePath(Tid),
+                    (alive ? "1" : "0") + "\n" + cwd + "\n" + dump);
+            }
+            catch (Exception e)
+            {
+                Debug.LogWarning("[Unterm] failed to save buffer: " + e.Message);
+            }
+        }
+
+        // Read and delete this window's saved-buffer file (one-shot). Returns false
+        // if there's none. `wasAlive` is the saved live/exited state; `cwd` is the
+        // shell's saved working directory (may be empty).
+        private bool TryConsumeSavedBuffer(out string buffer, out bool wasAlive, out string cwd)
+        {
+            buffer = null;
+            wasAlive = false;
+            cwd = null;
+            if (Tid == 0) return false;
+            var path = RestorePath(Tid);
+            if (!File.Exists(path)) return false;
+            try
+            {
+                string content = File.ReadAllText(path);
+                File.Delete(path);
+                int nl1 = content.IndexOf('\n');
+                if (nl1 < 0) return false;
+                int nl2 = content.IndexOf('\n', nl1 + 1);
+                if (nl2 < 0) return false;
+                wasAlive = content.Length > 0 && content[0] == '1';
+                cwd = content.Substring(nl1 + 1, nl2 - (nl1 + 1));
+                buffer = content.Substring(nl2 + 1);
+                return !string.IsNullOrEmpty(buffer);
+            }
+            catch
+            {
+                return false;
+            }
+        }
 
         private void LoadNative(bool freshInstance = false)
         {
@@ -173,15 +288,50 @@ namespace Unterm.Editor
                 float ppp = EditorGUIUtility.pixelsPerPoint;
                 var (w, h) = CurrentPixelSize();
 
-                // Re-adopt the existing terminal across reload, else create one.
-                // A pending command (e.g. Claude Code) launches directly in the
-                // PTY; otherwise a plain interactive shell. Re-adoption skips this,
-                // so a running command survives reloads without relaunching.
+                // Re-adopt the existing terminal across a domain reload (the native
+                // registry survives, so the id is still live). Otherwise create one.
+                // On a full editor restart the native terminal is gone, so restore
+                // from the saved buffer file, re-claiming this window's *own* id so
+                // restored windows can't be confused with each other: a live session
+                // gets the buffer plus a fresh shell; an exited one gets it with no
+                // shell. A pending command (Claude Code) launches in the PTY.
                 if (Tid == 0 || !_native.Exists(Tid))
                 {
-                    _termIdRaw = string.IsNullOrEmpty(s_pendingCommand)
-                        ? (long)_native.Create(w, h, ppp, ProjectRoot)
-                        : (long)_native.CreateCommand(w, h, ppp, ProjectRoot, s_pendingCommand);
+                    if (TryConsumeSavedBuffer(out string buf, out bool wasAlive, out string savedCwd))
+                    {
+                        // A dim rule marks where the restored buffer ends, so it's
+                        // clear the content above is a resumed session (and which
+                        // buffer landed in which window).
+                        const string esc = "\u001b";
+                        string mark = wasAlive
+                            ? $"{esc}[2m──────── session resumed ────────{esc}[0m\r\n"
+                            : $"{esc}[2m──────── session ended (press any key to close) ────────{esc}[0m\r\n";
+                        // Resume in the saved cwd when it still exists, else the project root.
+                        string dir = (!string.IsNullOrEmpty(savedCwd) && Directory.Exists(savedCwd))
+                            ? savedCwd
+                            : ProjectRoot;
+                        ulong oldId = (ulong)_termIdRaw; // re-claim our own id
+                        _termIdRaw = wasAlive
+                            ? (long)_native.CreateSeeded(oldId, w, h, ppp, dir, buf + mark)
+                            : (long)_native.CreateDead(oldId, w, h, ppp, buf + mark);
+                    }
+                    else if ((ulong)_termIdRaw != 0 && string.IsNullOrEmpty(s_pendingCommand))
+                    {
+                        // We owned a terminal last session but have no saved buffer
+                        // (e.g. a live session that wasn't persisted). Start a fresh
+                        // shell but RECLAIM our own id (empty-seed CreateSeeded), so a
+                        // plain Create's low alloc id can't collide with another
+                        // window's serialized id — which would make two windows adopt
+                        // the same terminal and share one screen.
+                        ulong oldId = (ulong)_termIdRaw;
+                        _termIdRaw = (long)_native.CreateSeeded(oldId, w, h, ppp, ProjectRoot, "");
+                    }
+                    else
+                    {
+                        _termIdRaw = string.IsNullOrEmpty(s_pendingCommand)
+                            ? (long)_native.Create(w, h, ppp, ProjectRoot)
+                            : (long)_native.CreateCommand(w, h, ppp, ProjectRoot, s_pendingCommand);
+                    }
                     ApplyFont();
                     _native.SetFontSize(Tid, _fontPt);
                 }
@@ -189,6 +339,7 @@ namespace Unterm.Editor
                 ApplyTheme();
                 _native.SetFocus(Tid, true);
                 RenderNow();
+                _alive = _native.IsAlive(Tid);
                 _refocus = true;
                 _status = "ready";
             }
@@ -241,13 +392,30 @@ namespace Unterm.Editor
             _native = null;
             if (!keepTerminal)
             {
-                if (native != null && Tid != 0)
-                    native.Destroy(Tid);
+                ulong tid = Tid;
+                // Don't kill the terminal if another live window still holds the same
+                // id: maximizing a tab makes Unity spin up a transient duplicate
+                // UntermWindow sharing this terminal, and destroying that duplicate
+                // (on un-maximize) would otherwise kill the terminal the original
+                // window is still showing — leaving it "(exited)".
+                if (native != null && tid != 0 && !AnyOtherWindowOwns(tid))
+                    native.Destroy(tid);
                 _termIdRaw = 0;
                 native?.Dispose(); // dlclose on real teardown
             }
             // On reload: drop the managed wrapper WITHOUT dlclose so the native
             // image (and the terminal registry) stay mapped for re-adoption.
+        }
+
+        // True if a UntermWindow other than this one holds terminal id `tid` — i.e.
+        // a sibling (e.g. the duplicate created while a tab is maximized) still owns
+        // the terminal, so this window's teardown must not destroy it.
+        private bool AnyOtherWindowOwns(ulong tid)
+        {
+            if (tid == 0) return false;
+            foreach (var w in Resources.FindObjectsOfTypeAll<UntermWindow>())
+                if (w != this && (ulong)w._termIdRaw == tid) return true;
+            return false;
         }
 
         private (uint, uint) CurrentPixelSize()
@@ -607,6 +775,16 @@ namespace Unterm.Editor
         {
             if (_native == null || Tid == 0) return;
             var e = Event.current;
+
+            // An exited terminal is a dead end (its final screen is shown for
+            // reference): any keypress closes the window. Deferred so we don't tear
+            // the window down in the middle of its own OnGUI.
+            if (!_alive && e.type == EventType.KeyDown)
+            {
+                e.Use();
+                EditorApplication.delayCall += Close;
+                return;
+            }
 
             // Scrollbar drag takes priority over selection: grabbing the thumb
             // scrolls to an absolute position, clicking the track pages, and a

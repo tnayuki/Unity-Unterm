@@ -25,7 +25,6 @@ mod term;
 
 use std::collections::HashMap;
 use std::ffi::{c_char, c_void, CStr};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use term::Terminal;
@@ -46,7 +45,47 @@ fn registry() -> &'static Mutex<Registry> {
     R.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+/// Lock the registry, recovering a poisoned mutex instead of panicking. A panic
+/// caught at the FFI boundary (see [`ffi_guard`]) can poison this lock; without
+/// recovery every later call would then panic on `.unwrap()` and the terminals
+/// would be wedged.
+fn lock_registry() -> std::sync::MutexGuard<'static, Registry> {
+    registry().lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Run `f`, swallowing any panic and returning `default` instead. The exported
+/// `unterm_*` functions are `extern "C"`; letting a Rust panic unwind across the
+/// C ABI into Unity is undefined behavior (and crashes the editor). wgpu panics
+/// on uncaptured GPU errors (e.g. a lost/again device on weak drivers), so the
+/// render/readback paths in particular must be guarded.
+fn ffi_guard<R>(default: R, f: impl FnOnce() -> R) -> R {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(v) => v,
+        Err(_) => {
+            log::error!("unterm: recovered from a panic at the FFI boundary");
+            default
+        }
+    }
+}
+
+/// Next free id: one past the highest id currently in the registry. There is no
+/// persistent counter, so ids naturally restart from the live set each launch —
+/// and a restored terminal re-claims its *own* id (see `restore_id`), so a stale
+/// serialized id is never silently handed to a different, fresh terminal.
+fn alloc_id(reg: &Registry) -> u64 {
+    reg.keys().max().copied().unwrap_or(0) + 1
+}
+
+/// Id for a restored terminal: its original `hint` if still free, else a fresh
+/// one. Keeping the original id means a re-adopting window finds its own terminal
+/// and never collides with another window's.
+fn restore_id(reg: &Registry, hint: u64) -> u64 {
+    if hint != 0 && !reg.contains_key(&hint) {
+        hint
+    } else {
+        alloc_id(reg)
+    }
+}
 
 fn cstr(p: *const c_char) -> String {
     if p.is_null() {
@@ -79,11 +118,14 @@ pub unsafe extern "C" fn unterm_create(
     cwd: *const c_char,
 ) -> u64 {
     init_log();
-    let cwd = cstr(cwd);
-    let terminal = Terminal::new(width, height, scale, &cwd, "");
-    let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-    registry().lock().unwrap().insert(id, Box::new(terminal));
-    id
+    ffi_guard(0, || {
+        let cwd = cstr(cwd);
+        let terminal = Terminal::new(width, height, scale, &cwd, "");
+        let mut reg = lock_registry();
+        let id = alloc_id(&reg);
+        reg.insert(id, Box::new(terminal));
+        id
+    })
 }
 
 /// Like `unterm_create`, but launches `command` directly in the PTY (via the
@@ -98,18 +140,98 @@ pub unsafe extern "C" fn unterm_create_command(
     command: *const c_char,
 ) -> u64 {
     init_log();
-    let cwd = cstr(cwd);
-    let command = cstr(command);
-    let terminal = Terminal::new(width, height, scale, &cwd, &command);
-    let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-    registry().lock().unwrap().insert(id, Box::new(terminal));
-    id
+    ffi_guard(0, || {
+        let cwd = cstr(cwd);
+        let command = cstr(command);
+        let terminal = Terminal::new(width, height, scale, &cwd, &command);
+        let mut reg = lock_registry();
+        let id = alloc_id(&reg);
+        reg.insert(id, Box::new(terminal));
+        id
+    })
+}
+
+/// Like `unterm_create`, but first seeds the grid with `seed` (terminal text,
+/// e.g. SGR-styled restored scrollback) above a fresh interactive shell. Used to
+/// restore a live session across an editor restart. `id` is the terminal's id from
+/// the previous run, re-claimed if free (so a re-adopting window finds its own).
+/// Returns a stable id (0 on error).
+#[no_mangle]
+pub unsafe extern "C" fn unterm_create_seeded(
+    id: u64,
+    width: u32,
+    height: u32,
+    scale: f32,
+    cwd: *const c_char,
+    seed: *const c_char,
+) -> u64 {
+    init_log();
+    ffi_guard(0, || {
+        let cwd = cstr(cwd);
+        let seed = cstr(seed);
+        let terminal = Terminal::new_seeded(width, height, scale, &cwd, &seed);
+        let mut reg = lock_registry();
+        let id = restore_id(&reg, id);
+        reg.insert(id, Box::new(terminal));
+        id
+    })
+}
+
+/// Create a display-only terminal: seeds the grid with `seed` but spawns no shell
+/// and is marked exited. Restores the final screen of a terminal that had already
+/// exited before an editor restart. `id` is re-claimed if free (see
+/// `unterm_create_seeded`). Returns a stable id (0 on error).
+#[no_mangle]
+pub unsafe extern "C" fn unterm_create_dead(
+    id: u64,
+    width: u32,
+    height: u32,
+    scale: f32,
+    seed: *const c_char,
+) -> u64 {
+    init_log();
+    ffi_guard(0, || {
+        let seed = cstr(seed);
+        let terminal = Terminal::new_dead(width, height, scale, &seed);
+        let mut reg = lock_registry();
+        let id = restore_id(&reg, id);
+        reg.insert(id, Box::new(terminal));
+        id
+    })
 }
 
 /// Whether a terminal id is still live (used to re-adopt after a reload).
 #[no_mangle]
 pub extern "C" fn unterm_exists(id: u64) -> bool {
     registry().lock().unwrap().contains_key(&id)
+}
+
+/// The whole buffer (scrollback + screen) as truecolor-SGR text. Writes the byte
+/// length; the pointer is valid until the next `unterm_dump` on this terminal.
+/// Used to save a session for restore across an editor restart.
+#[no_mangle]
+pub unsafe extern "C" fn unterm_dump(id: u64, out_len: *mut usize) -> *const u8 {
+    with_term(id, std::ptr::null(), |t| {
+        let bytes = t.dump_cstr().to_bytes();
+        if !out_len.is_null() {
+            unsafe { *out_len = bytes.len() };
+        }
+        bytes.as_ptr()
+    })
+}
+
+/// The shell's current working directory (UTF-8). Writes the byte length; the
+/// pointer is valid until the next `unterm_cwd` on this terminal. Empty if there's
+/// no live shell. Used to restore the cwd on resume across an editor restart.
+#[no_mangle]
+pub unsafe extern "C" fn unterm_cwd(id: u64, out_len: *mut usize) -> *const u8 {
+    with_term(id, std::ptr::null(), |t| {
+        let bytes = t.cwd_cstr().to_bytes();
+        if !out_len.is_null() {
+            unsafe { *out_len = bytes.len() };
+        }
+        bytes.as_ptr()
+    })
 }
 
 /// Destroy a terminal (kills its shell and frees the GPU surface).

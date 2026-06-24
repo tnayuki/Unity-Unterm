@@ -15,13 +15,14 @@ use std::thread::JoinHandle;
 
 use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::grid::{Dimensions, Scroll};
-use alacritty_terminal::index::{Column, Point as GridPoint, Side};
+use alacritty_terminal::index::{Column, Line, Point as GridPoint, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
+use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::{viewport_to_point, Config, Term, TermMode};
-use alacritty_terminal::vte::ansi::Processor;
+use alacritty_terminal::vte::ansi::{Color, NamedColor, Processor};
 
 use crate::keys;
-use crate::palette::Theme;
+use crate::palette::{self, Theme};
 use crate::pty::{self, Pty};
 use crate::renderer::Renderer;
 
@@ -50,6 +51,9 @@ struct Shared {
     title: Mutex<String>,
     dirty: AtomicBool,
     child_exited: AtomicBool,
+    /// The shell's working directory, captured from OSC 7 / OSC 9;9 in its output
+    /// (the shell reports it each prompt). Used to resume in the same dir.
+    cwd: Mutex<String>,
 }
 
 /// Sink for terminal events. Writes replies back to the PTY and tracks the
@@ -94,7 +98,9 @@ impl EventListener for EventProxy {
 
 pub struct Terminal {
     term: Arc<Mutex<Term<EventProxy>>>,
-    pty: Pty,
+    /// `None` for a display-only (already-exited) terminal restored from a saved
+    /// buffer — it has a grid to show but no live shell.
+    pty: Option<Pty>,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     shared: Arc<Shared>,
     renderer: Renderer,
@@ -107,7 +113,11 @@ pub struct Terminal {
     title_snap: CString,
     /// Stable storage for the selected text returned across the C ABI.
     sel_snap: CString,
-    _reader: JoinHandle<()>,
+    /// Stable storage for the full-buffer dump returned across the C ABI.
+    dump_snap: CString,
+    /// Stable storage for the working directory returned across the C ABI.
+    cwd_snap: CString,
+    _reader: Option<JoinHandle<()>>,
 }
 
 impl Terminal {
@@ -117,40 +127,88 @@ impl Terminal {
     /// via `$SHELL -lic "exec <command>"`, so rc is sourced (PATH resolves) and
     /// the program replaces the shell as the PTY leader — no typed-ahead input.
     pub fn new(width: u32, height: u32, scale: f32, cwd: &str, command: &str) -> Self {
+        Self::build(width, height, scale, cwd, command, "", true)
+    }
+
+    /// Like [`new`](Self::new) (interactive shell), but first seeds the grid with
+    /// `seed` (terminal text, e.g. SGR-styled restored scrollback) so it appears
+    /// above the fresh prompt. Used to restore a session across an editor restart.
+    pub fn new_seeded(width: u32, height: u32, scale: f32, cwd: &str, seed: &str) -> Self {
+        Self::build(width, height, scale, cwd, "", seed, true)
+    }
+
+    /// A display-only terminal: seeds the grid with `seed` but spawns no shell and
+    /// is marked exited. Restores the final screen of a terminal that had already
+    /// exited before an editor restart.
+    pub fn new_dead(width: u32, height: u32, scale: f32, seed: &str) -> Self {
+        Self::build(width, height, scale, "", "", seed, false)
+    }
+
+    /// Shared constructor. `spawn` controls whether a live shell/PTY is started;
+    /// `seed` (if non-empty) is fed through the parser before any shell output so
+    /// it lands above the prompt.
+    fn build(
+        width: u32,
+        height: u32,
+        scale: f32,
+        cwd: &str,
+        command: &str,
+        seed: &str,
+        spawn: bool,
+    ) -> Self {
         let scale = scale.max(0.5);
         let mut renderer = Renderer::new(width.max(1), height.max(1));
         renderer.set_scale(scale);
         let (cols, rows) = renderer.cell_grid_size();
 
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
-        let args: Vec<String> = if command.is_empty() {
-            Vec::new()
-        } else {
-            vec!["-lic".to_string(), format!("exec {command}")]
-        };
-        let handles = pty::spawn(&shell, &args, cwd, cols as u16, rows as u16)
-            .expect("unterm: failed to spawn shell on PTY");
-
-        let writer = Arc::new(Mutex::new(handles.writer));
         let shared = Arc::new(Shared {
             title: Mutex::new(String::new()),
             dirty: AtomicBool::new(true),
-            child_exited: AtomicBool::new(false),
+            child_exited: AtomicBool::new(!spawn),
+            cwd: Mutex::new(String::new()),
         });
 
+        // Either a live PTY+shell, or a no-op sink so writes from a display-only
+        // (exited) terminal go nowhere.
+        let (writer_box, pty, reader_in): (
+            Box<dyn Write + Send>,
+            Option<Pty>,
+            Option<Box<dyn Read + Send>>,
+        ) = if spawn {
+            let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
+            let args: Vec<String> = if command.is_empty() {
+                Vec::new()
+            } else {
+                vec!["-lic".to_string(), format!("exec {command}")]
+            };
+            let handles = pty::spawn(&shell, &args, cwd, cols as u16, rows as u16)
+                .expect("unterm: failed to spawn shell on PTY");
+            (handles.writer, Some(handles.pty), Some(handles.reader))
+        } else {
+            (Box::new(std::io::sink()), None, None)
+        };
+
+        let writer = Arc::new(Mutex::new(writer_box));
         let proxy = EventProxy {
             writer: writer.clone(),
             shared: shared.clone(),
         };
         let config = Config::default();
-        let term = Term::new(config, &TermSize { cols, rows }, proxy);
-        let term = Arc::new(Mutex::new(term));
+        let mut term = Term::new(config, &TermSize { cols, rows }, proxy);
 
-        let reader = spawn_reader(handles.reader, term.clone(), shared.clone());
+        // Seed the grid before the reader thread starts, so restored scrollback
+        // sits above whatever the shell prints next.
+        if !seed.is_empty() {
+            let mut parser: Processor = Processor::new();
+            parser.advance(&mut term, seed.as_bytes());
+        }
+
+        let term = Arc::new(Mutex::new(term));
+        let reader = reader_in.map(|r| spawn_reader(r, term.clone(), shared.clone()));
 
         Terminal {
             term,
-            pty: handles.pty,
+            pty,
             writer,
             shared,
             renderer,
@@ -161,6 +219,8 @@ impl Terminal {
             focused: true,
             title_snap: CString::default(),
             sel_snap: CString::default(),
+            dump_snap: CString::default(),
+            cwd_snap: CString::default(),
             _reader: reader,
         }
     }
@@ -195,7 +255,9 @@ impl Terminal {
         if let Ok(mut t) = self.term.lock() {
             t.resize(TermSize { cols, rows });
         }
-        self.pty.resize(cols as u16, rows as u16);
+        if let Some(pty) = &self.pty {
+            pty.resize(cols as u16, rows as u16);
+        }
         self.shared.dirty.store(true, Ordering::Relaxed);
     }
 
@@ -327,6 +389,98 @@ impl Terminal {
         &self.sel_snap
     }
 
+    /// The whole grid (scrollback + screen) as text with truecolor SGR, capped to
+    /// the most recent rows. Fed back through the parser by [`new_seeded`] /
+    /// [`new_dead`] to restore a colored buffer across an editor restart.
+    pub fn dump_styled(&mut self) -> String {
+        /// Cap so a restored layout file stays bounded.
+        const MAX_LINES: i32 = 5000;
+
+        let t = match self.term.lock() {
+            Ok(t) => t,
+            Err(_) => return String::new(),
+        };
+        let grid = t.grid();
+        let cols = grid.columns();
+        let theme = &self.theme;
+        let bottom = grid.bottommost_line().0;
+        let start = grid.topmost_line().0.max(bottom - MAX_LINES + 1);
+
+        let mut out = String::new();
+        for line in start..=bottom {
+            let row = &grid[Line(line)];
+            // Trim trailing blank cells (space on default bg, no flags).
+            let mut last = 0usize;
+            for col in 0..cols {
+                let cell = &row[Column(col)];
+                let blank = cell.c == ' '
+                    && matches!(cell.bg, Color::Named(NamedColor::Background))
+                    && cell.flags.is_empty();
+                if !blank {
+                    last = col + 1;
+                }
+            }
+            let (mut cf, mut cb) = (None, None);
+            let (mut cbold, mut cital) = (false, false);
+            for col in 0..last {
+                let cell = &row[Column(col)];
+                // Skip the placeholder cell after (or before, at a wrap) a wide
+                // glyph: the wide char re-creates its own spacer when the dump is
+                // re-parsed, so emitting this cell's space would add an extra column
+                // — widening every CJK glyph's gap on restore.
+                if cell.flags.intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER) {
+                    continue;
+                }
+                let fg = palette::resolve(cell.fg, theme);
+                let bg = palette::resolve(cell.bg, theme);
+                let bold = cell.flags.contains(Flags::BOLD);
+                let ital = cell.flags.contains(Flags::ITALIC);
+                if Some(fg) != cf || Some(bg) != cb || bold != cbold || ital != cital {
+                    out.push_str("\x1b[0");
+                    if bold {
+                        out.push_str(";1");
+                    }
+                    if ital {
+                        out.push_str(";3");
+                    }
+                    out.push_str(&format!(
+                        ";38;2;{};{};{};48;2;{};{};{}m",
+                        fg[0], fg[1], fg[2], bg[0], bg[1], bg[2]
+                    ));
+                    cf = Some(fg);
+                    cb = Some(bg);
+                    cbold = bold;
+                    cital = ital;
+                }
+                out.push(cell.c);
+            }
+            out.push_str("\x1b[0m\r\n");
+        }
+        out
+    }
+
+    /// [`dump_styled`](Self::dump_styled) as a stable C string (valid until the
+    /// next call on this terminal).
+    pub fn dump_cstr(&mut self) -> &CStr {
+        let s = self.dump_styled();
+        self.dump_snap = CString::new(s.replace('\0', "")).unwrap_or_default();
+        &self.dump_snap
+    }
+
+    /// The shell's current working directory, queried from the OS by the child
+    /// pid (so it doesn't depend on the shell emitting OSC 7). Empty if there's no
+    /// live shell or the cwd can't be read. Used to restore the cwd on resume.
+    pub fn cwd(&mut self) -> String {
+        self.shared.cwd.lock().map(|c| c.clone()).unwrap_or_default()
+    }
+
+    /// [`cwd`](Self::cwd) as a stable C string (valid until the next call).
+    pub fn cwd_cstr(&mut self) -> &CStr {
+        let s = self.cwd();
+        self.cwd_snap = CString::new(s.replace('\0', "")).unwrap_or_default();
+        &self.cwd_snap
+    }
+
     /// Change the HiDPI scale, keeping the pixel size (re-derives the grid).
     pub fn set_scale(&mut self, scale: f32) {
         let (w, h) = self.renderer.size();
@@ -351,7 +505,9 @@ impl Terminal {
             if let Ok(mut t) = self.term.lock() {
                 t.resize(TermSize { cols, rows });
             }
-            self.pty.resize(cols as u16, rows as u16);
+            if let Some(pty) = &self.pty {
+            pty.resize(cols as u16, rows as u16);
+        }
         }
         self.shared.dirty.store(true, Ordering::Relaxed);
     }
@@ -365,7 +521,9 @@ impl Terminal {
             if let Ok(mut t) = self.term.lock() {
                 t.resize(TermSize { cols, rows });
             }
-            self.pty.resize(cols as u16, rows as u16);
+            if let Some(pty) = &self.pty {
+            pty.resize(cols as u16, rows as u16);
+        }
         }
         self.shared.dirty.store(true, Ordering::Relaxed);
     }
@@ -395,7 +553,8 @@ impl Terminal {
     }
 
     pub fn is_alive(&mut self) -> bool {
-        !self.shared.child_exited.load(Ordering::Relaxed) && self.pty.is_alive()
+        !self.shared.child_exited.load(Ordering::Relaxed)
+            && self.pty.as_mut().map_or(false, |p| p.is_alive())
     }
 
     pub fn cols(&self) -> usize {
@@ -429,6 +588,101 @@ impl Terminal {
 }
 
 /// Pump shell output through the parser into the shared grid until EOF.
+/// Extracts the shell's working directory from OSC escape sequences in its
+/// output: OSC 7 (`ESC ] 7 ; file://host/path ST`, what the shells emit on
+/// macOS/unix) and OSC 9;9 (`ESC ] 9 ; 9 ; path ST`, what we have Windows
+/// PowerShell emit). Stateful so a sequence split across reads still parses.
+#[derive(Default)]
+struct CwdScanner {
+    collecting: bool,
+    payload: Vec<u8>,
+    esc: bool,
+}
+
+impl CwdScanner {
+    /// Feed a chunk; returns the latest cwd if an OSC 7/9;9 completed in it.
+    fn feed(&mut self, bytes: &[u8]) -> Option<String> {
+        let mut out = None;
+        for &b in bytes {
+            if self.collecting {
+                if b == 0x07 {
+                    if let Some(c) = parse_osc_cwd(&self.payload) {
+                        out = Some(c);
+                    }
+                    self.collecting = false;
+                    self.payload.clear();
+                    self.esc = false;
+                } else if self.esc {
+                    if b == b'\\' {
+                        if let Some(c) = parse_osc_cwd(&self.payload) {
+                            out = Some(c);
+                        }
+                        self.collecting = false;
+                        self.payload.clear();
+                    } else {
+                        self.payload.push(0x1b);
+                        self.payload.push(b);
+                    }
+                    self.esc = false;
+                } else if b == 0x1b {
+                    self.esc = true;
+                } else {
+                    self.payload.push(b);
+                    if self.payload.len() > 4096 {
+                        self.collecting = false;
+                        self.payload.clear();
+                    }
+                }
+            } else if self.esc {
+                if b == b']' {
+                    self.collecting = true;
+                    self.payload.clear();
+                }
+                self.esc = false;
+            } else if b == 0x1b {
+                self.esc = true;
+            }
+        }
+        out
+    }
+}
+
+/// Parse an OSC payload (without the `ESC ]` / terminator) into a cwd.
+fn parse_osc_cwd(payload: &[u8]) -> Option<String> {
+    let s = std::str::from_utf8(payload).ok()?;
+    if let Some(rest) = s.strip_prefix("7;") {
+        // `file://<host>/<percent-encoded-path>`; host may be empty (file:///path).
+        let rest = rest.strip_prefix("file://")?;
+        let slash = rest.find('/')?;
+        Some(percent_decode(&rest[slash..]))
+    } else if let Some(rest) = s.strip_prefix("9;9;") {
+        Some(rest.to_string())
+    } else {
+        None
+    }
+}
+
+/// Minimal percent-decoder for OSC 7 file:// paths (`%20` → space, etc.).
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            let hi = (b[i + 1] as char).to_digit(16);
+            let lo = (b[i + 2] as char).to_digit(16);
+            if let (Some(h), Some(l)) = (hi, lo) {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 fn spawn_reader(
     mut reader: Box<dyn Read + Send>,
     term: Arc<Mutex<Term<EventProxy>>>,
@@ -436,11 +690,18 @@ fn spawn_reader(
 ) -> JoinHandle<()> {
     std::thread::spawn(move || {
         let mut parser: Processor = Processor::new();
+        let mut scanner = CwdScanner::default();
         let mut buf = [0u8; 65536];
         loop {
             match reader.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
+                    // Capture the shell's reported working directory (OSC 7 / 9;9).
+                    if let Some(dir) = scanner.feed(&buf[..n]) {
+                        if let Ok(mut c) = shared.cwd.lock() {
+                            *c = dir;
+                        }
+                    }
                     if let Ok(mut t) = term.lock() {
                         parser.advance(&mut *t, &buf[..n]);
                     }

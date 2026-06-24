@@ -30,6 +30,8 @@ namespace Unterm.Editor
         private static extern IntPtr dlerror();
 
         // --- terminal registry C ABI (id-based; survives reload) ---
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate ulong CreateSeededFn(ulong id, uint w, uint h, float scale, [MarshalAs(UnmanagedType.LPUTF8Str)] string cwd, [MarshalAs(UnmanagedType.LPUTF8Str)] string seed);
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate ulong CreateDeadFn(ulong id, uint w, uint h, float scale, [MarshalAs(UnmanagedType.LPUTF8Str)] string seed);
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate ulong CreateFn(uint w, uint h, float scale, [MarshalAs(UnmanagedType.LPUTF8Str)] string cwd);
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate ulong CreateCommandFn(uint w, uint h, float scale, [MarshalAs(UnmanagedType.LPUTF8Str)] string cwd, [MarshalAs(UnmanagedType.LPUTF8Str)] string command);
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)] [return: MarshalAs(UnmanagedType.I1)] private delegate bool ExistsFn(ulong id);
@@ -58,6 +60,8 @@ namespace Unterm.Editor
         private bool _stable;
 
         private CreateFn _create; private CreateCommandFn _createCommand; private ExistsFn _exists; private IdFn _destroy; private ResizeFn _resize;
+        // Restore-across-restart: seed+shell, seed-only (display-only/exited), the buffer dump, the cwd.
+        private CreateSeededFn _createSeeded; private CreateDeadFn _createDead; private TitleFn _dump; private TitleFn _cwd;
         private SetScaleFn _setScale; private SetFontFn _setFont; private SetFontSizeFn _setFontSize;
         private SetColorsFn _setColors; private SetFocusFn _setFocus; private SendTextFn _sendText;
         private SendKeyFn _sendKey; private SendTextFn _paste; private IdFn _clear;
@@ -96,6 +100,10 @@ namespace Unterm.Editor
 
             _create = Sym<CreateFn>("unterm_create");
             _createCommand = Sym<CreateCommandFn>("unterm_create_command");
+            _createSeeded = Sym<CreateSeededFn>("unterm_create_seeded");
+            _createDead = Sym<CreateDeadFn>("unterm_create_dead");
+            _dump = Sym<TitleFn>("unterm_dump");
+            _cwd = Sym<TitleFn>("unterm_cwd");
             _exists = Sym<ExistsFn>("unterm_exists");
             _destroy = Sym<IdFn>("unterm_destroy");
             _resize = Sym<ResizeFn>("unterm_resize");
@@ -147,6 +155,24 @@ namespace Unterm.Editor
         /// Create a terminal that launches `command` directly in the PTY (no shell prompt / typed input).
         public ulong CreateCommand(uint w, uint h, float scale, string cwd, string command) =>
             _createCommand(w, h, scale, cwd ?? string.Empty, command ?? string.Empty);
+        /// Restore an interactive shell with the grid pre-seeded; re-claims terminal id `id` if free.
+        public ulong CreateSeeded(ulong id, uint w, uint h, float scale, string cwd, string seed) =>
+            _createSeeded(id, w, h, scale, cwd ?? string.Empty, seed ?? string.Empty);
+        /// Restore a display-only terminal (no shell, marked exited); re-claims terminal id `id` if free.
+        public ulong CreateDead(ulong id, uint w, uint h, float scale, string seed) =>
+            _createDead(id, w, h, scale, seed ?? string.Empty);
+        /// The full buffer (scrollback + screen) as truecolor-SGR text, for saving across a restart.
+        public string Dump(ulong id)
+        {
+            var p = _dump(id, out UIntPtr len);
+            return Utf8(p, len);
+        }
+        /// The shell's current working directory (empty if no live shell), for restoring cwd on resume.
+        public string Cwd(ulong id)
+        {
+            var p = _cwd(id, out UIntPtr len);
+            return Utf8(p, len);
+        }
         public bool Exists(ulong id) => id != 0 && _exists(id);
         public void Destroy(ulong id) { if (id != 0) _destroy(id); }
         public void Resize(ulong id, uint w, uint h, float scale) => _resize(id, w, h, scale);
@@ -207,7 +233,8 @@ namespace Unterm.Editor
                 dlclose(_handle);
                 _handle = IntPtr.Zero;
             }
-            _create = null; _createCommand = null; _exists = null; _destroy = null; _resize = null; _setScale = null;
+            _create = null; _createCommand = null; _createSeeded = null; _createDead = null; _dump = null; _cwd = null;
+            _exists = null; _destroy = null; _resize = null; _setScale = null;
             _setFont = null; _setFontSize = null; _setColors = null; _setFocus = null;
             _sendText = null; _sendKey = null; _scroll = null; _render = null; _dirty = null;
             _selStart = null; _selUpdate = null; _selClear = null; _selText = null;

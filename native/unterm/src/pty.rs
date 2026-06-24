@@ -42,12 +42,22 @@ pub fn spawn(
     for a in args {
         cmd.arg(a);
     }
-    if !cwd.is_empty() {
+    // Only set the cwd if it's a real directory: a stale/deleted path (e.g. a
+    // resumed session whose dir is gone, or a TOCTOU after the host's check) would
+    // otherwise fail the spawn. Falling back to inherit keeps the terminal alive.
+    if !cwd.is_empty() && std::path::Path::new(cwd).is_dir() {
         cmd.cwd(cwd);
     }
     // Advertise a capable terminal so programs emit colors/cursor sequences.
     cmd.env("TERM", "xterm-256color");
     cmd.env("COLORTERM", "truecolor");
+
+    // macOS ships /etc/zshrc_Apple_Terminal (and a bash equivalent) that reports
+    // the shell's working directory via OSC 7 — but only when TERM_PROGRAM marks
+    // an Apple terminal. Set it so the shell emits OSC 7 on every prompt; the
+    // reader captures it for cwd-on-resume (no sysinfo, no rc injection).
+    #[cfg(target_os = "macos")]
+    cmd.env("TERM_PROGRAM", "Apple_Terminal");
 
     // Ensure a UTF-8 locale so the shell's line editor handles multibyte input
     // (e.g. Japanese) instead of garbling it. GUI hosts like Unity often launch

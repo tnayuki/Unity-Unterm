@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Added
+
+- **Session restore** — terminals restore their scrollback across a full editor restart (not just a C# domain reload); a window whose shell had already exited is restored read-only.
+- **Working-directory restore** — a resumed terminal reopens in the shell's last working directory, falling back to the project root if that directory is gone.
+
 ### Changed
 
 - The terminal grid now fills the whole window: the toolbar has been removed, and font size +/- moved into the right-click menu.
