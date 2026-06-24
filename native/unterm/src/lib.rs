@@ -914,6 +914,15 @@ pub extern "C" fn unterm_agentview_panel_scroll_h(id: u64, x: f32, y: f32, dx: f
     }
 }
 
+/// Vertical scroll of the capped plan box under (x, y). Returns 1 if consumed.
+#[no_mangle]
+pub extern "C" fn unterm_agentview_panel_scroll_v(id: u64, x: f32, y: f32, dy: f32) -> u8 {
+    match views().lock().unwrap().get_mut(&id) {
+        Some(v) => v.panel_scroll_v(x, y, dy) as u8,
+        None => 0,
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn unterm_agentview_panel_select_all(id: u64) {
     if let Some(v) = views().lock().unwrap().get_mut(&id) {

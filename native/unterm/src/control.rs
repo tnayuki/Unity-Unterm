@@ -59,7 +59,7 @@ static NEXT_REQ: AtomicU64 = AtomicU64::new(1);
 pub struct Conv {
     blocks: Vec<(char, String)>,
     tools: HashMap<String, (usize, String)>, // toolUseId -> (block index, title)
-    // tool_use ids we surface through custom UI (e.g. AskUserQuestion), so their
+    // tool_use ids we render via custom UI (ExitPlanMode / AskUserQuestion), so their
     // raw "▸ ToolName" line is suppressed in the transcript (incl. their tool_result).
     hidden_tools: HashSet<String>,
 }
@@ -216,9 +216,9 @@ impl Conv {
             Some("tool_use") => {
                 let id = b["id"].as_str().unwrap_or("");
                 let name = b["name"].as_str().unwrap_or("");
-                // Tools we surface through custom UI (the question prompt) shouldn't
-                // also show a raw "▸ ToolName" line.
-                if name == "AskUserQuestion" {
+                // Tools we surface through custom UI (plan approval / question
+                // prompts) shouldn't also show a raw "▸ ToolName" line.
+                if name == "ExitPlanMode" || name == "AskUserQuestion" {
                     if !id.is_empty() {
                         self.hidden_tools.insert(id.to_string());
                     }
@@ -323,6 +323,13 @@ enum Pending {
         questions: Vec<Question>,
         answers: Vec<(String, String)>, // (header, chosen label)
         index: usize,
+    },
+    /// An `ExitPlanMode` tool call: the agent presents a plan and asks to leave
+    /// plan mode. Rendered as a "Ready to code?" approval (accept + pick the next
+    /// permission mode, or keep planning) rather than a generic allow/deny.
+    Plan {
+        request_id: String,
+        input: Value, // echoed back as updatedInput on approval
     },
 }
 
@@ -637,6 +644,30 @@ impl Driver {
                     }));
                 }
             }
+            Pending::Plan { request_id, input } => match option_id {
+                // Approve: let ExitPlanMode run (engine leaves plan mode), then set
+                // the permission mode the user picked for coding.
+                "plan_accept" => {
+                    self.state.write_permission(&request_id, true, &input);
+                    self.set_permission_mode("acceptEdits");
+                }
+                "plan_default" => {
+                    self.state.write_permission(&request_id, true, &input);
+                    self.set_permission_mode("default");
+                }
+                // Keep planning: deny so the agent revises and re-presents the plan.
+                _ => self.state.write_value(&json!({
+                    "type": "control_response",
+                    "response": {
+                        "subtype": "success",
+                        "request_id": request_id,
+                        "response": {
+                            "behavior": "deny",
+                            "message": "The user wants to keep planning. Revise the plan based on any feedback and call ExitPlanMode again when ready."
+                        }
+                    }
+                })),
+            },
         }
     }
 
@@ -758,6 +789,32 @@ impl Driver {
                 opts.push(("__skip__".to_string(), "Skip".to_string(), "skip".to_string()));
                 Some((title, opts))
             }
+            Pending::Plan { .. } => {
+                // The plan itself is rendered as a Markdown agent block (see
+                // `AgentView::compose` + `pending_plan`); this note is just the prompt.
+                let body = "Ready to code?".to_string();
+                let opts = [
+                    ("plan_accept", "Yes, and auto-accept edits"),
+                    ("plan_default", "Yes, and manually approve edits"),
+                    ("plan_reject", "No, keep planning"),
+                ]
+                .iter()
+                .map(|(id, name)| (id.to_string(), name.to_string(), id.to_string()))
+                .collect();
+                Some((body, opts))
+            }
+        }
+    }
+
+    /// The pending plan's Markdown text, if the current prompt is an `ExitPlanMode`
+    /// approval — so the host can render it as a Markdown block (not a plain note).
+    pub fn pending_plan(&self) -> Option<String> {
+        match self.state.pending.lock().unwrap().as_ref()? {
+            Pending::Plan { input, .. } => {
+                let p = input["plan"].as_str().unwrap_or("");
+                (!p.is_empty()).then(|| p.to_string())
+            }
+            _ => None,
         }
     }
 
@@ -986,6 +1043,17 @@ fn handle_control_request(state: &Arc<State>, v: &Value) {
                         index: 0,
                     });
                 }
+                return;
+            }
+
+            // ExitPlanMode presents a plan and asks to leave plan mode: show a
+            // "Ready to code?" approval (accept → also set the next permission mode)
+            // rather than a generic allow/deny.
+            if tool_name == "ExitPlanMode" {
+                *state.pending.lock().unwrap() = Some(Pending::Plan {
+                    request_id,
+                    input,
+                });
                 return;
             }
 

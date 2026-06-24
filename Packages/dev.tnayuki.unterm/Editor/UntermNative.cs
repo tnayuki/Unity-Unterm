@@ -144,7 +144,7 @@ namespace Unterm.Editor
         private AvStrFn _avSetPermissionMode; private AvBufFn _avPermissionMode;
         private AvStrFn _avSetModel; private AvBufFn _avModel;
         private AvUintGetFn _avQueueLen; private AvUintSetFn _avCancelQueued;
-        private AvDownFn _avPanelDown; private AvDragFn _avPanelDrag; private AvScrollHFn _avPanelScrollH;
+        private AvDownFn _avPanelDown; private AvDragFn _avPanelDrag; private AvScrollHFn _avPanelScrollH; private AvScrollHFn _avPanelScrollV;
         private AvVoidFn _avPanelSelectAll; private AvVoidFn _avPanelSelectClear; private AvBoolFn _avPanelHasSelection; private AvBufFn _avPanelSelectedText;
         private AvBoolFn _avThinking;
         private AvInputDownFn _avInputDown; private AvDragFn _avInputDrag; private AvInputKeyFn _avInputKey;
@@ -261,6 +261,7 @@ namespace Unterm.Editor
             _avPanelDown = Sym<AvDownFn>("unterm_agentview_panel_down");
             _avPanelDrag = Sym<AvDragFn>("unterm_agentview_panel_drag");
             _avPanelScrollH = Sym<AvScrollHFn>("unterm_agentview_panel_scroll_h");
+            _avPanelScrollV = Sym<AvScrollHFn>("unterm_agentview_panel_scroll_v");
             _avPanelSelectAll = Sym<AvVoidFn>("unterm_agentview_panel_select_all");
             _avPanelSelectClear = Sym<AvVoidFn>("unterm_agentview_panel_select_clear");
             _avPanelHasSelection = Sym<AvBoolFn>("unterm_agentview_panel_has_selection");
@@ -416,6 +417,8 @@ namespace Unterm.Editor
         public void AgentviewPanelDrag(ulong id, float x, float y) => _avPanelDrag(id, x, y);
         /// Horizontal scroll over a code block; returns 1 if consumed.
         public byte AgentviewPanelScrollH(ulong id, float x, float y, float dx) => _avPanelScrollH(id, x, y, dx);
+        /// Vertical scroll over the capped plan box; returns 1 if consumed.
+        public byte AgentviewPanelScrollV(ulong id, float x, float y, float dy) => _avPanelScrollV(id, x, y, dy);
         public void AgentviewPanelSelectAll(ulong id) => _avPanelSelectAll(id);
         public void AgentviewPanelSelectClear(ulong id) => _avPanelSelectClear(id);
         public bool AgentviewPanelHasSelection(ulong id) => _avPanelHasSelection(id);
@@ -465,7 +468,7 @@ namespace Unterm.Editor
             _avInterrupt = null; _avSessionId = null; _avTitle = null;
             _avSetPermissionMode = null; _avPermissionMode = null; _avSetModel = null; _avModel = null;
             _avQueueLen = null; _avCancelQueued = null;
-            _avPanelDown = null; _avPanelDrag = null; _avPanelScrollH = null;
+            _avPanelDown = null; _avPanelDrag = null; _avPanelScrollH = null; _avPanelScrollV = null;
             _avPanelSelectAll = null; _avPanelSelectClear = null; _avPanelHasSelection = null; _avPanelSelectedText = null;
             _avThinking = null;
             _avInputDown = null; _avInputDrag = null; _avInputKey = null;

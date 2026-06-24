@@ -162,6 +162,11 @@ impl AgentView {
         };
         let mut text = d.transcript();
         if let Some((title, _)) = d.pending_view() {
+            // An ExitPlanMode plan is Markdown: render it as a plan block (Markdown
+            // in a capped, internally-scrollable box) before the "Ready to code?" note.
+            if let Some(plan) = d.pending_plan() {
+                push_plan(&mut text, &plan);
+            }
             push_note(&mut text, &title);
         }
         let status = d.status();
@@ -319,6 +324,9 @@ impl AgentView {
     pub fn panel_scroll_h(&mut self, x: f32, y: f32, dx: f32) -> bool {
         self.panel.scroll_h(x, y, dx)
     }
+    pub fn panel_scroll_v(&mut self, x: f32, y: f32, dy: f32) -> bool {
+        self.panel.scroll_v(x, y, dy)
+    }
     pub fn panel_select_all(&mut self) {
         self.panel.select_all();
     }
@@ -417,6 +425,14 @@ impl AgentView {
 fn push_note(text: &mut String, body: &str) {
     text.push(RS);
     text.push('t');
+    text.push(US);
+    text.push_str(body);
+}
+
+/// Append a role-`p` (plan) block — Markdown in a capped, scrollable box.
+fn push_plan(text: &mut String, body: &str) {
+    text.push(RS);
+    text.push('p');
     text.push(US);
     text.push_str(body);
 }

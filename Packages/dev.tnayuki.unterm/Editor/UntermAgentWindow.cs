@@ -145,6 +145,15 @@ namespace Unterm.Editor
             if (dirty) { RenderView(measureInput: false); Repaint(); }
             else if ((f & 2) != 0) Repaint();
 
+            // Keep the mode dropdown in sync with the engine: approving ExitPlanMode
+            // switches the permission mode native-side, so mirror it back here.
+            string nativeMode = _native.AgentviewPermissionMode(Vid);
+            if (!string.IsNullOrEmpty(nativeMode) && nativeMode != _permissionMode)
+            {
+                _permissionMode = nativeMode;
+                Repaint();
+            }
+
             // Record the Claude session id once established: register it as open
             // and index it so it can be resumed/listed later. The native side also
             // owns the tab title.
@@ -503,8 +512,20 @@ namespace Unterm.Editor
                 }
                 if (Mathf.Abs(we.delta.y) > 0.01f)
                 {
-                    _scroll = Mathf.Clamp(_scroll - we.delta.y * step, 0f, MaxScroll());
-                    used = true;
+                    // A capped plan box under the pointer scrolls internally first;
+                    // otherwise the wheel scrolls the whole transcript.
+                    float lx = (we.mousePosition.x - rect.x) * ppp;
+                    float ly = (we.mousePosition.y - rect.y) * ppp;
+                    if (_native != null && _viewId != 0
+                        && _native.AgentviewPanelScrollV(Vid, lx, ly, we.delta.y * step) == 1)
+                    {
+                        used = true;
+                    }
+                    else
+                    {
+                        _scroll = Mathf.Clamp(_scroll - we.delta.y * step, 0f, MaxScroll());
+                        used = true;
+                    }
                 }
                 if (used)
                 {

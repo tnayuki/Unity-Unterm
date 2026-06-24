@@ -47,6 +47,9 @@ enum Role {
     Tool,
     /// A follow-up prompt queued while a turn runs (dimmed; sent on turn end).
     Queued,
+    /// An ExitPlanMode plan: Markdown like an agent block, but laid out in a
+    /// capped-height, internally-scrollable box so a long plan can't dominate.
+    Plan,
 }
 
 impl Role {
@@ -56,6 +59,7 @@ impl Role {
             't' => Role::Thought,
             'x' => Role::Tool,
             'q' => Role::Queued,
+            'p' => Role::Plan,
             _ => Role::Agent,
         }
     }
@@ -188,6 +192,12 @@ pub struct PanelRenderer {
     /// Per-code-block horizontal scroll, keyed by the block's content hash so it
     /// survives re-layout as the transcript grows.
     hscroll: HashMap<u64, f32>,
+    /// Internal vertical scroll of the capped ExitPlanMode plan box (physical px).
+    plan_scroll: f32,
+    /// Max plan_scroll (content height beyond the capped box; 0 = no scroll).
+    plan_max: f32,
+    /// The plan box's hit rect (physical px x,y,w,h) for wheel routing, if shown.
+    plan_rect: Option<[f32; 4]>,
 
     swash_cache: SwashCache,
     viewport: Viewport,
@@ -230,6 +240,9 @@ impl PanelRenderer {
             scale: 1.0,
             scroll: 0.0,
             content_h: 0.0,
+            plan_scroll: 0.0,
+            plan_max: 0.0,
+            plan_rect: None,
             buttons: Vec::new(),
             button_rects: Vec::new(),
             laid: Vec::new(),
@@ -444,6 +457,21 @@ impl PanelRenderer {
         false
     }
 
+    /// Scroll the capped plan box under (x, y) vertically by `dy` physical px.
+    /// Returns true if the plan box consumed it (so the host keeps the event and
+    /// doesn't scroll the whole transcript).
+    pub fn scroll_v(&mut self, x: f32, y: f32, dy: f32) -> bool {
+        if let Some(r) = self.plan_rect {
+            if self.plan_max > 0.5
+                && x >= r[0] && x <= r[0] + r[2] && y >= r[1] && y <= r[1] + r[3]
+            {
+                self.plan_scroll = (self.plan_scroll + dy).clamp(0.0, self.plan_max);
+                return true;
+            }
+        }
+        false
+    }
+
     /// Index of the button at physical-px point (x, y), or -1.
     pub fn hit_button(&self, x: f32, y: f32) -> i32 {
         for (i, r) in self.button_rects.iter().enumerate() {
@@ -518,15 +546,25 @@ impl PanelRenderer {
         // First pass: shape + measure each block. Non-agent blocks render plain;
         // agent blocks are parsed as Markdown and expanded into styled items.
         let mut measured: Vec<Measured> = Vec::new();
+        // The contiguous run of measured items produced by the plan block, if any.
+        let mut plan_range: Option<(usize, usize)> = None;
+        // The plan box reserves `card_pad` of inner padding on each side, so its
+        // Markdown is measured (wrapped) at a narrower width.
+        let plan_w = (content_w - card_pad * 2.0).max(1.0);
         for b in &blocks {
-            if b.role == Role::Agent && !b.text.is_empty() {
+            if (b.role == Role::Agent || b.role == Role::Plan) && !b.text.is_empty() {
+                let start = measured.len();
+                let w = if b.role == Role::Plan { plan_w } else { content_w };
                 for mb in markdown::parse(&b.text) {
                     if let Some(m) = build_md(
-                        &mut fs, &mb, content_w, font_size, line_height, card_pad, faces, text_color,
+                        &mut fs, &mb, w, font_size, line_height, card_pad, faces, text_color,
                         lum < 0.5,
                     ) {
                         measured.push(m);
                     }
+                }
+                if b.role == Role::Plan {
+                    plan_range = Some((start, measured.len()));
                 }
             } else {
                 measured.push(build_plain(
@@ -587,10 +625,30 @@ impl PanelRenderer {
         let buttons_h = if rows.is_empty() { 0.0 } else { gap + button_block_h };
         let content_bottom = height - pad;
 
+        // The plan box is capped: it contributes at most `plan_region_h` to the
+        // laid-out height (the overflow scrolls internally), so factor that out of
+        // the totals below. `plan_region_h`/`plan_total` are 0 when no plan shows.
+        let plan_cap = (height * 0.5).min(280.0 * s);
+        let (plan_total, plan_inner_h) = match plan_range {
+            Some((a, b)) => {
+                let items = &measured[a..b];
+                let pt = items.iter().map(|m| m.height).sum::<f32>()
+                    + gap * items.len().saturating_sub(1) as f32;
+                (pt, pt.min(plan_cap))
+            }
+            None => (0.0, 0.0),
+        };
+        // The drawn box adds `card_pad` of inner padding above and below the content.
+        let plan_box_h = if plan_range.is_some() { plan_inner_h + card_pad * 2.0 } else { 0.0 };
+        self.plan_max = (plan_total - plan_inner_h).max(0.0);
+        self.plan_scroll = self.plan_scroll.clamp(0.0, self.plan_max);
+
         // Bottom-anchor when the transcript overflows; `scroll` reveals older
-        // content (clamped so 0 = latest, max = top).
+        // content (clamped so 0 = latest, max = top). The plan box counts as its
+        // capped box height, not its full content height.
         let total: f32 = measured.iter().map(|m| m.height).sum::<f32>()
             + gap * measured.len().saturating_sub(1) as f32
+            - (plan_total - plan_box_h)
             + buttons_h;
         self.content_h = total + pad * 2.0;
         let viewport_h = content_bottom - pad;
@@ -612,7 +670,66 @@ impl PanelRenderer {
         let mut quads: Vec<Quad> = Vec::new();
         self.laid.clear();
         let mut live_keys: Vec<u64> = Vec::new();
-        for m in measured {
+        self.plan_rect = None;
+        let mut plan_box_top = 0.0_f32; // y of the plan box's top (set at its first item)
+        let mut plan_y = 0.0_f32; // running y inside the plan box (offset by plan_scroll)
+        for (idx, m) in measured.into_iter().enumerate() {
+            // Plan items: lay out inside a capped box that scrolls internally, so a
+            // long plan can't push the rest off-screen. Clip every item to the box
+            // and offset by `plan_scroll`; the box advances `y` by its capped height.
+            if let Some((ps, pe)) = plan_range {
+                if idx >= ps && idx < pe {
+                    if idx == ps {
+                        plan_box_top = y;
+                        self.plan_rect = Some([pad, y, content_w, plan_box_h]);
+                        quads.push(Quad {
+                            x: pad,
+                            y,
+                            w: content_w,
+                            h: plan_box_h,
+                            color: [overlay, overlay, overlay, 0.06],
+                            radius,
+                        });
+                        // Content starts card_pad below the box top, offset by scroll.
+                        plan_y = y + card_pad - self.plan_scroll;
+                    }
+                    // Clip to the padded inner area so content never paints over the
+                    // box's padding (top/bottom/left/right).
+                    let top = (plan_box_top + card_pad).max(0.0);
+                    let bottom = (plan_box_top + plan_box_h - card_pad).min(self.height as f32);
+                    let clip = [pad + card_pad, top, plan_w, (bottom - top).max(0.0)];
+                    let tx = pad + card_pad + m.indent;
+                    if let Some(tbl) = m.table {
+                        for c in tbl.cells {
+                            self.laid.push(LaidBlock {
+                                buffer: c.buffer, text: c.text, tx: tx + c.dx, ty: plan_y + c.dy,
+                                hscroll: 0.0, clip: Some(clip), code_key: None, max_hscroll: 0.0,
+                            });
+                        }
+                    } else {
+                        self.laid.push(LaidBlock {
+                            buffer: m.buffer, text: m.text, tx, ty: plan_y,
+                            hscroll: 0.0, clip: Some(clip), code_key: None, max_hscroll: 0.0,
+                        });
+                    }
+                    plan_y += m.height + gap;
+                    if idx == pe - 1 {
+                        // Scroll thumb on the box's right edge when it overflows.
+                        if self.plan_max > 0.5 && plan_total > 0.0 {
+                            let track = plan_inner_h;
+                            let thumb_h = (track * plan_inner_h / plan_total).max(20.0 * s);
+                            let thumb_y = plan_box_top + card_pad
+                                + (self.plan_scroll / self.plan_max) * (track - thumb_h);
+                            quads.push(Quad {
+                                x: pad + content_w - 4.0 * s, y: thumb_y, w: 3.0 * s, h: thumb_h,
+                                color: [overlay, overlay, overlay, 0.45], radius: 1.5 * s,
+                            });
+                        }
+                        y = plan_box_top + plan_box_h + gap;
+                    }
+                    continue;
+                }
+            }
             // A table draws its own grid + header background, then places each
             // cell buffer as its own laid block (so selection still works).
             if let Some(tbl) = m.table {
