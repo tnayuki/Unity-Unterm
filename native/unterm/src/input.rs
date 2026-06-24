@@ -363,6 +363,9 @@ impl InputBox {
     }
 
     pub fn render(&mut self) {
+        // Self-heal a placeholder surface once Unity's device is available (no-op on
+        // macOS, and after the first real frame).
+        self.shared.begin_frame();
         let g = gpu::gpu();
         let s = self.scale;
         let font_size = 14.0 * s;
@@ -612,9 +615,13 @@ impl InputBox {
                 .render(&self.atlas, &self.viewport, &mut pass)
                 .expect("unterm: input glyphon render failed");
         }
+        // Blit the freshly rendered frame into the surface's presented texture:
+        // no-op on macOS (the IOSurface is the render target); on Windows it copies
+        // the private target into the shared D3D texture Unity samples.
+        self.shared.finish_frame(&mut encoder);
         g.queue.submit([encoder.finish()]);
-        g.device.poll(wgpu::Maintain::Wait);
-        // Blit into the presented texture (no-op on macOS; D3D copy on Windows).
+        // Block until the GPU finishes (render + copy) so Unity samples a complete
+        // texture (the zero-copy path has no readback to force completion).
         self.shared.present();
     }
 

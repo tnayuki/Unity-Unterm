@@ -120,6 +120,24 @@ namespace Unterm.Editor
             LoadNative();
         }
 
+        private void OnFocus()
+        {
+            _refocus = true; // re-park the IME field on the caret for typing
+#if UNITY_EDITOR_WIN
+            // The Windows editor doesn't auto-engage the OS IME for a custom IMGUI
+            // window (Auto leaves it off here), so Japanese/CJK composition never
+            // starts. Force it on while we're focused; restored on blur.
+            Input.imeCompositionMode = IMECompositionMode.On;
+#endif
+        }
+
+        private void OnLostFocus()
+        {
+#if UNITY_EDITOR_WIN
+            Input.imeCompositionMode = IMECompositionMode.Auto;
+#endif
+        }
+
         private void OnDisable()
         {
             AssemblyReloadEvents.beforeAssemblyReload -= OnBeforeReload;

@@ -561,6 +561,9 @@ impl PanelRenderer {
     /// Render the role-tagged transcript as stacked, optionally-carded blocks
     /// (Zed-like). Newest content is bottom-anchored so it stays in view.
     pub fn render(&mut self, text: &str) {
+        // Self-heal a placeholder surface once Unity's device is available (no-op on
+        // macOS, and after the first real frame).
+        self.shared.begin_frame();
         let g = gpu::gpu();
         let mut fs = gpu::font_system().lock().unwrap();
 
@@ -1064,13 +1067,15 @@ impl PanelRenderer {
                 .render(&self.atlas, &self.viewport, &mut pass)
                 .expect("unterm: panel glyphon render failed");
         }
+        // Blit the freshly rendered frame into the surface's presented texture:
+        // no-op on macOS (the IOSurface is the render target); on Windows it copies
+        // the private target into the shared D3D texture Unity samples.
+        self.shared.finish_frame(&mut encoder);
         g.queue.submit([encoder.finish()]);
-        // Wait for the GPU so the IOSurface holds a complete frame before Unity
-        // samples it (the zero-copy path has no readback to force completion).
-        g.device.poll(wgpu::Maintain::Wait);
-        self.atlas.trim();
-        // Blit into the presented texture (no-op on macOS; D3D copy on Windows).
+        // Block until the GPU finishes (render + copy) so Unity samples a complete
+        // texture (the zero-copy path has no readback to force completion).
         self.shared.present();
+        self.atlas.trim();
     }
 
 }

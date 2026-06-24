@@ -25,7 +25,7 @@ namespace Unterm.Editor
 
         static UntermMcp()
         {
-#if UNITY_EDITOR_OSX
+#if UNITY_EDITOR_OSX || UNITY_EDITOR_WIN
             // Bring the bridge up at editor load — eagerly, not lazily when the
             // first agent window opens — so the tool catalog is always published
             // up front. Deferred one tick so AssetDatabase (GUID -> plugin path)
@@ -41,7 +41,7 @@ namespace Unterm.Editor
         /// Publish the Unity tool catalog and hook the per-tick drain (idempotent).
         public static void EnsureStarted()
         {
-#if UNITY_EDITOR_OSX
+#if UNITY_EDITOR_OSX || UNITY_EDITOR_WIN
             if (_native != null) return;
             try
             {
