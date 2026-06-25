@@ -7,7 +7,7 @@
 //! warmed once. All of this lives in `OnceLock`s so it survives — like the
 //! terminal registry — across Unity C# domain reloads.
 
-use glyphon::{Cache, FontSystem};
+use glyphon::{fontdb, Cache, FontSystem};
 use std::sync::{Mutex, OnceLock};
 
 /// sRGB target so Unity's external texture (created with `linear=false`)
@@ -100,5 +100,49 @@ pub fn gpu() -> &'static Gpu {
 /// The shared font database. Locked briefly during layout/render.
 pub fn font_system() -> &'static Mutex<FontSystem> {
     static FS: OnceLock<Mutex<FontSystem>> = OnceLock::new();
-    FS.get_or_init(|| Mutex::new(FontSystem::new()))
+    FS.get_or_init(|| {
+        // Mirror cosmic-text's `FontSystem::new()` database setup, but build it with
+        // a normalized locale so its Han-unification fallback resolves CJK ideographs
+        // to the right regional font (see `normalized_locale`).
+        let mut db = fontdb::Database::new();
+        db.set_monospace_family("Fira Mono");
+        db.set_sans_serif_family("Fira Sans");
+        db.set_serif_family("DejaVu Serif");
+        db.load_system_fonts();
+        let locale = normalized_locale();
+        Mutex::new(FontSystem::new_with_locale_and_db(locale, db))
+    })
+}
+
+/// The system locale, normalized for cosmic-text's exact-match Han-unification
+/// fallback. cosmic-text keys CJK ideograph fallback off the bare language for
+/// `ja`/`ko`, but keeps the region only for Chinese (`zh-HK`/`zh-TW`); `sys_locale`
+/// returns region-tagged values like `ja-JP`, which never match, so kanji wrongly
+/// fall back to a Chinese font. Reduce to the primary subtag, except for Chinese
+/// where the region (Traditional vs Simplified) must be preserved.
+fn normalized_locale() -> String {
+    let raw = sys_locale::get_locale().unwrap_or_else(|| "en-US".to_string());
+    let primary = raw.split(['-', '_']).next().unwrap_or("en");
+    if primary.eq_ignore_ascii_case("zh") {
+        let upper = raw.to_ascii_uppercase();
+        if upper.contains("HK") {
+            "zh-HK".to_string()
+        } else if upper.contains("TW") || upper.contains("HANT") {
+            "zh-TW".to_string()
+        } else {
+            "zh-CN".to_string() // Simplified — cosmic-text's default arm
+        }
+    } else {
+        primary.to_ascii_lowercase()
+    }
+}
+
+/// Whether a font spec is a file path to load from disk (vs. a family name that's
+/// already in the shared [`font_system`], e.g. a system UI font referenced by name).
+pub fn is_font_path(s: &str) -> bool {
+    s.contains('/')
+        || s.contains('\\')
+        || s.ends_with(".ttf")
+        || s.ends_with(".ttc")
+        || s.ends_with(".otf")
 }

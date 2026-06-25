@@ -418,6 +418,15 @@ namespace Unterm.Editor
         // the native generic monospace family.
         private void ApplyFont()
         {
+            var p = ResolveMonospaceFontPath();
+            if (!string.IsNullOrEmpty(p)) _native.SetFont(Tid, p);
+        }
+
+        // The terminal's monospace font file, or "" if none resolves (Windows: none
+        // of these exist, so the renderer falls back to the generic monospace family
+        // — Consolas). Shared so the agent panel can render in the same font.
+        internal static string ResolveMonospaceFontPath()
+        {
             // Menlo first: a clean "Menlo" family with full Regular/Bold/Italic
             // faces. (SF Mono registers under a private ".SF NS Mono" name that
             // doesn't resolve by name, and Monaco reports as non-monospaced.)
@@ -429,8 +438,9 @@ namespace Unterm.Editor
             };
             foreach (var p in candidates)
             {
-                if (File.Exists(p)) { _native.SetFont(Tid, p); break; }
+                if (File.Exists(p)) return p;
             }
+            return "";
         }
 
         private void Teardown(bool keepTerminal)

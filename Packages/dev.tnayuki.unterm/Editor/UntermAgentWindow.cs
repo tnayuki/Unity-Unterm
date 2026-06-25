@@ -339,24 +339,23 @@ namespace Unterm.Editor
             }
         }
 
-        // Use the Unity editor's own bundled Inter faces (Regular + the
-        // SemiBold/Italic variants) so Markdown bold/italic render real faces, not
-        // synthesized ones. (Unity ships SemiBold, no "Bold".)
+        // Prose renders in the OS's native proportional UI font, addressed by family
+        // name (already loaded as a system font). Latin comes from this family;
+        // Japanese (kana + kanji) falls back to the matching system face — Yu Gothic
+        // on Windows, Hiragino on macOS — consistently, because the shared FontSystem
+        // is built with a normalized locale (see gpu::font_system) so cosmic-text's
+        // Han-unification fallback no longer mis-picks a Chinese font for kanji.
+        // Bold/italic resolve from the family's own faces. Code blocks stay monospace
+        // (renderer-hardcoded), so the panel reads like a chat, not a terminal.
         private void ApplyFonts()
         {
             if (_native == null || _viewId == 0) return;
-            string fontsDir = Path.Combine(EditorApplication.applicationContentsPath, "Resources/Fonts");
-            string FontOrEmpty(string name)
-            {
-                string p = Path.Combine(fontsDir, name);
-                return File.Exists(p) ? p : "";
-            }
-            _native.AgentviewSetFonts(
-                Vid,
-                FontOrEmpty("Inter-Regular.ttf"),
-                FontOrEmpty("Inter-SemiBold.ttf"),
-                FontOrEmpty("Inter-Italic.ttf"),
-                FontOrEmpty("Inter-SemiBoldItalic.ttf"));
+#if UNITY_EDITOR_WIN
+            const string ui = "Segoe UI";
+#else
+            const string ui = "Helvetica Neue";
+#endif
+            _native.AgentviewSetFonts(Vid, ui, "", "", "");
         }
 
         /// Tear down host-side resources. When <paramref name="keepView"/> is true

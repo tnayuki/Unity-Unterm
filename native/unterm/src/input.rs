@@ -119,6 +119,12 @@ impl InputBox {
     }
 
     pub fn set_font(&mut self, path: &str) {
+        // A family name (not a file path) is already in the shared FontSystem (a
+        // system UI font): address it directly, no file load.
+        if !gpu::is_font_path(path) {
+            self.font_family = Some(path.to_string());
+            return;
+        }
         let mut fs = gpu::font_system().lock().unwrap();
         let db = fs.db_mut();
         if let Err(e) = db.load_font_file(path) {
@@ -195,7 +201,7 @@ impl InputBox {
         let mut fs = gpu::font_system().lock().unwrap();
         let family = match family_name.as_deref() {
             Some(n) => Family::Name(n),
-            None => Family::SansSerif,
+            None => Family::Monospace,
         };
         let attrs = Attrs::new().family(family).color(color);
         self.editor
@@ -387,7 +393,7 @@ impl InputBox {
         let fs = &mut *guard;
         let family = match family_name.as_deref() {
             Some(n) => Family::Name(n),
-            None => Family::SansSerif,
+            None => Family::Monospace,
         };
         let attrs = Attrs::new().family(family).color(color);
 
@@ -525,7 +531,7 @@ impl InputBox {
             b.set_text(
                 fs,
                 ch,
-                Attrs::new().family(Family::SansSerif).color(tc),
+                Attrs::new().family(Family::Monospace).color(tc),
                 Shaping::Advanced,
             );
             b.shape_until_scroll(fs, false);

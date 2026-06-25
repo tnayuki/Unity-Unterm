@@ -22,6 +22,9 @@ log = "0.4"
 env_logger = "0.11"
 # Display width of the IME preedit so it can be laid out over the right cells.
 unicode-width = "0.1"
+# System locale detection, normalized so cosmic-text's Han-unification fallback
+# resolves CJK ideographs to the right regional font (see gpu::font_system).
+sys-locale = "0.3"
 
 # Terminal model + PTY.
 alacritty_terminal = "0.25"

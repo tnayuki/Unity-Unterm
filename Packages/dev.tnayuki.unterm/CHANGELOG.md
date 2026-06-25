@@ -18,6 +18,7 @@
 ### Fixed
 
 - A terminal window wider or taller than 2048 px no longer fails to render: the renderer now requests the GPU's real maximum texture size and clamps its target to it, instead of the 2048-px downlevel default.
+- CJK ideographs (kanji) now render in the correct regional font for the system locale (e.g. Japanese on a `ja-JP` machine) instead of falling back to a Chinese font.
 
 ## [0.2.2] - 2026-06-20
 

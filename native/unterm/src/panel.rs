@@ -39,6 +39,19 @@ use std::ffi::c_void;
 pub(crate) const RS: char = '\u{1e}';
 pub(crate) const US: char = '\u{1f}';
 
+/// Family for code blocks / inline code. cosmic-text maps the generic
+/// `Family::Monospace` to the (usually absent) "Fira Mono", so macOS would fall back
+/// to an arbitrary monospace; name Menlo to match the terminal. On Windows the
+/// generic already resolves to Consolas (= the terminal), so keep it.
+#[cfg(target_os = "macos")]
+fn code_family() -> Family<'static> {
+    Family::Name("Menlo")
+}
+#[cfg(windows)]
+fn code_family() -> Family<'static> {
+    Family::Monospace
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum Role {
     User,
@@ -584,11 +597,14 @@ impl PanelRenderer {
         let lum = 0.2126 * self.clear.r + 0.7152 * self.clear.g + 0.0722 * self.clear.b;
         let overlay = if lum < 0.5 { 1.0_f32 } else { 0.0_f32 };
 
+        // No editor font loaded → generic monospace, which (unlike `SansSerif`)
+        // reliably resolves a face in the embedded FontSystem on Windows too
+        // (Consolas), matching the terminal renderer's fallback.
         let regular = self
             .font_family
             .as_deref()
             .map(Family::Name)
-            .unwrap_or(Family::SansSerif);
+            .unwrap_or(Family::Monospace);
         let bold = self.font_bold.as_deref().map(Family::Name).unwrap_or(regular);
         let italic = self.font_italic.as_deref().map(Family::Name).unwrap_or(regular);
         let bold_italic = self
@@ -1120,6 +1136,11 @@ fn highlight_code(text: &str, lang: &str, dark: bool) -> Option<Vec<(String, Col
 
 /// Load a font file and return its first family name (None on failure).
 fn load_face(fs: &mut FontSystem, path: &str) -> Option<String> {
+    // A family name (not a file path) is already in the shared FontSystem (a system
+    // UI font): address it directly, no file load.
+    if !gpu::is_font_path(path) {
+        return Some(path.to_string());
+    }
     let db = fs.db_mut();
     if let Err(e) = db.load_font_file(path) {
         log::warn!("unterm: failed to load font {path}: {e}");
@@ -1285,7 +1306,7 @@ fn shape_spans(
         .map(|sp| {
             let bold = sp.bold || force_bold;
             let fam = if sp.code {
-                Family::Monospace
+                code_family()
             } else {
                 faces.pick(bold, sp.italic)
             };
@@ -1381,32 +1402,32 @@ fn build_md(
                         } else {
                             text_color
                         };
-                        (l.as_str(), Attrs::new().family(Family::Monospace).color(c))
+                        (l.as_str(), Attrs::new().family(code_family()).color(c))
                     })
                     .collect();
                 buf.set_rich_text(
                     fs,
                     parts,
-                    Attrs::new().family(Family::Monospace).color(text_color),
+                    Attrs::new().family(code_family()).color(text_color),
                     Shaping::Advanced,
                 );
             } else if let Some(pieces) = &highlighted {
                 // Syntax-highlighted: one colored span per token.
                 let parts: Vec<(&str, Attrs)> = pieces
                     .iter()
-                    .map(|(t, c)| (t.as_str(), Attrs::new().family(Family::Monospace).color(*c)))
+                    .map(|(t, c)| (t.as_str(), Attrs::new().family(code_family()).color(*c)))
                     .collect();
                 buf.set_rich_text(
                     fs,
                     parts,
-                    Attrs::new().family(Family::Monospace).color(text_color),
+                    Attrs::new().family(code_family()).color(text_color),
                     Shaping::Advanced,
                 );
             } else {
                 buf.set_text(
                     fs,
                     text,
-                    Attrs::new().family(Family::Monospace).color(text_color),
+                    Attrs::new().family(code_family()).color(text_color),
                     Shaping::Advanced,
                 );
             }
