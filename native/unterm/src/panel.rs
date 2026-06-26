@@ -704,8 +704,9 @@ impl PanelRenderer {
             buf.set_text(
                 &mut fs,
                 label,
-                Attrs::new().family(faces.regular).color(text_color),
+                &Attrs::new().family(faces.regular).color(text_color),
                 Shaping::Advanced,
+                None,
             );
             buf.shape_until_scroll(&mut fs, false);
             btn_w.push(measure_width(&buf) + btn_pad_x * 2.0);
@@ -920,8 +921,9 @@ impl PanelRenderer {
                 gb.set_text(
                     &mut fs,
                     glyph,
-                    Attrs::new().family(faces.regular).color(dim(text_color, 150)),
+                    &Attrs::new().family(faces.regular).color(dim(text_color, 150)),
                     Shaping::Advanced,
+                    None,
                 );
                 gb.shape_until_scroll(&mut fs, false);
                 let gw = measure_width(&gb);
@@ -1068,6 +1070,7 @@ impl PanelRenderer {
                 label: Some("unterm-panel-pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: self.shared.view(),
+                    depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(self.clear),
@@ -1077,6 +1080,7 @@ impl PanelRenderer {
                 depth_stencil_attachment: None,
                 timestamp_writes: None,
                 occlusion_query_set: None,
+                multiview_mask: None,
             });
             self.quads.render(&mut pass);
             self.text_renderer
@@ -1198,8 +1202,9 @@ fn build_plain(
     buffer.set_text(
         fs,
         &b.text,
-        Attrs::new().family(family).color(color),
+        &Attrs::new().family(family).color(color),
         Shaping::Advanced,
+        None,
     );
     buffer.shape_until_scroll(fs, false);
     let text_h = measure_height(&buffer);
@@ -1249,14 +1254,14 @@ fn build_tool(
 
     // Owned span texts (kept alive for the borrowed slices set_rich_text takes).
     let mut texts: Vec<String> = vec![header.to_string()];
-    let mut attrs: Vec<Attrs> = vec![head_attrs];
+    let mut attrs: Vec<Attrs> = vec![head_attrs.clone()];
     if !preview.is_empty() {
         texts.push(format!("  {preview}"));
-        attrs.push(small_attrs);
+        attrs.push(small_attrs.clone());
     }
     if let Some(d) = detail {
         texts.push(format!("\n{d}"));
-        attrs.push(small_attrs);
+        attrs.push(small_attrs.clone());
     }
 
     let mut buffer = Buffer::new(fs, Metrics::new(font_size, line_height));
@@ -1265,9 +1270,9 @@ fn build_tool(
     let spans: Vec<(&str, Attrs)> = texts
         .iter()
         .map(|s| s.as_str())
-        .zip(attrs.iter().copied())
+        .zip(attrs.iter().cloned())
         .collect();
-    buffer.set_rich_text(fs, spans, head_attrs, Shaping::Advanced);
+    buffer.set_rich_text(fs, spans, &head_attrs, Shaping::Advanced, None);
     buffer.shape_until_scroll(fs, false);
 
     let text: String = texts.concat();
@@ -1331,8 +1336,9 @@ fn shape_spans(
     buf.set_rich_text(
         fs,
         parts,
-        Attrs::new().family(faces.regular).color(base_color),
+        &Attrs::new().family(faces.regular).color(base_color),
         Shaping::Advanced,
+        None,
     );
     buf.shape_until_scroll(fs, false);
     (buf, text)
@@ -1408,8 +1414,9 @@ fn build_md(
                 buf.set_rich_text(
                     fs,
                     parts,
-                    Attrs::new().family(code_family()).color(text_color),
+                    &Attrs::new().family(code_family()).color(text_color),
                     Shaping::Advanced,
+                    None,
                 );
             } else if let Some(pieces) = &highlighted {
                 // Syntax-highlighted: one colored span per token.
@@ -1420,15 +1427,17 @@ fn build_md(
                 buf.set_rich_text(
                     fs,
                     parts,
-                    Attrs::new().family(code_family()).color(text_color),
+                    &Attrs::new().family(code_family()).color(text_color),
                     Shaping::Advanced,
+                    None,
                 );
             } else {
                 buf.set_text(
                     fs,
                     text,
-                    Attrs::new().family(code_family()).color(text_color),
+                    &Attrs::new().family(code_family()).color(text_color),
                     Shaping::Advanced,
+                    None,
                 );
             }
             buf.shape_until_scroll(fs, false);

@@ -2,9 +2,9 @@
 //!
 //! We create an `IOSurface`, wrap it in an `MTLTexture` on wgpu's own Metal
 //! device, and hand that texture to wgpu via `create_texture_from_hal` so the
-//! panel renders straight into the surface. The same `IOSurface` (and, in
-//! Stage 2, a sibling `MTLTexture` created on Unity's device) lets Unity sample
-//! the result with no CPU readback.
+//! panel renders straight into the surface. Unity samples the result with no CPU
+//! readback. The Metal side uses the same `objc2-metal` bindings wgpu-hal 29 is
+//! built on; IOSurface creation stays on the plain CoreFoundation FFI.
 
 use std::ffi::c_void;
 
@@ -14,9 +14,16 @@ use core_foundation::number::CFNumber;
 use core_foundation::string::CFString;
 use core_foundation_sys::dictionary::CFDictionaryRef;
 use core_foundation_sys::string::CFStringRef;
-use foreign_types::ForeignType;
-use objc::{msg_send, sel, sel_impl};
 
+use objc2::rc::Retained;
+use objc2::runtime::ProtocolObject;
+use objc2_metal::{
+    MTLDevice, MTLPixelFormat, MTLStorageMode, MTLTexture, MTLTextureDescriptor, MTLTextureType,
+    MTLTextureUsage,
+};
+
+/// Raw IOSurface pointer handed across the surface abstraction (the FFI shape the
+/// rest of the crate uses); distinct from objc2's typed `IOSurfaceRef`.
 pub type IOSurfaceRef = *const c_void;
 
 #[link(name = "IOSurface", kind = "framework")]
@@ -38,11 +45,11 @@ const PIXEL_FORMAT_RGBA: i32 = 0x5247_4241;
 /// An IOSurface plus the wgpu texture that renders into it.
 pub struct SharedSurface {
     surface: IOSurfaceRef,
-    /// Raw `id<MTLTexture>` (owned by `texture`; valid while it lives).
-    /// Stage 2 hands Unity a sibling texture made from the same IOSurface.
+    /// Raw `id<MTLTexture>` (owned by `texture`; valid while it lives). Handed to
+    /// Unity for `CreateExternalTexture`.
     raw_texture: *mut c_void,
-    /// Owns the wgpu texture's retain on the IOSurface; never read directly, but
-    /// must outlive the surface (see `Drop`), so it's held for its lifetime.
+    /// Owns the wgpu texture's retain on the Metal texture / IOSurface; never read
+    /// directly, but must outlive the surface (see `Drop`).
     #[allow(dead_code)]
     texture: wgpu::Texture,
     view: wgpu::TextureView,
@@ -77,7 +84,7 @@ impl SharedSurface {
 
     /// Block until the frame is done so Unity samples a finished IOSurface.
     pub fn present(&mut self) {
-        crate::gpu::gpu().device.poll(wgpu::Maintain::Wait);
+        let _ = crate::gpu::gpu().device.poll(wgpu::PollType::wait_indefinitely());
     }
 
     /// Single-buffered — nothing to advance on idle ticks.
@@ -104,49 +111,42 @@ pub fn create_shared_target(
     let surface = unsafe { create_iosurface(width, height) };
     assert!(!surface.is_null(), "IOSurfaceCreate failed");
 
-    // Pull the raw MTLDevice out of wgpu so the texture lands on the same device.
-    let raw_device: metal::Device = unsafe {
-        device
-            .as_hal::<wgpu::hal::api::Metal, _, _>(|d| {
-                d.expect("wgpu device is not Metal")
-                    .raw_device()
-                    .lock()
-                    .clone()
-            })
-            .expect("as_hal returned None")
+    // Pull wgpu's own MTLDevice so the texture lands on the same device.
+    let mtl_device: Retained<ProtocolObject<dyn MTLDevice>> = unsafe {
+        let hal_device = device
+            .as_hal::<wgpu::hal::api::Metal>()
+            .expect("wgpu device is not Metal");
+        hal_device.raw_device().clone()
     };
 
-    let desc = metal::TextureDescriptor::new();
-    desc.set_texture_type(metal::MTLTextureType::D2);
-    // Must match the wgpu FORMAT (Rgba8UnormSrgb) so wgpu accepts the texture.
-    desc.set_pixel_format(metal::MTLPixelFormat::RGBA8Unorm_sRGB);
-    desc.set_width(width as u64);
-    desc.set_height(height as u64);
-    desc.set_mipmap_level_count(1);
-    desc.set_storage_mode(metal::MTLStorageMode::Shared);
-    desc.set_usage(metal::MTLTextureUsage::RenderTarget | metal::MTLTextureUsage::ShaderRead);
-
-    // newTextureWithDescriptor:iosurface:plane: — not exposed by metal-rs 0.29.
-    let raw_tex: metal::Texture = unsafe {
-        let dev_obj = raw_device.as_ptr() as *mut objc::runtime::Object;
-        let desc_obj = desc.as_ptr() as *mut objc::runtime::Object;
-        let tex_id: *mut objc::runtime::Object = msg_send![
-            dev_obj,
-            newTextureWithDescriptor: desc_obj
-            iosurface: surface
-            plane: 0usize
-        ];
-        assert!(!tex_id.is_null(), "newTextureWithDescriptor:iosurface: returned nil");
-        metal::Texture::from_ptr(tex_id as *mut _)
+    let desc = unsafe {
+        let desc = MTLTextureDescriptor::new();
+        desc.setTextureType(MTLTextureType::Type2D);
+        // Must match the wgpu FORMAT (Rgba8UnormSrgb) so wgpu accepts the texture.
+        desc.setPixelFormat(MTLPixelFormat::RGBA8Unorm_sRGB);
+        desc.setWidth(width as usize);
+        desc.setHeight(height as usize);
+        desc.setMipmapLevelCount(1);
+        desc.setStorageMode(MTLStorageMode::Shared);
+        desc.setUsage(MTLTextureUsage::RenderTarget | MTLTextureUsage::ShaderRead);
+        desc
     };
 
-    let raw_texture = raw_tex.as_ptr() as *mut c_void;
+    // Bridge the CoreFoundation IOSurface pointer into objc2's typed reference.
+    let surf_ref: &objc2_io_surface::IOSurfaceRef =
+        unsafe { &*(surface as *const objc2_io_surface::IOSurfaceRef) };
+    let mtl_tex: Retained<ProtocolObject<dyn MTLTexture>> = mtl_device
+        .newTextureWithDescriptor_iosurface_plane(&desc, surf_ref, 0)
+        .expect("newTextureWithDescriptor:iosurface: returned nil");
+
+    // Raw pointer for Unity; valid while the wgpu texture (below) holds the retain.
+    let raw_texture = Retained::as_ptr(&mtl_tex) as *mut c_void;
 
     let hal_tex = unsafe {
         wgpu::hal::metal::Device::texture_from_raw(
-            raw_tex,
+            mtl_tex,
             format,
-            metal::MTLTextureType::D2,
+            MTLTextureType::Type2D,
             1,
             1,
             wgpu::hal::CopyExtent {

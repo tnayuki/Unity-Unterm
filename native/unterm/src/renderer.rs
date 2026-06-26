@@ -231,8 +231,9 @@ impl Renderer {
         buf.set_text(
             &mut fs,
             sample,
-            Attrs::new().family(family),
+            &Attrs::new().family(family),
             Shaping::Advanced,
+            None,
         );
         buf.shape_until_scroll(&mut fs, false);
         let line_w = buf
@@ -434,8 +435,9 @@ impl Renderer {
                             buf.set_text(
                                 &mut fs,
                                 cv.ch.encode_utf8(&mut [0u8; 4]),
-                                attrs_of(cv.fg, cv.bold, cv.italic),
+                                &attrs_of(cv.fg, cv.bold, cv.italic),
                                 Shaping::Advanced,
+                                None,
                             );
                             buf.shape_until_scroll(&mut fs, false);
                             row_buffers.push((buf, pad + col as f32 * cell_w, top));
@@ -483,7 +485,7 @@ impl Renderer {
                         }
                         Some((&text[s..e], attrs_of(fg, bold, italic)))
                     });
-                    buf.set_rich_text(&mut fs, spans, Attrs::new().family(family), Shaping::Advanced);
+                    buf.set_rich_text(&mut fs, spans, &Attrs::new().family(family), Shaping::Advanced, None);
                     buf.shape_until_scroll(&mut fs, false);
                     row_buffers.push((buf, pad + seg_start as f32 * cell_w, top));
                 }
@@ -545,8 +547,9 @@ impl Renderer {
                                 buf.set_text(
                                     &mut fs,
                                     chs[i].encode_utf8(&mut [0u8; 4]),
-                                    attrs_of(theme.fg, false, false),
+                                    &attrs_of(theme.fg, false, false),
                                     Shaping::Advanced,
+                                    None,
                                 );
                                 buf.shape_until_scroll(&mut fs, false);
                                 row_buffers.push((buf, pad + c as f32 * cell_w, y));
@@ -567,7 +570,7 @@ impl Renderer {
                                 if !run.is_empty() {
                                     let mut buf = Buffer::new(&mut fs, Metrics::new(font_px, line_h));
                                     buf.set_size(&mut fs, None, Some(line_h));
-                                    buf.set_text(&mut fs, &run, attrs_of(theme.fg, false, false), Shaping::Advanced);
+                                    buf.set_text(&mut fs, &run, &attrs_of(theme.fg, false, false), Shaping::Advanced, None);
                                     buf.shape_until_scroll(&mut fs, false);
                                     row_buffers.push((buf, pad + run_col as f32 * cell_w, y));
                                 }
@@ -652,6 +655,7 @@ impl Renderer {
                 label: Some("unterm-pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: self.shared.view(),
+                    depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(clear),
@@ -661,6 +665,7 @@ impl Renderer {
                 depth_stencil_attachment: None,
                 timestamp_writes: None,
                 occlusion_query_set: None,
+                multiview_mask: None,
             });
             self.quads.render(&mut pass);
             self.text_renderer

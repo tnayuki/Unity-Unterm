@@ -18,17 +18,14 @@
 //! each interface struct declares just enough fields to reach them.
 
 use std::ffi::c_void;
-use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU32, Ordering};
 
-use winapi::shared::dxgi::{CreateDXGIFactory1, IDXGIAdapter, IDXGIDevice, DXGI_ADAPTER_DESC};
-use winapi::shared::dxgi1_4::IDXGIFactory4;
-use winapi::shared::ntdef::LUID;
-use winapi::shared::winerror::SUCCEEDED;
-use winapi::um::d3d11::ID3D11Device;
-use winapi::um::d3d12::ID3D12Device;
-use winapi::um::unknwnbase::IUnknown;
-use winapi::Interface;
+use windows::core::Interface;
+use windows::Win32::Graphics::Direct3D11::ID3D11Device;
+use windows::Win32::Graphics::Direct3D12::ID3D12Device;
+use windows::Win32::Graphics::Dxgi::{
+    CreateDXGIFactory1, IDXGIAdapter, IDXGIDevice, IDXGIFactory4, DXGI_ADAPTER_DESC,
+};
 
 /// `UnityGfxRenderer` values we care about (from IUnityGraphics.h).
 pub const KIND_NONE: i32 = 0;
@@ -193,63 +190,23 @@ pub fn unity_adapter_ids() -> Option<(u32, u32)> {
 /// D3D11: via `IDXGIDevice::GetAdapter`. D3D12: look the device's LUID up through
 /// a DXGI factory. Returns `None` on any COM failure.
 unsafe fn adapter_ids(kind: i32, device: *mut c_void) -> Option<(u32, u32)> {
-    let desc = match kind {
+    let d: DXGI_ADAPTER_DESC = match kind {
         KIND_D3D11 => {
-            let dev = device as *mut ID3D11Device;
-            let mut dxgi_dev: *mut IDXGIDevice = ptr::null_mut();
-            let hr = (*dev).QueryInterface(
-                &IDXGIDevice::uuidof(),
-                &mut dxgi_dev as *mut *mut IDXGIDevice as *mut *mut c_void,
-            );
-            if !SUCCEEDED(hr) || dxgi_dev.is_null() {
-                return None;
-            }
-            let mut adapter: *mut IDXGIAdapter = ptr::null_mut();
-            let hr = (*dxgi_dev).GetAdapter(&mut adapter);
-            (*dxgi_dev).Release();
-            if !SUCCEEDED(hr) || adapter.is_null() {
-                return None;
-            }
-            let mut d: DXGI_ADAPTER_DESC = std::mem::zeroed();
-            let hr = (*adapter).GetDesc(&mut d);
-            (*adapter).Release();
-            if !SUCCEEDED(hr) {
-                return None;
-            }
-            d
+            let dev: &ID3D11Device = ID3D11Device::from_raw_borrowed(&device)?;
+            let dxgi_dev: IDXGIDevice = dev.cast().ok()?;
+            let adapter: IDXGIAdapter = dxgi_dev.GetAdapter().ok()?;
+            adapter.GetDesc().ok()?
         }
         KIND_D3D12 => {
-            let dev = device as *mut ID3D12Device;
-            let luid: LUID = (*dev).GetAdapterLuid();
-            let mut factory: *mut IDXGIFactory4 = ptr::null_mut();
-            let hr = CreateDXGIFactory1(
-                &IDXGIFactory4::uuidof(),
-                &mut factory as *mut *mut IDXGIFactory4 as *mut *mut c_void,
-            );
-            if !SUCCEEDED(hr) || factory.is_null() {
-                return None;
-            }
-            let mut adapter: *mut IDXGIAdapter = ptr::null_mut();
-            let hr = (*factory).EnumAdapterByLuid(
-                luid,
-                &IDXGIAdapter::uuidof(),
-                &mut adapter as *mut *mut IDXGIAdapter as *mut *mut c_void,
-            );
-            (*(factory as *mut IUnknown)).Release();
-            if !SUCCEEDED(hr) || adapter.is_null() {
-                return None;
-            }
-            let mut d: DXGI_ADAPTER_DESC = std::mem::zeroed();
-            let hr = (*adapter).GetDesc(&mut d);
-            (*adapter).Release();
-            if !SUCCEEDED(hr) {
-                return None;
-            }
-            d
+            let dev: &ID3D12Device = ID3D12Device::from_raw_borrowed(&device)?;
+            let luid = dev.GetAdapterLuid();
+            let factory: IDXGIFactory4 = CreateDXGIFactory1().ok()?;
+            let adapter: IDXGIAdapter = factory.EnumAdapterByLuid(luid).ok()?;
+            adapter.GetDesc().ok()?
         }
         _ => return None,
     };
-    Some((desc.VendorId, desc.DeviceId))
+    Some((d.VendorId, d.DeviceId))
 }
 
 /// Try each interface GUID in turn; return the device from the first that the

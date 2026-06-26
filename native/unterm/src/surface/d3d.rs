@@ -10,38 +10,30 @@
 //! The editor graphics device is always D3D11 or D3D12, so this is the only
 //! display path — there is no readback fallback. If the Unity device isn't
 //! captured yet (it is captured at editor startup, long before any terminal
-//! window opens) or a `HRESULT` fails, the buffer is a plain offscreen texture
-//! and `raw_texture` reports null; the host shows a status and retries, and a
-//! later resize rebuilds the target once the device is available.
+//! window opens) or a call fails, the buffer is a plain offscreen texture and
+//! `raw_texture` reports null; the host shows a status and retries, and a later
+//! resize rebuilds the target once the device is available.
 //!
 //! Like the macOS IOSurface path, this is **single-buffered and synchronous**:
 //! the renderer draws into a private wgpu target, copies the finished frame into
 //! the one shared texture, and `present` blocks until the GPU is done, so Unity
-//! always samples a complete frame. (A private target is needed because clears
-//! aren't reliable rendering straight into the imported resource.) Each terminal
-//! owns its own surface; only the wgpu device/queue is shared.
+//! always samples a complete frame. Uses the same `windows` (windows-rs) crate
+//! wgpu-hal is built on, so the raw `ID3D12Resource` handed to wgpu-hal matches.
 
 use std::ffi::c_void;
 use std::ptr;
 
-use winapi::ctypes::c_void as win_void;
-use winapi::shared::dxgiformat::DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
-use winapi::shared::dxgitype::DXGI_SAMPLE_DESC;
-use winapi::shared::ntdef::HANDLE;
-use winapi::shared::winerror::SUCCEEDED;
-use winapi::um::d3d11::{ID3D11Device, ID3D11Texture2D};
-use winapi::um::d3d11_1::ID3D11Device1;
-use winapi::um::d3d12::{
-    ID3D12Device, ID3D12DeviceChild, ID3D12Resource, D3D12_CPU_PAGE_PROPERTY_UNKNOWN,
-    D3D12_HEAP_FLAG_SHARED, D3D12_HEAP_PROPERTIES, D3D12_HEAP_TYPE_DEFAULT,
-    D3D12_MEMORY_POOL_UNKNOWN, D3D12_RESOURCE_DESC, D3D12_RESOURCE_DIMENSION_TEXTURE2D,
-    D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS,
-    D3D12_RESOURCE_STATE_COMMON, D3D12_TEXTURE_LAYOUT_UNKNOWN,
+use windows::core::{IUnknown, Interface};
+use windows::Win32::Foundation::{CloseHandle, GENERIC_ALL, HANDLE};
+use windows::Win32::Graphics::Direct3D11::{ID3D11Device, ID3D11Device1, ID3D11Texture2D};
+use windows::Win32::Graphics::Direct3D12::{
+    ID3D12Device, ID3D12Resource, D3D12_CPU_PAGE_PROPERTY_UNKNOWN, D3D12_HEAP_FLAG_SHARED,
+    D3D12_HEAP_PROPERTIES, D3D12_HEAP_TYPE_DEFAULT, D3D12_MEMORY_POOL_UNKNOWN, D3D12_RESOURCE_DESC,
+    D3D12_RESOURCE_DIMENSION_TEXTURE2D, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+    D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS, D3D12_RESOURCE_STATE_COMMON,
+    D3D12_TEXTURE_LAYOUT_UNKNOWN,
 };
-use winapi::um::handleapi::CloseHandle;
-use winapi::um::unknwnbase::IUnknown;
-use winapi::um::winnt::GENERIC_ALL;
-use winapi::Interface;
+use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, DXGI_SAMPLE_DESC};
 
 use crate::unity;
 
@@ -54,20 +46,13 @@ pub type IOSurfaceRef = *const c_void;
 struct Buffer {
     /// The wgpu side of the shared D3D12 resource; the copy destination.
     texture: wgpu::Texture,
-    /// Unity-device texture (`ID3D11Texture2D*` / `ID3D12Resource*`) aliasing
-    /// `texture`, or null if the Unity device wasn't available when this target
-    /// was built (a placeholder until the next rebuild picks the device up).
+    /// Unity-device texture (`ID3D11Texture2D` / `ID3D12Resource`) aliasing
+    /// `texture`, or null if the Unity device wasn't available when this target was
+    /// built (a placeholder until the next rebuild picks the device up).
     raw_texture: *mut c_void,
-    /// The same object as an `IUnknown` to release on drop (null = placeholder).
-    keep_alive: *mut IUnknown,
-}
-
-impl Drop for Buffer {
-    fn drop(&mut self) {
-        if !self.keep_alive.is_null() {
-            unsafe { (*self.keep_alive).Release() };
-        }
-    }
+    /// Keeps the Unity-device texture alive (windows-rs RAII releases on drop);
+    /// `None` for a placeholder.
+    _keep_alive: Option<IUnknown>,
 }
 
 /// A single-buffered, synchronous render target (the macOS IOSurface model).
@@ -115,13 +100,13 @@ impl SharedSurface {
     pub fn finish_frame(&self, encoder: &mut wgpu::CommandEncoder) {
         let dst = &self.buffer.texture;
         encoder.copy_texture_to_texture(
-            wgpu::ImageCopyTexture {
+            wgpu::TexelCopyTextureInfo {
                 texture: &self.render,
                 mip_level: 0,
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
             },
-            wgpu::ImageCopyTexture {
+            wgpu::TexelCopyTextureInfo {
                 texture: dst,
                 mip_level: 0,
                 origin: wgpu::Origin3d::ZERO,
@@ -151,7 +136,7 @@ impl SharedSurface {
     /// Block until the GPU finishes the submitted frame (render + copy) so Unity
     /// samples a complete texture. Same as the macOS path.
     pub fn present(&mut self) {
-        crate::gpu::gpu().device.poll(wgpu::Maintain::Wait);
+        let _ = crate::gpu::gpu().device.poll(wgpu::PollType::wait_indefinitely());
     }
 
     /// Single-buffered — nothing to advance on idle ticks.
@@ -243,12 +228,12 @@ fn placeholder_buffer(
     Buffer {
         texture,
         raw_texture: ptr::null_mut(),
-        keep_alive: ptr::null_mut(),
+        _keep_alive: None,
     }
 }
 
-/// Build one shared buffer, or `None` if the Unity device isn't captured yet or
-/// any `HRESULT` fails.
+/// Build one shared buffer, or `None` if the Unity device isn't captured yet or any
+/// call fails.
 unsafe fn try_shared_buffer(
     device: &wgpu::Device,
     width: u32,
@@ -261,17 +246,12 @@ unsafe fn try_shared_buffer(
         return None;
     }
 
-    // wgpu's own ID3D12Device (clone bumps the refcount; the ComPtr releases it
-    // when this function returns — the device itself stays alive via wgpu).
-    // `as_hal` returns `Option<R>` and our closure returns `Option<_>` too, so
-    // flatten the two layers.
-    let wgpu_dev: d3d12::Device = device
-        .as_hal::<wgpu::hal::api::Dx12, _, _>(|d| d.map(|h| h.raw_device().clone()))
-        .flatten()?;
-    let dev = wgpu_dev.as_mut_ptr();
-    if dev.is_null() {
-        return None;
-    }
+    // wgpu's own ID3D12Device (clone bumps the refcount; the original stays alive
+    // via wgpu).
+    let wgpu_dev: ID3D12Device = {
+        let hal = device.as_hal::<wgpu::hal::api::Dx12>()?;
+        hal.raw_device().clone()
+    };
 
     // --- producer: a shared, render-target D3D12 texture on wgpu's device ---
     let heap = D3D12_HEAP_PROPERTIES {
@@ -295,64 +275,48 @@ unsafe fn try_shared_buffer(
         },
         Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
         // SIMULTANEOUS_ACCESS makes the cross-API read well-defined: Microsoft
-        // documents it specifically for D3D11-on-12 interop, which is exactly this
-        // path (wgpu D3D12 writes via copy; Unity's D3D11 device samples).
+        // documents it for D3D11-on-12 interop, which is exactly this path (wgpu
+        // D3D12 writes via copy; Unity's D3D11 device samples).
         Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET
             | D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS,
     };
 
-    let mut resource: *mut ID3D12Resource = ptr::null_mut();
-    let hr = (*dev).CreateCommittedResource(
+    let mut resource: Option<ID3D12Resource> = None;
+    if let Err(e) = wgpu_dev.CreateCommittedResource(
         &heap,
         D3D12_HEAP_FLAG_SHARED,
         &desc,
         D3D12_RESOURCE_STATE_COMMON,
-        ptr::null(),
-        &ID3D12Resource::uuidof(),
-        &mut resource as *mut *mut ID3D12Resource as *mut *mut win_void,
-    );
-    if !SUCCEEDED(hr) || resource.is_null() {
-        log::warn!("unterm: CreateCommittedResource(shared) failed: 0x{hr:08x}");
+        None,
+        &mut resource,
+    ) {
+        log::warn!("unterm: CreateCommittedResource(shared) failed: {e}");
         return None;
     }
+    let resource = resource?;
 
-    let mut handle: HANDLE = ptr::null_mut();
-    let hr = (*dev).CreateSharedHandle(
-        resource as *mut ID3D12DeviceChild,
-        ptr::null(),
-        GENERIC_ALL,
-        ptr::null(),
-        &mut handle,
-    );
-    if !SUCCEEDED(hr) || handle.is_null() {
-        log::warn!("unterm: CreateSharedHandle failed: 0x{hr:08x}");
-        (*(resource as *mut IUnknown)).Release();
-        return None;
-    }
-
-    // --- consumer: open the handle on Unity's device ---
-    let opened = match kind {
-        unity::KIND_D3D11 => open_on_d3d11(unity_dev as *mut ID3D11Device, handle),
-        unity::KIND_D3D12 => open_on_d3d12(unity_dev as *mut ID3D12Device, handle),
-        _ => None,
-    };
-    CloseHandle(handle);
-
-    let (raw_texture, keep_alive) = match opened {
-        Some(pair) => pair,
-        None => {
-            (*(resource as *mut IUnknown)).Release();
+    let handle = match wgpu_dev.CreateSharedHandle(&resource, None, GENERIC_ALL.0, None) {
+        Ok(h) => h,
+        Err(e) => {
+            log::warn!("unterm: CreateSharedHandle failed: {e}");
             return None;
         }
     };
 
-    // Hand the D3D12 resource to wgpu as the copy destination. `from_raw` AddRefs,
-    // so drop our original reference and let the wgpu texture own the one ref.
-    let owned = d3d12::Resource::from_raw(resource);
-    (*(resource as *mut IUnknown)).Release();
+    // --- consumer: open the handle on Unity's device ---
+    let opened = match kind {
+        unity::KIND_D3D11 => open_on_d3d11(unity_dev, handle),
+        unity::KIND_D3D12 => open_on_d3d12(unity_dev, handle),
+        _ => None,
+    };
+    let _ = CloseHandle(handle);
 
+    let (raw_texture, keep_alive) = opened?;
+
+    // Hand the D3D12 resource to wgpu as the copy destination (moves our reference;
+    // the wgpu texture owns it from here).
     let hal_tex = wgpu::hal::dx12::Device::texture_from_raw(
-        owned,
+        resource,
         format,
         wgpu::TextureDimension::D2,
         wgpu::Extent3d {
@@ -384,46 +348,34 @@ unsafe fn try_shared_buffer(
     Some(Buffer {
         texture,
         raw_texture,
-        keep_alive,
+        _keep_alive: Some(keep_alive),
     })
 }
 
-/// Open the shared handle on a D3D11 device → `ID3D11Texture2D*`.
-unsafe fn open_on_d3d11(dev: *mut ID3D11Device, handle: HANDLE) -> Option<(*mut c_void, *mut IUnknown)> {
-    let mut dev1: *mut ID3D11Device1 = ptr::null_mut();
-    let hr = (*dev).QueryInterface(
-        &ID3D11Device1::uuidof(),
-        &mut dev1 as *mut *mut ID3D11Device1 as *mut *mut win_void,
-    );
-    if !SUCCEEDED(hr) || dev1.is_null() {
-        log::warn!("unterm: QI ID3D11Device1 failed: 0x{hr:08x}");
-        return None;
-    }
-    let mut tex: *mut ID3D11Texture2D = ptr::null_mut();
-    let hr = (*dev1).OpenSharedResource1(
-        handle,
-        &ID3D11Texture2D::uuidof(),
-        &mut tex as *mut *mut ID3D11Texture2D as *mut *mut win_void,
-    );
-    (*dev1).Release();
-    if !SUCCEEDED(hr) || tex.is_null() {
-        log::warn!("unterm: OpenSharedResource1 failed: 0x{hr:08x}");
-        return None;
-    }
-    Some((tex as *mut c_void, tex as *mut IUnknown))
+/// Open the shared handle on Unity's D3D11 device → `ID3D11Texture2D`.
+unsafe fn open_on_d3d11(unity_dev: *mut c_void, handle: HANDLE) -> Option<(*mut c_void, IUnknown)> {
+    let dev: &ID3D11Device = ID3D11Device::from_raw_borrowed(&unity_dev)?;
+    let dev1: ID3D11Device1 = dev.cast().ok()?;
+    let tex: ID3D11Texture2D = match dev1.OpenSharedResource1(handle) {
+        Ok(t) => t,
+        Err(e) => {
+            log::warn!("unterm: OpenSharedResource1 failed: {e}");
+            return None;
+        }
+    };
+    let raw = tex.as_raw();
+    Some((raw, tex.into()))
 }
 
-/// Open the shared handle on a D3D12 device → `ID3D12Resource*`.
-unsafe fn open_on_d3d12(dev: *mut ID3D12Device, handle: HANDLE) -> Option<(*mut c_void, *mut IUnknown)> {
-    let mut res: *mut ID3D12Resource = ptr::null_mut();
-    let hr = (*dev).OpenSharedHandle(
-        handle,
-        &ID3D12Resource::uuidof(),
-        &mut res as *mut *mut ID3D12Resource as *mut *mut win_void,
-    );
-    if !SUCCEEDED(hr) || res.is_null() {
-        log::warn!("unterm: OpenSharedHandle failed: 0x{hr:08x}");
+/// Open the shared handle on Unity's D3D12 device → `ID3D12Resource`.
+unsafe fn open_on_d3d12(unity_dev: *mut c_void, handle: HANDLE) -> Option<(*mut c_void, IUnknown)> {
+    let dev: &ID3D12Device = ID3D12Device::from_raw_borrowed(&unity_dev)?;
+    let mut res: Option<ID3D12Resource> = None;
+    if let Err(e) = dev.OpenSharedHandle(handle, &mut res) {
+        log::warn!("unterm: OpenSharedHandle failed: {e}");
         return None;
     }
-    Some((res as *mut c_void, res as *mut IUnknown))
+    let res = res?;
+    let raw = res.as_raw();
+    Some((raw, res.into()))
 }

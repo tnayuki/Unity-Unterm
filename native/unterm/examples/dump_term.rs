@@ -32,29 +32,20 @@ fn main() {
     }
     std::thread::sleep(Duration::from_millis(400));
 
-    unterm_render(id);
-
-    let mut len = 0usize;
-    let ptr = unsafe { unterm_get_pixels(id, &mut len as *mut usize) };
-    assert!(!ptr.is_null() && len > 0, "no pixels");
+    // Zero-copy has no CPU readback, so just drive the full pipeline a few times
+    // (PTY -> parser -> grid -> GPU render into the IOSurface target) and confirm it
+    // doesn't panic — a runtime check of the objc2-metal IOSurface path on wgpu 29.
+    for _ in 0..3 {
+        unterm_render(id);
+        std::thread::sleep(Duration::from_millis(50));
+    }
     let mut w = 0u32;
     let mut h = 0u32;
     unsafe { unterm_size(id, &mut w as *mut u32, &mut h as *mut u32) };
-    let mut cols = 0u32;
-    let mut rows = 0u32;
-    unsafe { unterm_grid_size(id, &mut cols as *mut u32, &mut rows as *mut u32) };
-    println!("rendered {w}x{h} px, grid {cols}x{rows}, {len} bytes");
-
-    let data = unsafe { std::slice::from_raw_parts(ptr, len) };
-    image::save_buffer(
-        "unterm.png",
-        data,
-        w,
-        h,
-        image::ExtendedColorType::Rgba8,
-    )
-    .expect("png save");
-    println!("wrote unterm.png");
+    let raw = unsafe { unterm_raw_texture(id) };
+    println!("rendered {w}x{h}; IOSurface MTLTexture ptr = {raw:?}");
+    assert!(!raw.is_null(), "IOSurface texture was null (zero-copy target failed)");
 
     unterm_destroy(id);
+    println!("OK: render pipeline ran on wgpu 29 without panicking");
 }

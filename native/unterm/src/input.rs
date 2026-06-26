@@ -205,7 +205,7 @@ impl InputBox {
         };
         let attrs = Attrs::new().family(family).color(color);
         self.editor
-            .with_buffer_mut(|b| b.set_text(&mut fs, text, attrs, Shaping::Advanced));
+            .with_buffer_mut(|b| b.set_text(&mut fs, text, &attrs, Shaping::Advanced, None));
         self.editor.action(&mut fs, Action::Motion(Motion::BufferEnd));
         self.undo.clear(); // programmatic reset isn't an undoable edit
         self.redo.clear();
@@ -403,7 +403,7 @@ impl InputBox {
             b.set_wrap(fs, Wrap::WordOrGlyph);
             // Re-apply attrs (color/family) to every line so theme changes take.
             for line in b.lines.iter_mut() {
-                line.set_attrs_list(glyphon::AttrsList::new(attrs));
+                line.set_attrs_list(glyphon::AttrsList::new(&attrs));
             }
         });
 
@@ -531,8 +531,9 @@ impl InputBox {
             b.set_text(
                 fs,
                 ch,
-                Attrs::new().family(Family::Monospace).color(tc),
+                &Attrs::new().family(Family::Monospace).color(tc),
                 Shaping::Advanced,
+                None,
             );
             b.shape_until_scroll(fs, false);
             let icon_w = b.layout_runs().map(|r| r.line_w).fold(0.0_f32, f32::max);
@@ -606,6 +607,7 @@ impl InputBox {
                 label: Some("unterm-input-pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: self.shared.view(),
+                    depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(self.clear),
@@ -615,6 +617,7 @@ impl InputBox {
                 depth_stencil_attachment: None,
                 timestamp_writes: None,
                 occlusion_query_set: None,
+                multiview_mask: None,
             });
             self.quads.render(&mut pass);
             self.text_renderer

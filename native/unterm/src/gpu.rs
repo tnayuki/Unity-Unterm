@@ -7,8 +7,10 @@
 //! warmed once. All of this lives in `OnceLock`s so it survives — like the
 //! terminal registry — across Unity C# domain reloads.
 
+use glyphon::cosmic_text::{Fallback, PlatformFallback};
 use glyphon::{fontdb, Cache, FontSystem};
 use std::sync::{Mutex, OnceLock};
+use unicode_script::Script;
 
 /// sRGB target so Unity's external texture (created with `linear=false`)
 /// hardware-decodes on sample. The Metal IOSurface uses `RGBA8Unorm_sRGB`.
@@ -32,23 +34,25 @@ fn init_gpu() -> Gpu {
     let backends = wgpu::Backends::PRIMARY;
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
         backends,
-        ..Default::default()
+        flags: wgpu::InstanceFlags::default(),
+        memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
+        backend_options: wgpu::BackendOptions::default(),
+        display: None,
     });
     let adapter = pick_adapter(&instance);
 
-    let (device, queue) = pollster::block_on(adapter.request_device(
-        &wgpu::DeviceDescriptor {
-            label: Some("unterm-device"),
-            required_features: wgpu::Features::empty(),
-            // Use the adapter's real limits, not downlevel defaults — the latter cap
-            // max_texture_dimension_2d at 2048, so a window wider/taller than that
-            // failed to build its render target (panicking the create, which left the
-            // terminal showing only "ready").
-            required_limits: adapter.limits(),
-            memory_hints: wgpu::MemoryHints::default(),
-        },
-        None,
-    ))
+    let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+        label: Some("unterm-device"),
+        required_features: wgpu::Features::empty(),
+        // Use the adapter's real limits, not downlevel defaults — the latter cap
+        // max_texture_dimension_2d at 2048, so a window wider/taller than that
+        // failed to build its render target (panicking the create, which left the
+        // terminal showing only "ready").
+        required_limits: adapter.limits(),
+        memory_hints: wgpu::MemoryHints::default(),
+        experimental_features: wgpu::ExperimentalFeatures::disabled(),
+        trace: wgpu::Trace::Off,
+    }))
     .expect("unterm: failed to create device");
 
     let cache = Cache::new(&device);
@@ -65,7 +69,7 @@ fn init_gpu() -> Gpu {
 fn pick_adapter(instance: &wgpu::Instance) -> wgpu::Adapter {
     #[cfg(windows)]
     if let Some((vendor, device)) = crate::unity::unity_adapter_ids() {
-        for a in instance.enumerate_adapters(wgpu::Backends::DX12) {
+        for a in pollster::block_on(instance.enumerate_adapters(wgpu::Backends::DX12)) {
             let info = a.get_info();
             if info.vendor == vendor && info.device == device {
                 log::info!(
@@ -101,30 +105,50 @@ pub fn gpu() -> &'static Gpu {
 pub fn font_system() -> &'static Mutex<FontSystem> {
     static FS: OnceLock<Mutex<FontSystem>> = OnceLock::new();
     FS.get_or_init(|| {
-        // Mirror cosmic-text's `FontSystem::new()` database setup, but build it with
-        // a normalized locale so its Han-unification fallback resolves CJK ideographs
-        // to the right regional font (see `normalized_locale`).
+        // Mirror cosmic-text's `FontSystem::new()` database setup, but install a
+        // custom CJK fallback (see `LocaleFallback`).
         let mut db = fontdb::Database::new();
         db.set_monospace_family("Fira Mono");
         db.set_sans_serif_family("Fira Sans");
         db.set_serif_family("DejaVu Serif");
         db.load_system_fonts();
-        let locale = normalized_locale();
-        Mutex::new(FontSystem::new_with_locale_and_db(locale, db))
+        let locale = sys_locale::get_locale().unwrap_or_else(|| "en-US".to_string());
+        Mutex::new(FontSystem::new_with_locale_and_db_and_fallback(
+            locale,
+            db,
+            LocaleFallback,
+        ))
     })
 }
 
-/// The system locale, normalized for cosmic-text's exact-match Han-unification
-/// fallback. cosmic-text keys CJK ideograph fallback off the bare language for
-/// `ja`/`ko`, but keeps the region only for Chinese (`zh-HK`/`zh-TW`); `sys_locale`
-/// returns region-tagged values like `ja-JP`, which never match, so kanji wrongly
-/// fall back to a Chinese font. Reduce to the primary subtag, except for Chinese
-/// where the region (Traditional vs Simplified) must be preserved.
-fn normalized_locale() -> String {
-    let raw = sys_locale::get_locale().unwrap_or_else(|| "en-US".to_string());
-    let primary = raw.split(['-', '_']).next().unwrap_or("en");
+/// cosmic-text's built-in Han-unification fallback matches the locale *exactly*
+/// (`ja`/`ko`/`zh-HK`/`zh-TW`), but `sys_locale` returns region-tagged values like
+/// `ja-JP` that never match — so CJK ideographs wrongly fall back to a Chinese
+/// font. This wraps the platform fallback and normalizes the locale first (the
+/// region is kept only for Chinese, where it picks Traditional vs Simplified).
+struct LocaleFallback;
+
+impl Fallback for LocaleFallback {
+    fn common_fallback(&self) -> &[&'static str] {
+        PlatformFallback.common_fallback()
+    }
+
+    fn forbidden_fallback(&self) -> &[&'static str] {
+        PlatformFallback.forbidden_fallback()
+    }
+
+    fn script_fallback(&self, script: Script, locale: &str) -> &[&'static str] {
+        PlatformFallback.script_fallback(script, &normalize_locale(locale))
+    }
+}
+
+/// Reduce a locale to the subtag cosmic-text's Han-unification fallback matches on:
+/// the primary language for everything except Chinese, where the region is kept
+/// (`zh-TW`/`zh-HK` = Traditional, anything else = Simplified).
+fn normalize_locale(locale: &str) -> String {
+    let primary = locale.split(['-', '_']).next().unwrap_or("en");
     if primary.eq_ignore_ascii_case("zh") {
-        let upper = raw.to_ascii_uppercase();
+        let upper = locale.to_ascii_uppercase();
         if upper.contains("HK") {
             "zh-HK".to_string()
         } else if upper.contains("TW") || upper.contains("HANT") {
