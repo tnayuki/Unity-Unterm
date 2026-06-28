@@ -45,9 +45,6 @@ use crate::mcp::McpDispatcher;
 pub const RS: char = '\u{1e}';
 pub const US: char = '\u{1f}';
 
-/// Override the spawned command (default `claude`); flags are always appended.
-const DEFAULT_CMD: &str = "claude";
-
 static NEXT_REQ: AtomicU64 = AtomicU64::new(1);
 
 // ===========================================================================
@@ -513,13 +510,17 @@ impl Driver {
         effort: String,
         claude_cmd: String,
     ) -> std::io::Result<Self> {
-        // The host (see ClaudeCode) resolves `claude` to an absolute path and passes
-        // it in; absent that we fall back to bare `claude` (resolved per-OS below).
-        let cmd = if claude_cmd.is_empty() {
-            DEFAULT_CMD.to_string()
-        } else {
-            claude_cmd
-        };
+        // The host (see ClaudeCode) resolves `claude` to its managed install and
+        // passes that absolute path in. We deliberately never fall back to a bare
+        // `claude` off the user's PATH: Unterm drives only the engine it manages, so
+        // a missing command is a hard error, not a silent system-`claude` spawn.
+        if claude_cmd.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "no managed claude binary — download it in Preferences > Unterm",
+            ));
+        }
+        let cmd = claude_cmd;
         let mut args: Vec<String> = "--output-format stream-json --verbose \
              --input-format stream-json --permission-prompt-tool stdio"
             .split_whitespace()

@@ -5,6 +5,7 @@
 ### Added
 
 - **Code editor** — a native in-Editor code editor window with tree-sitter syntax highlighting, Roslyn-powered C# autocomplete and signature help, find/replace and line operations, registered as a selectable External Script Editor so Unity file opens (and file paths clicked in the Claude Code transcript) route to it.
+- **Built-in Claude Code engine download** — a button in **Preferences > Unterm** fetches Anthropic's standalone Claude Code engine from the npm registry on demand, so the agent panel works without a separately installed `claude` (and without Node); the binary is integrity-checked, tracked to the latest release, and shared across your Unity projects.
 
 ### Changed
 

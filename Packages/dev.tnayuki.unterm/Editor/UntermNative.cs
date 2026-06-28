@@ -456,7 +456,8 @@ namespace Unterm.Editor
             _avCreate(cwd ?? string.Empty, pw, ph, iw, ih, effort ?? string.Empty, claudeCmd ?? string.Empty);
         /// Resume a prior conversation `resume` (empty -> fresh); returns the view id.
         /// `effort` is the reasoning effort (none/low/medium/high/max; ""/default = model default).
-        /// `claudeCmd` is the resolved absolute path to the `claude` CLI ("" -> bare `claude`).
+        /// `claudeCmd` is the resolved absolute path to the managed `claude` CLI; ""
+        /// is rejected (spawn fails) — Unterm never falls back to a system `claude`.
         public ulong AgentviewLoad(string cwd, string resume, uint pw, uint ph, uint iw, uint ih, string effort, string claudeCmd) =>
             _avLoad(cwd ?? string.Empty, resume ?? string.Empty, pw, ph, iw, ih, effort ?? string.Empty, claudeCmd ?? string.Empty);
         public bool AgentviewExists(ulong id) => id != 0 && _avExists(id);
