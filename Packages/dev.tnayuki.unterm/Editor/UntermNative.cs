@@ -102,6 +102,7 @@ namespace Unterm.Editor
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate IntPtr AvPtrFn(ulong id);
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate IntPtr AvBufFn(ulong id, out UIntPtr len);
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate float AvFloatFn(ulong id);
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate ulong U64IdFn(ulong id);
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate void AvF1Fn(ulong id, float v);
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate void AvCaretFn(ulong id, out float x, out float y, out float w, out float h);
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate byte AvDownFn(ulong id, float x, float y);
@@ -113,6 +114,15 @@ namespace Unterm.Editor
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate void AvStrFn(ulong id, [MarshalAs(UnmanagedType.LPUTF8Str)] string text);
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate uint AvUintGetFn(ulong id);
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate void AvUintSetFn(ulong id, uint v);
+
+        // --- code editor view (id-based; tree-sitter highlighting + line-number
+        // gutter; survives reload via a process-global registry). Symbols prefixed
+        // `unterm_editor_`. Most calls reuse the Av*/terminal delegate shapes. ---
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate ulong EdCreateFn(uint w, uint h, float scale);
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate void EdThemeFn(ulong id, double br, double bg, double bb, double ba, byte fr, byte fg, byte fb, [MarshalAs(UnmanagedType.I1)] bool dark);
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate void EdMouseFn(ulong id, float x, float y, byte kind);
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)] [return: MarshalAs(UnmanagedType.I1)] private delegate bool EdFindFn(ulong id, [MarshalAs(UnmanagedType.LPUTF8Str)] string query, [MarshalAs(UnmanagedType.I1)] bool forward, [MarshalAs(UnmanagedType.I1)] bool caseSensitive);
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate uint EdReplaceAllFn(ulong id, [MarshalAs(UnmanagedType.LPUTF8Str)] string query, [MarshalAs(UnmanagedType.LPUTF8Str)] string repl, [MarshalAs(UnmanagedType.I1)] bool caseSensitive);
 
         private IntPtr _handle;
 
@@ -143,6 +153,18 @@ namespace Unterm.Editor
         private AvInputDownFn _avInputDown; private AvDragFn _avInputDrag; private AvInputKeyFn _avInputKey;
         private AvStrFn _avInputInsert; private AvStrFn _avInputSetPreedit; private AvVoidFn _avInputUndo; private AvVoidFn _avInputRedo; private AvVoidFn _avInputSelectAll;
         private AvBufFn _avInputCopy; private AvBufFn _avInputCut; private AvBufFn _avInputText;
+        // Code editor view bindings (reusing several Av*/terminal delegate shapes).
+        private EdCreateFn _edCreate; private AvExistsFn _edExists; private AvVoidFn _edDestroy; private ResizeFn _edResize;
+        private SetScaleFn _edSetScale; private AvStrFn _edSetFont; private EdThemeFn _edSetTheme; private AvStrFn _edSetLanguage;
+        private AvUintSetFn _edSetUndoLimit;
+        private AvVoidFn _edRender; private AvPtrFn _edRawTexture; private AvFloatFn _edContentHeight; private AvCaretFn _edCaret;
+        private U64IdFn _edEditSerial;
+        private AvInputKeyFn _edKey; private AvStrFn _edInsert; private AvStrFn _edSetPreedit; private AvStrFn _edSetText;
+        private AvBufFn _edText; private AvVoidFn _edUndo; private AvVoidFn _edRedo; private AvVoidFn _edSelectAll;
+        private AvBufFn _edCopy; private AvBufFn _edCut; private EdMouseFn _edMouse; private AvF1Fn _edScroll;
+        private AvF1Fn _edSetScroll; private AvFloatFn _edScrollOffset; private AvF1Fn _edScrollH;
+        private AvVoidFn _edIndent, _edOutdent, _edToggleComment, _edMoveUp, _edMoveDown, _edDuplicate, _edDeleteLine;
+        private AvUintSetFn _edGotoLine; private EdFindFn _edFind; private AvStrFn _edReplaceSel; private EdReplaceAllFn _edReplaceAll;
 
         public bool IsLoaded => _handle != IntPtr.Zero;
 
@@ -267,6 +289,47 @@ namespace Unterm.Editor
             _avInputCopy = Sym<AvBufFn>("unterm_agentview_input_copy");
             _avInputCut = Sym<AvBufFn>("unterm_agentview_input_cut");
             _avInputText = Sym<AvBufFn>("unterm_agentview_input_text");
+
+            _edCreate = Sym<EdCreateFn>("unterm_editor_create");
+            _edExists = Sym<AvExistsFn>("unterm_editor_exists");
+            _edDestroy = Sym<AvVoidFn>("unterm_editor_destroy");
+            _edResize = Sym<ResizeFn>("unterm_editor_resize");
+            _edSetScale = Sym<SetScaleFn>("unterm_editor_set_scale");
+            _edSetUndoLimit = Sym<AvUintSetFn>("unterm_editor_set_undo_limit");
+            _edSetFont = Sym<AvStrFn>("unterm_editor_set_font");
+            _edSetTheme = Sym<EdThemeFn>("unterm_editor_set_theme");
+            _edSetLanguage = Sym<AvStrFn>("unterm_editor_set_language");
+            _edRender = Sym<AvVoidFn>("unterm_editor_render");
+            _edRawTexture = Sym<AvPtrFn>("unterm_editor_raw_texture");
+            _edContentHeight = Sym<AvFloatFn>("unterm_editor_content_height");
+            _edEditSerial = Sym<U64IdFn>("unterm_editor_edit_serial");
+            _edCaret = Sym<AvCaretFn>("unterm_editor_caret");
+            _edKey = Sym<AvInputKeyFn>("unterm_editor_key");
+            _edInsert = Sym<AvStrFn>("unterm_editor_insert");
+            _edSetPreedit = Sym<AvStrFn>("unterm_editor_set_preedit");
+            _edSetText = Sym<AvStrFn>("unterm_editor_set_text");
+            _edText = Sym<AvBufFn>("unterm_editor_text");
+            _edUndo = Sym<AvVoidFn>("unterm_editor_undo");
+            _edRedo = Sym<AvVoidFn>("unterm_editor_redo");
+            _edSelectAll = Sym<AvVoidFn>("unterm_editor_select_all");
+            _edCopy = Sym<AvBufFn>("unterm_editor_copy");
+            _edCut = Sym<AvBufFn>("unterm_editor_cut");
+            _edMouse = Sym<EdMouseFn>("unterm_editor_mouse");
+            _edScroll = Sym<AvF1Fn>("unterm_editor_scroll");
+            _edSetScroll = Sym<AvF1Fn>("unterm_editor_set_scroll");
+            _edScrollOffset = Sym<AvFloatFn>("unterm_editor_scroll_offset");
+            _edScrollH = Sym<AvF1Fn>("unterm_editor_scroll_h");
+            _edIndent = Sym<AvVoidFn>("unterm_editor_indent");
+            _edOutdent = Sym<AvVoidFn>("unterm_editor_outdent");
+            _edToggleComment = Sym<AvVoidFn>("unterm_editor_toggle_comment");
+            _edMoveUp = Sym<AvVoidFn>("unterm_editor_move_line_up");
+            _edMoveDown = Sym<AvVoidFn>("unterm_editor_move_line_down");
+            _edDuplicate = Sym<AvVoidFn>("unterm_editor_duplicate_line");
+            _edDeleteLine = Sym<AvVoidFn>("unterm_editor_delete_line");
+            _edGotoLine = Sym<AvUintSetFn>("unterm_editor_goto_line");
+            _edFind = Sym<EdFindFn>("unterm_editor_find");
+            _edReplaceSel = Sym<AvStrFn>("unterm_editor_replace_selection");
+            _edReplaceAll = Sym<EdReplaceAllFn>("unterm_editor_replace_all");
         }
 
         private T Sym<T>(string name) where T : Delegate
@@ -430,6 +493,54 @@ namespace Unterm.Editor
         public string AgentviewInputCut(ulong id) { var s = _avInputCut(id, out UIntPtr len); return Utf8(s, len); }
         public string AgentviewInputText(ulong id) { var s = _avInputText(id, out UIntPtr len); return Utf8(s, len); }
 
+        // --- code editor view (id-based; tree-sitter highlighting + gutter) ---
+        public ulong EditorCreate(uint w, uint h, float scale) => _edCreate(w, h, scale);
+        public bool EditorExists(ulong id) => id != 0 && _edExists(id);
+        public void EditorDestroy(ulong id) { if (id != 0) _edDestroy(id); }
+        public void EditorResize(ulong id, uint w, uint h, float scale) => _edResize(id, w, h, scale);
+        public void EditorSetScale(ulong id, float scale) => _edSetScale(id, scale);
+        public void EditorSetUndoLimit(ulong id, int limit) => _edSetUndoLimit(id, (uint)(limit < 0 ? 0 : limit));
+        public void EditorSetFont(ulong id, string path) => _edSetFont(id, path ?? string.Empty);
+        /// Background rgba + foreground rgb, and whether to use the dark highlight theme.
+        public void EditorSetTheme(ulong id, Color bg, Color32 fg, bool dark) =>
+            _edSetTheme(id, bg.r, bg.g, bg.b, bg.a, fg.r, fg.g, fg.b, dark);
+        /// Tree-sitter language token (e.g. "cs"); empty/unknown = plain.
+        public void EditorSetLanguage(ulong id, string token) => _edSetLanguage(id, token ?? string.Empty);
+        public void EditorRender(ulong id) => _edRender(id);
+        public IntPtr EditorRawTexture(ulong id) => _edRawTexture(id);
+        public float EditorContentHeight(ulong id) => _edContentHeight(id);
+        public ulong EditorEditSerial(ulong id) => _edEditSerial(id);
+        public void EditorCaret(ulong id, out float x, out float y, out float w, out float h) =>
+            _edCaret(id, out x, out y, out w, out h);
+        public void EditorKey(ulong id, string name, bool ctrl, bool alt, bool shift) =>
+            _edKey(id, name ?? string.Empty, ctrl, alt, shift);
+        public void EditorInsert(ulong id, string text) { if (!string.IsNullOrEmpty(text)) _edInsert(id, text); }
+        public void EditorSetPreedit(ulong id, string text) => _edSetPreedit(id, text ?? "");
+        public void EditorSetText(ulong id, string text) => _edSetText(id, text ?? string.Empty);
+        public string EditorText(ulong id) { var p = _edText(id, out UIntPtr len); return Utf8(p, len); }
+        public void EditorUndo(ulong id) => _edUndo(id);
+        public void EditorRedo(ulong id) => _edRedo(id);
+        public void EditorSelectAll(ulong id) => _edSelectAll(id);
+        public string EditorCopy(ulong id) { var p = _edCopy(id, out UIntPtr len); return Utf8(p, len); }
+        public string EditorCut(ulong id) { var p = _edCut(id, out UIntPtr len); return Utf8(p, len); }
+        /// Mouse at physical px: kind 0 click, 1 drag, 2 double-click, 3 triple-click.
+        public void EditorMouse(ulong id, float x, float y, byte kind) => _edMouse(id, x, y, kind);
+        public void EditorScroll(ulong id, float dy) => _edScroll(id, dy);
+        public void EditorScrollH(ulong id, float dx) => _edScrollH(id, dx);
+        public void EditorSetScroll(ulong id, float px) => _edSetScroll(id, px);
+        public float EditorScrollOffset(ulong id) => _edScrollOffset(id);
+        public void EditorIndent(ulong id) => _edIndent(id);
+        public void EditorOutdent(ulong id) => _edOutdent(id);
+        public void EditorToggleComment(ulong id) => _edToggleComment(id);
+        public void EditorMoveLineUp(ulong id) => _edMoveUp(id);
+        public void EditorMoveLineDown(ulong id) => _edMoveDown(id);
+        public void EditorDuplicateLine(ulong id) => _edDuplicate(id);
+        public void EditorDeleteLine(ulong id) => _edDeleteLine(id);
+        public void EditorGotoLine(ulong id, uint line) => _edGotoLine(id, line);
+        public bool EditorFind(ulong id, string query, bool forward, bool caseSensitive) => _edFind(id, query ?? "", forward, caseSensitive);
+        public void EditorReplaceSelection(ulong id, string repl) => _edReplaceSel(id, repl ?? "");
+        public uint EditorReplaceAll(ulong id, string query, string repl, bool caseSensitive) => _edReplaceAll(id, query ?? "", repl ?? "", caseSensitive);
+
         private static uint Pack(Color32 c) => (uint)((c.r << 16) | (c.g << 8) | c.b);
 
         public void Dispose()
@@ -464,6 +575,14 @@ namespace Unterm.Editor
             _avInputDown = null; _avInputDrag = null; _avInputKey = null;
             _avInputInsert = null; _avInputSetPreedit = null; _avInputUndo = null; _avInputRedo = null; _avInputSelectAll = null;
             _avInputCopy = null; _avInputCut = null; _avInputText = null;
+            _edCreate = null; _edExists = null; _edDestroy = null; _edResize = null; _edSetScale = null; _edSetUndoLimit = null;
+            _edSetFont = null; _edSetTheme = null; _edSetLanguage = null; _edRender = null; _edRawTexture = null;
+            _edContentHeight = null; _edEditSerial = null; _edCaret = null; _edKey = null; _edInsert = null; _edSetPreedit = null;
+            _edSetText = null; _edText = null; _edUndo = null; _edRedo = null; _edSelectAll = null;
+            _edCopy = null; _edCut = null; _edMouse = null; _edScroll = null;
+            _edSetScroll = null; _edScrollOffset = null; _edScrollH = null; _edIndent = null; _edOutdent = null;
+            _edToggleComment = null; _edMoveUp = null; _edMoveDown = null; _edDuplicate = null;
+            _edDeleteLine = null; _edGotoLine = null; _edFind = null; _edReplaceSel = null; _edReplaceAll = null;
         }
     }
 }

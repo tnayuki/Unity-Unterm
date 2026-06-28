@@ -16,7 +16,10 @@
 
 mod agentview;
 mod control;
+mod editops;
+mod editorview;
 mod gpu;
+mod highlight;
 mod input;
 #[cfg(target_os = "macos")]
 mod iosurface;
@@ -39,6 +42,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use agentview::AgentView;
+use editorview::EditorView;
 use term::Terminal;
 
 /// Tees log output to stderr *and* a file. env_logger writes only to stderr,
@@ -1180,6 +1184,416 @@ unsafe fn view_string(
 
 
 
+
+// ===========================================================================
+// Code editor view: an id-handled editing surface (tree-sitter highlighting +
+// line-number gutter) the Unity side blits and drives. Lives in its own
+// process-global registry keyed by a stable id so unsaved edits survive C#
+// domain reloads (the host re-adopts by id). The file path / dirty state are
+// C#-side; this owns only the surface, language, and theme.
+// ===========================================================================
+
+type EditorMap = HashMap<u64, Box<EditorView>>;
+
+fn editors() -> &'static Mutex<EditorMap> {
+    static E: OnceLock<Mutex<EditorMap>> = OnceLock::new();
+    E.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Lock the editor registry, recovering a poisoned mutex instead of panicking —
+/// the same reasoning as [`lock_registry`]: a panic caught at the FFI boundary
+/// (see [`with_editor`]) must not wedge every later call.
+fn lock_editors() -> std::sync::MutexGuard<'static, EditorMap> {
+    editors().lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Run `f` against the editor with `id`, contained by [`ffi_guard`] so a panic in
+/// cosmic-text (e.g. an out-of-range selection during an edit) or wgpu can't
+/// unwind across the C ABI and abort Unity.
+fn with_editor<R>(id: u64, default: R, f: impl FnOnce(&mut EditorView) -> R) -> R {
+    ffi_guard(None, || lock_editors().get_mut(&id).map(|e| f(e))).unwrap_or(default)
+}
+
+static NEXT_EDITOR_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Shared helper for the editor's cached-CString accessors.
+unsafe fn editor_string(
+    id: u64,
+    out_len: *mut usize,
+    f: impl FnOnce(&mut EditorView) -> &CString,
+) -> *const c_char {
+    // Guard like the other editor entry points: `cut` mutates (deletes the
+    // selection) and could panic in cosmic-text; that must not abort Unity. The
+    // returned pointer is into the editor's cached CString, valid until the next
+    // call on this editor (so it outlives the dropped lock).
+    ffi_guard(std::ptr::null(), || {
+        let mut map = lock_editors();
+        let Some(e) = map.get_mut(&id) else {
+            return std::ptr::null();
+        };
+        let c = f(e);
+        if !out_len.is_null() {
+            unsafe { *out_len = c.as_bytes().len() };
+        }
+        c.as_ptr()
+    })
+}
+
+/// Create a code-editor surface sized `width`x`height` physical px at `scale`.
+/// Returns a stable id the host persists to re-adopt across reloads (0 on error).
+#[no_mangle]
+pub extern "C" fn unterm_editor_create(width: u32, height: u32, scale: f32) -> u64 {
+    init_log();
+    ffi_guard(0, || {
+        let v = EditorView::new(width.max(1), height.max(1), scale);
+        let id = NEXT_EDITOR_ID.fetch_add(1, Ordering::Relaxed);
+        lock_editors().insert(id, Box::new(v));
+        id
+    })
+}
+
+/// Whether an editor id is still live (to re-adopt after a reload).
+#[no_mangle]
+pub extern "C" fn unterm_editor_exists(id: u64) -> bool {
+    lock_editors().contains_key(&id)
+}
+
+/// Destroy an editor surface (frees its GPU target; unsaved text is lost).
+#[no_mangle]
+pub extern "C" fn unterm_editor_destroy(id: u64) {
+    lock_editors().remove(&id);
+}
+
+/// Resize to `width`x`height` physical px at `scale`.
+#[no_mangle]
+pub extern "C" fn unterm_editor_resize(id: u64, width: u32, height: u32, scale: f32) {
+    if let Some(e) = lock_editors().get_mut(&id) {
+        e.resize(width.max(1), height.max(1), scale);
+    }
+}
+
+/// Set the HiDPI scale (pixels per point) without changing the pixel size.
+#[no_mangle]
+pub extern "C" fn unterm_editor_set_scale(id: u64, scale: f32) {
+    if let Some(e) = lock_editors().get_mut(&id) {
+        e.set_scale(scale);
+    }
+}
+
+/// Set the undo-history cap (number of retained steps; 0 = unlimited).
+#[no_mangle]
+pub extern "C" fn unterm_editor_set_undo_limit(id: u64, limit: u32) {
+    if let Some(e) = lock_editors().get_mut(&id) {
+        e.set_undo_limit(limit as usize);
+    }
+}
+
+/// Load a monospace font file (TTF/OTF/TTC) or address a system family by name.
+///
+/// # Safety
+/// `path` must be a valid C string or null.
+#[no_mangle]
+pub unsafe extern "C" fn unterm_editor_set_font(id: u64, path: *const c_char) {
+    let path = cstr(path);
+    if let Some(e) = lock_editors().get_mut(&id) {
+        e.set_font(&path);
+    }
+}
+
+/// Background rgba + foreground rgb, plus whether to use the dark highlight theme.
+#[no_mangle]
+pub extern "C" fn unterm_editor_set_theme(
+    id: u64,
+    br: f64,
+    bg: f64,
+    bb: f64,
+    ba: f64,
+    fr: u8,
+    fg: u8,
+    fb: u8,
+    dark: bool,
+) {
+    if let Some(e) = lock_editors().get_mut(&id) {
+        e.set_theme(br, bg, bb, ba, fr, fg, fb, dark);
+    }
+}
+
+/// Set the tree-sitter language token (e.g. "cs"); empty/unknown = plain.
+///
+/// # Safety
+/// `token` must be a valid C string or null.
+#[no_mangle]
+pub unsafe extern "C" fn unterm_editor_set_language(id: u64, token: *const c_char) {
+    let token = cstr(token);
+    with_editor(id, (), |e| e.set_language(&token));
+}
+
+/// Render the editor surface into its IOSurface/shared texture.
+#[no_mangle]
+pub extern "C" fn unterm_editor_render(id: u64) {
+    with_editor(id, (), |e| e.render());
+}
+
+/// Raw `id<MTLTexture>` of the editor surface (for Unity zero-copy).
+#[no_mangle]
+pub extern "C" fn unterm_editor_raw_texture(id: u64) -> *mut c_void {
+    match lock_editors().get(&id) {
+        Some(e) => e.raw_texture(),
+        None => std::ptr::null_mut(),
+    }
+}
+
+/// Laid-out content height in physical px (for the host scrollbar).
+#[no_mangle]
+pub extern "C" fn unterm_editor_content_height(id: u64) -> f32 {
+    lock_editors().get(&id).map_or(0.0, |e| e.content_height())
+}
+
+/// Document-state version: a monotonic id that undo/redo restore. The host records
+/// it at save and compares to detect unsaved changes (no second buffer copy).
+#[no_mangle]
+pub extern "C" fn unterm_editor_edit_serial(id: u64) -> u64 {
+    lock_editors().get(&id).map_or(0, |e| e.edit_serial())
+}
+
+/// Caret rect in physical px into x/y/w/h (any pointer may be null).
+///
+/// # Safety
+/// Out pointers must be writable or null.
+#[no_mangle]
+pub unsafe extern "C" fn unterm_editor_caret(
+    id: u64,
+    x: *mut f32,
+    y: *mut f32,
+    w: *mut f32,
+    h: *mut f32,
+) {
+    if let Some(e) = lock_editors().get(&id) {
+        let r = e.caret_rect();
+        unsafe {
+            if !x.is_null() {
+                *x = r[0];
+            }
+            if !y.is_null() {
+                *y = r[1];
+            }
+            if !w.is_null() {
+                *w = r[2];
+            }
+            if !h.is_null() {
+                *h = r[3];
+            }
+        }
+    }
+}
+
+/// Apply a named editing key (arrows/Home/End/Return/Backspace/Delete).
+///
+/// # Safety
+/// `name` must be a valid C string or null.
+#[no_mangle]
+pub unsafe extern "C" fn unterm_editor_key(
+    id: u64,
+    name: *const c_char,
+    ctrl: bool,
+    alt: bool,
+    shift: bool,
+) {
+    let name = cstr(name);
+    with_editor(id, (), |e| e.key(&name, ctrl, alt, shift));
+}
+
+/// Insert text at the caret (typing / paste / IME commit).
+///
+/// # Safety
+/// `text` must be a valid C string or null.
+#[no_mangle]
+pub unsafe extern "C" fn unterm_editor_insert(id: u64, text: *const c_char) {
+    let text = cstr(text);
+    with_editor(id, (), |e| e.insert(&text));
+}
+
+/// Set the live IME composition shown inline as marked text (empty clears it).
+///
+/// # Safety
+/// `text` must be a valid C string or null.
+#[no_mangle]
+pub unsafe extern "C" fn unterm_editor_set_preedit(id: u64, text: *const c_char) {
+    let text = cstr(text);
+    with_editor(id, (), |e| e.set_preedit(&text));
+}
+
+/// Replace the whole buffer (e.g. on opening a file).
+///
+/// # Safety
+/// `text` must be a valid C string or null.
+#[no_mangle]
+pub unsafe extern "C" fn unterm_editor_set_text(id: u64, text: *const c_char) {
+    let text = cstr(text);
+    with_editor(id, (), |e| e.set_text(&text));
+}
+
+/// The editor's current text. Writes the byte length; the pointer is valid until
+/// the next call on this editor.
+///
+/// # Safety
+/// `out_len` writable or null.
+#[no_mangle]
+pub unsafe extern "C" fn unterm_editor_text(id: u64, out_len: *mut usize) -> *const c_char {
+    editor_string(id, out_len, |e| e.text())
+}
+
+#[no_mangle]
+pub extern "C" fn unterm_editor_undo(id: u64) {
+    with_editor(id, (), |e| e.undo());
+}
+
+#[no_mangle]
+pub extern "C" fn unterm_editor_redo(id: u64) {
+    with_editor(id, (), |e| e.redo());
+}
+
+#[no_mangle]
+pub extern "C" fn unterm_editor_select_all(id: u64) {
+    with_editor(id, (), |e| e.select_all());
+}
+
+/// Copy the selection to a snapshot (host writes the OS clipboard). Writes len.
+///
+/// # Safety
+/// `out_len` writable or null. Pointer valid until the next call on this editor.
+#[no_mangle]
+pub unsafe extern "C" fn unterm_editor_copy(id: u64, out_len: *mut usize) -> *const c_char {
+    editor_string(id, out_len, |e| e.copy())
+}
+
+/// Cut the selection to a snapshot (host writes the OS clipboard). Writes len.
+///
+/// # Safety
+/// `out_len` writable or null. Pointer valid until the next call on this editor.
+#[no_mangle]
+pub unsafe extern "C" fn unterm_editor_cut(id: u64, out_len: *mut usize) -> *const c_char {
+    editor_string(id, out_len, |e| e.cut())
+}
+
+/// Mouse at physical px: kind 0 click, 1 drag, 2 double-click, 3 triple-click.
+#[no_mangle]
+pub extern "C" fn unterm_editor_mouse(id: u64, x: f32, y: f32, kind: u8) {
+    with_editor(id, (), |e| e.mouse(x, y, kind));
+}
+
+/// Scroll vertically by `dy` physical px (mouse wheel).
+#[no_mangle]
+pub extern "C" fn unterm_editor_scroll(id: u64, dy: f32) {
+    with_editor(id, (), |e| e.scroll(dy));
+}
+
+/// Scroll horizontally by `dx` physical px (wheel/trackpad).
+#[no_mangle]
+pub extern "C" fn unterm_editor_scroll_h(id: u64, dx: f32) {
+    with_editor(id, (), |e| e.scroll_h(dx));
+}
+
+/// Set the absolute vertical scroll offset (physical px), e.g. from a scrollbar.
+#[no_mangle]
+pub extern "C" fn unterm_editor_set_scroll(id: u64, px: f32) {
+    with_editor(id, (), |e| e.set_scroll(px));
+}
+
+/// The current vertical scroll offset (physical px).
+#[no_mangle]
+pub extern "C" fn unterm_editor_scroll_offset(id: u64) -> f32 {
+    lock_editors().get(&id).map_or(0.0, |e| e.scroll_offset())
+}
+
+/// Indent the selected lines (or the caret line) by one level.
+#[no_mangle]
+pub extern "C" fn unterm_editor_indent(id: u64) {
+    with_editor(id, (), |e| e.indent());
+}
+
+/// Outdent the selected lines (or the caret line) by one level.
+#[no_mangle]
+pub extern "C" fn unterm_editor_outdent(id: u64) {
+    with_editor(id, (), |e| e.outdent());
+}
+
+/// Toggle a line comment on the selected lines (or the caret line).
+#[no_mangle]
+pub extern "C" fn unterm_editor_toggle_comment(id: u64) {
+    with_editor(id, (), |e| e.toggle_comment());
+}
+
+/// Move the caret line up one (swaps with the line above).
+#[no_mangle]
+pub extern "C" fn unterm_editor_move_line_up(id: u64) {
+    with_editor(id, (), |e| e.move_line_up());
+}
+
+/// Move the caret line down one (swaps with the line below).
+#[no_mangle]
+pub extern "C" fn unterm_editor_move_line_down(id: u64) {
+    with_editor(id, (), |e| e.move_line_down());
+}
+
+/// Duplicate the selected lines (or the caret line) below.
+#[no_mangle]
+pub extern "C" fn unterm_editor_duplicate_line(id: u64) {
+    with_editor(id, (), |e| e.duplicate_line());
+}
+
+/// Delete the selected lines (or the caret line).
+#[no_mangle]
+pub extern "C" fn unterm_editor_delete_line(id: u64) {
+    with_editor(id, (), |e| e.delete_line());
+}
+
+/// Move the caret to the start of line `line` (0-based).
+#[no_mangle]
+pub extern "C" fn unterm_editor_goto_line(id: u64, line: u32) {
+    with_editor(id, (), |e| e.goto_line(line as usize));
+}
+
+/// Find `query` and select the match (search wraps). Returns true if found.
+///
+/// # Safety
+/// `query` must be a valid C string or null.
+#[no_mangle]
+pub unsafe extern "C" fn unterm_editor_find(
+    id: u64,
+    query: *const c_char,
+    forward: bool,
+    case_sensitive: bool,
+) -> bool {
+    let query = cstr(query);
+    with_editor(id, false, |e| e.find(&query, forward, case_sensitive))
+}
+
+/// Replace the current selection with `repl` (no-op without a selection).
+///
+/// # Safety
+/// `repl` must be a valid C string or null.
+#[no_mangle]
+pub unsafe extern "C" fn unterm_editor_replace_selection(id: u64, repl: *const c_char) {
+    let repl = cstr(repl);
+    with_editor(id, (), |e| e.replace_selection(&repl));
+}
+
+/// Replace every occurrence of `query` with `repl`. Returns the count.
+///
+/// # Safety
+/// `query`/`repl` must be valid C strings or null.
+#[no_mangle]
+pub unsafe extern "C" fn unterm_editor_replace_all(
+    id: u64,
+    query: *const c_char,
+    repl: *const c_char,
+    case_sensitive: bool,
+) -> u32 {
+    let query = cstr(query);
+    let repl = cstr(repl);
+    with_editor(id, 0, |e| e.replace_all(&query, &repl, case_sensitive))
+}
 
 // Keep `c_void` referenced so a header generator records the opaque handle type.
 #[doc(hidden)]

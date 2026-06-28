@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- **Code editor** — a native in-Editor code editor window with tree-sitter syntax highlighting, Roslyn-powered C# autocomplete and signature help, find/replace and line operations, registered as a selectable External Script Editor so Unity file opens (and file paths clicked in the Claude Code transcript) route to it.
+
 ### Changed
 
 - On macOS, the native plugin now binds Unity's own Metal device in-process — the shadow-copy loader is gone and device/command-queue capture is unified into one cross-platform module shared with Windows.

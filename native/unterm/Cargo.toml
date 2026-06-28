@@ -36,6 +36,12 @@ pulldown-cmark = { version = "0.12", default-features = false }
 # Syntax highlighting for fenced code blocks (no `tty`/crossterm; we render).
 syntect = { version = "5.3.0", default-features = false, features = ["default-fancy"] }
 
+# Tree-sitter highlighting for the code editor (accurate, incremental reparse).
+# Grammar crates compile a C parser via their build.rs (needs a C compiler).
+tree-sitter = "0.25"
+tree-sitter-c-sharp = "0.23"
+streaming-iterator = "0.1" # consume tree-sitter 0.25's QueryCursor::captures
+
 # In-process MCP server hosted in the plugin so it survives Unity C# domain
 # reloads. No transport/port: the control-protocol driver dispatches the agent's
 # `mcp_message` requests straight in. Tool defs + execution come from the C# side.
