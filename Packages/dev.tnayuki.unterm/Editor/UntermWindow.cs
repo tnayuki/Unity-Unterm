@@ -336,7 +336,7 @@ namespace Unterm.Editor
             }
         }
 
-        private void LoadNative(bool freshInstance = false)
+        private void LoadNative()
         {
             try
             {
@@ -346,7 +346,7 @@ namespace Unterm.Editor
                 unterm_unity_gfx(out int _);
 #endif
                 _native = new UntermNative();
-                _native.Load(PluginPath, freshInstance);
+                _native.Load(PluginPath);
 
                 float ppp = EditorGUIUtility.pixelsPerPoint;
                 var (w, h) = CurrentPixelSize();

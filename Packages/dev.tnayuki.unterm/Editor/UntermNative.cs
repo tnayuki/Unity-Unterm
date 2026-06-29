@@ -1,5 +1,4 @@
 using System;
-using System.IO;
 using System.Runtime.InteropServices;
 using UnityEngine;
 
@@ -10,15 +9,13 @@ namespace Unterm.Editor
     /// Windows).
     ///
     /// Terminals live in process globals on the native side (the registry keyed
-    /// by a stable u64 id), so they survive Unity C# domain reloads. To keep
-    /// them mapped we load the library via a *stable* shadow copy and never
-    /// unload it on reload. Every editor window loads the same shadow path, so
-    /// they all share one native image and one registry; each window owns one
-    /// terminal id it serializes and re-adopts after a reload.
-    ///
-    /// The OS dynamic loader is used directly (dlopen on macOS, LoadLibrary on
-    /// Windows) rather than Unity's native-plugin import system, so we control
-    /// when the image loads/unloads across reloads.
+    /// by a stable u64 id), so they survive Unity C# domain reloads. We bind to
+    /// the SAME native image Unity loads as an editor plugin (LoadLibrary by base
+    /// name on Windows; dlopen of the resolved path with RTLD_NOLOAD on macOS),
+    /// which Unity keeps mapped across reloads — so the registry persists and each
+    /// window re-adopts its own serialized id. Binding to Unity's image also means
+    /// UnityPluginLoad (which captures the editor's graphics device) ran there, so
+    /// the renderer uses that device directly — no shadow copy, no device bridge.
     /// </summary>
     internal sealed class UntermNative : IDisposable
     {
@@ -39,9 +36,6 @@ namespace Unterm.Editor
         private static string NativeError() =>
             new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error()).Message;
 #else
-        // Shadow copies keep a .dylib extension on macOS.
-        private const string ShadowExt = ".dylib";
-
         private const int RTLD_NOW = 2;
         private const int RTLD_LOCAL = 4;
 
@@ -120,27 +114,7 @@ namespace Unterm.Editor
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate uint AvUintGetFn(ulong id);
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate void AvUintSetFn(ulong id, uint v);
 
-#if UNITY_EDITOR_OSX
-        // --- macOS Unity device sharing (see lib.rs `unity_metal`) ---
-        // The *original* bundle Unity auto-loads exposes the editor's MTLDevice /
-        // MTLCommandQueue pointers; resolved by bare name so these P/Invokes bind
-        // to that image (not our RTLD_LOCAL shadow copy). Forwarded into the shadow
-        // image via the `unterm_set_unity_device` delegate below.
-        private static class UntermOriginal
-        {
-            [DllImport("unterm")]
-            public static extern IntPtr unterm_get_unity_device();
-            [DllImport("unterm")]
-            public static extern IntPtr unterm_get_unity_queue();
-        }
-
-        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-        private delegate void SetUnityDeviceFn(IntPtr device, IntPtr queue);
-#endif
-
         private IntPtr _handle;
-        private string _shadowPath;
-        private bool _stable;
 
         private CreateFn _create; private CreateCommandFn _createCommand; private ExistsFn _exists; private IdFn _destroy; private ResizeFn _resize;
         // Restore-across-restart: seed+shell, seed-only (display-only/exited), the buffer dump, the cwd.
@@ -169,20 +143,17 @@ namespace Unterm.Editor
         private AvInputDownFn _avInputDown; private AvDragFn _avInputDrag; private AvInputKeyFn _avInputKey;
         private AvStrFn _avInputInsert; private AvStrFn _avInputSetPreedit; private AvVoidFn _avInputUndo; private AvVoidFn _avInputRedo; private AvVoidFn _avInputSelectAll;
         private AvBufFn _avInputCopy; private AvBufFn _avInputCut; private AvBufFn _avInputText;
-#if UNITY_EDITOR_OSX
-        private SetUnityDeviceFn _setUnityDevice;
-#endif
 
         public bool IsLoaded => _handle != IntPtr.Zero;
 
         /// <summary>
-        /// Load the bundle via a shadow copy. With <paramref name="freshInstance"/>
-        /// false (default) a stable shadow path keyed on the bundle's identity is
-        /// reused, so re-loading after a domain reload returns the same mapped
-        /// image (the terminal registry persists). Pass true to force a brand-new
-        /// image (picks up a rebuilt Rust bundle).
+        /// Bind to the native bundle Unity loaded as an editor plugin (same image
+        /// on both platforms; <paramref name="bundlePath"/> is used only on macOS,
+        /// where dlopen needs the resolved path). Unity keeps the plugin mapped
+        /// across domain reloads, so the terminal registry persists and the window
+        /// re-adopts its id after a reload.
         /// </summary>
-        public void Load(string bundlePath, bool freshInstance = false)
+        public void Load(string bundlePath)
         {
             if (IsLoaded) return;
 #if UNITY_EDITOR_WIN
@@ -193,27 +164,22 @@ namespace Unterm.Editor
             // that device directly (no shadow copy, no cross-image device bridge).
             // Unity keeps editor plugins mapped across domain reloads, so the
             // terminal registry survives without our own shadow-copy trick.
-            _stable = true; // not a temp file we own, so never delete on Dispose
             _handle = NativeOpen("unterm");
             if (_handle == IntPtr.Zero)
                 throw new Exception(
                     $"native load failed — is unterm.dll imported as an Editor/Windows plugin? {NativeError()}");
 #else
-            if (!File.Exists(bundlePath))
-                throw new FileNotFoundException($"Unterm native bundle not found: {bundlePath}");
-
-            _stable = !freshInstance;
-            var info = new FileInfo(bundlePath);
-            _shadowPath = freshInstance
-                ? Path.Combine(Path.GetTempPath(), $"unterm_{Guid.NewGuid():N}{ShadowExt}")
-                : Path.Combine(Path.GetTempPath(), $"unterm_{info.Length}_{info.LastWriteTimeUtc.Ticks}{ShadowExt}");
-
-            if (freshInstance || !File.Exists(_shadowPath))
-                File.Copy(bundlePath, _shadowPath, overwrite: freshInstance);
-
-            _handle = NativeOpen(_shadowPath);
+            // dlopen the bundle by its resolved path. dyld dedups by path, so if
+            // Unity already auto-loaded it as an editor plugin — where
+            // UnityPluginLoad ran and captured the editor's MTLDevice — we get THAT
+            // same image and render on that device directly (no shadow copy, no
+            // cross-image bridge); otherwise we load it here and the renderer falls
+            // back to the default adapter. Either way we never dlclose on reload, so
+            // the registry stays mapped and the window re-adopts its id. (Unlike
+            // Windows' bare-name LoadLibrary, macOS dlopen needs the full path.)
+            _handle = NativeOpen(bundlePath);
             if (_handle == IntPtr.Zero)
-                throw new Exception($"native load failed: {NativeError()}");
+                throw new Exception($"native load failed (is unterm.bundle built?): {NativeError()}");
 #endif
 
             _create = Sym<CreateFn>("unterm_create");
@@ -301,28 +267,6 @@ namespace Unterm.Editor
             _avInputCopy = Sym<AvBufFn>("unterm_agentview_input_copy");
             _avInputCut = Sym<AvBufFn>("unterm_agentview_input_cut");
             _avInputText = Sym<AvBufFn>("unterm_agentview_input_text");
-
-#if UNITY_EDITOR_OSX
-            // macOS shadow-copy split: forward the editor's MTLDevice + command
-            // queue from the original auto-loaded bundle into this image so the
-            // renderer builds wgpu on the same GPU (see lib.rs `unity_metal`).
-            // Windows binds to Unity's own image, so it needs no bridge.
-            _setUnityDevice = Sym<SetUnityDeviceFn>("unterm_set_unity_device");
-            IntPtr unityDevice = IntPtr.Zero, unityQueue = IntPtr.Zero;
-            try
-            {
-                unityDevice = UntermOriginal.unterm_get_unity_device();
-                unityQueue = UntermOriginal.unterm_get_unity_queue();
-            }
-            catch (Exception e)
-            {
-                // Normal if Unity hasn't auto-loaded the original bundle yet (the
-                // renderer then falls back to the default adapter).
-                Debug.LogWarning(
-                    "unterm: could not read Unity's device from the original bundle: " + e.Message);
-            }
-            _setUnityDevice(unityDevice, unityQueue);
-#endif
         }
 
         private T Sym<T>(string name) where T : Delegate
@@ -520,15 +464,6 @@ namespace Unterm.Editor
             _avInputDown = null; _avInputDrag = null; _avInputKey = null;
             _avInputInsert = null; _avInputSetPreedit = null; _avInputUndo = null; _avInputRedo = null; _avInputSelectAll = null;
             _avInputCopy = null; _avInputCut = null; _avInputText = null;
-#if UNITY_EDITOR_OSX
-            _setUnityDevice = null;
-#endif
-
-            if (!_stable && !string.IsNullOrEmpty(_shadowPath) && File.Exists(_shadowPath))
-            {
-                try { File.Delete(_shadowPath); } catch { /* best effort */ }
-            }
-            _shadowPath = null;
         }
     }
 }

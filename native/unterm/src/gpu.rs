@@ -74,9 +74,9 @@ fn open_device(instance: &wgpu::Instance) -> (wgpu::Device, wgpu::Queue) {
 /// The IOSurface target is a Metal texture created on *this* wgpu device, then
 /// handed to Unity for `CreateExternalTexture`; a texture is bound to its origin
 /// device, so the two must be the same GPU. So we build wgpu directly on the
-/// device (and command queue) Unity captured at `UnityPluginLoad` and bridged in
-/// (see lib.rs `unity_metal`). With no captured device (headless tests, or Unity
-/// not ready yet), fall back to the default adapter.
+/// device (and command queue) Unity captured at `UnityPluginLoad` (read in-image
+/// via lib.rs `unity_metal`). With no captured device (headless tests, or Unity
+/// graphics not up), fall back to the default adapter.
 #[cfg(target_os = "macos")]
 fn open_device(instance: &wgpu::Instance) -> (wgpu::Device, wgpu::Queue) {
     let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
@@ -86,43 +86,34 @@ fn open_device(instance: &wgpu::Instance) -> (wgpu::Device, wgpu::Queue) {
     }))
     .expect("unterm: no suitable GPU adapter");
 
-    let device_ptr = crate::shadow_device_ptr();
-    if device_ptr.is_null() {
+    let Some(device) = crate::unity_metal::unity_device() else {
+        log::info!("unterm: editor MTLDevice unavailable (UnityPluginLoad not run); using default adapter");
         return pollster::block_on(adapter.request_device(&device_descriptor(&adapter)))
             .expect("unterm: failed to create device");
-    }
+    };
 
     // `create_device_from_hal` uses the OpenDevice's device/queue (not the
     // adapter's), so the adapter only serves as the backend/parent handle here.
-    let open = unsafe { unity_open_device(device_ptr, crate::shadow_queue_ptr()) };
     log::info!("unterm: rendering on the editor's own MTLDevice");
+    let open = unsafe { unity_open_device(device, crate::unity_metal::unity_queue()) };
     unsafe { adapter.create_device_from_hal::<wgpu::hal::api::Metal>(open, &device_descriptor(&adapter)) }
         .expect("unterm: failed to create device from Unity's MTLDevice")
 }
 
-/// Build a wgpu-hal `OpenDevice` from Unity's raw `id<MTLDevice>` and (optional)
-/// `id<MTLCommandQueue>`. We retain both (the Obj-C runtime is process-global, so
-/// retaining a pointer made in the original image is fine); wgpu then owns the
-/// retains for the device's lifetime.
+/// Build a wgpu-hal `OpenDevice` from the editor's `MTLDevice` and (optional)
+/// `MTLCommandQueue`; wgpu takes ownership of the retains for its lifetime.
 #[cfg(target_os = "macos")]
 unsafe fn unity_open_device(
-    device_ptr: *mut std::ffi::c_void,
-    queue_ptr: *mut std::ffi::c_void,
+    device: objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLDevice>>,
+    queue: Option<objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLCommandQueue>>>,
 ) -> wgpu::hal::OpenDevice<wgpu::hal::api::Metal> {
-    use objc2::rc::Retained;
-    use objc2::runtime::ProtocolObject;
-    use objc2_metal::{MTLCommandQueue, MTLDevice};
+    use objc2_metal::MTLDevice;
 
-    let device: Retained<ProtocolObject<dyn MTLDevice>> =
-        Retained::retain(device_ptr.cast()).expect("unterm: null Unity MTLDevice");
-
-    let queue: Retained<ProtocolObject<dyn MTLCommandQueue>> = if queue_ptr.is_null() {
+    let queue = queue.unwrap_or_else(|| {
         device
             .newCommandQueue()
             .expect("unterm: newCommandQueue failed")
-    } else {
-        Retained::retain(queue_ptr.cast()).expect("unterm: null Unity MTLCommandQueue")
-    };
+    });
 
     // unterm never issues GPU timestamp queries, so this period is cosmetic; 1.0
     // (ns/tick) is correct for Apple Silicon and AMD (Intel would be 83.333).
