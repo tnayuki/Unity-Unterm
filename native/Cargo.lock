@@ -1078,6 +1078,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e3e0adef53c21f888deb4fa59fc59f7eb17404926ee8a6f59f5df0fd7f9f3272"
 dependencies = [
  "bitflags 2.13.0",
+ "block2",
+ "libc",
  "objc2",
  "objc2-core-foundation",
 ]
@@ -1906,6 +1908,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b4ac048d71ede7ee76d585517add45da530660ef4390e49b098733c6e897f254"
 
 [[package]]
+name = "unity-native-plugin"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2b87595f1063af99a3bd106e3ab6d99c38ccf68d9ead7ef61f7f2388d07a357e"
+dependencies = [
+ "objc2",
+ "objc2-foundation",
+ "objc2-metal",
+ "unity-native-plugin-sys",
+]
+
+[[package]]
+name = "unity-native-plugin-sys"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "179c8a544cb30336ccb9e65fe1b88dc916efbf1c85698548ab5f4d61e4e5be2e"
+
+[[package]]
 name = "unterm"
 version = "0.1.0"
 dependencies = [
@@ -1928,6 +1948,7 @@ dependencies = [
  "sys-locale",
  "unicode-script",
  "unicode-width 0.1.14",
+ "unity-native-plugin",
  "wgpu",
  "windows",
 ]

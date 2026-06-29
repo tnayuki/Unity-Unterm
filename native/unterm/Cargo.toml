@@ -48,6 +48,7 @@ serde_json = "1"
 objc2 = "0.6"
 objc2-metal = { version = "0.3", features = [
     "MTLDevice",
+    "MTLCommandQueue",
     "MTLTexture",
     "MTLPixelFormat",
     "MTLResource",
@@ -59,6 +60,10 @@ objc2-io-surface = "0.3"
 # bridged into objc2's `&IOSurfaceRef` for the Metal texture call.
 core-foundation = "0.10"
 core-foundation-sys = "0.8"
+# Capture the editor's MTLDevice when Unity auto-loads the original bundle
+# (UnityPluginLoad). Its `registryID` is bridged to the shadow-copy image so the
+# renderer's wgpu adapter matches Unity's GPU (see gpu.rs / lib.rs).
+unity-native-plugin = { version = "0.9", features = ["metal"] }
 
 # Windows zero-copy path: create a shared D3D12 render target on wgpu's device
 # and open it on Unity's D3D11/D3D12 device. Uses the same `windows` (windows-rs)

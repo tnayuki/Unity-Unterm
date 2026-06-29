@@ -120,6 +120,24 @@ namespace Unterm.Editor
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate uint AvUintGetFn(ulong id);
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate void AvUintSetFn(ulong id, uint v);
 
+#if UNITY_EDITOR_OSX
+        // --- macOS Unity device sharing (see lib.rs `unity_metal`) ---
+        // The *original* bundle Unity auto-loads exposes the editor's MTLDevice /
+        // MTLCommandQueue pointers; resolved by bare name so these P/Invokes bind
+        // to that image (not our RTLD_LOCAL shadow copy). Forwarded into the shadow
+        // image via the `unterm_set_unity_device` delegate below.
+        private static class UntermOriginal
+        {
+            [DllImport("unterm")]
+            public static extern IntPtr unterm_get_unity_device();
+            [DllImport("unterm")]
+            public static extern IntPtr unterm_get_unity_queue();
+        }
+
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        private delegate void SetUnityDeviceFn(IntPtr device, IntPtr queue);
+#endif
+
         private IntPtr _handle;
         private string _shadowPath;
         private bool _stable;
@@ -151,6 +169,9 @@ namespace Unterm.Editor
         private AvInputDownFn _avInputDown; private AvDragFn _avInputDrag; private AvInputKeyFn _avInputKey;
         private AvStrFn _avInputInsert; private AvStrFn _avInputSetPreedit; private AvVoidFn _avInputUndo; private AvVoidFn _avInputRedo; private AvVoidFn _avInputSelectAll;
         private AvBufFn _avInputCopy; private AvBufFn _avInputCut; private AvBufFn _avInputText;
+#if UNITY_EDITOR_OSX
+        private SetUnityDeviceFn _setUnityDevice;
+#endif
 
         public bool IsLoaded => _handle != IntPtr.Zero;
 
@@ -280,6 +301,28 @@ namespace Unterm.Editor
             _avInputCopy = Sym<AvBufFn>("unterm_agentview_input_copy");
             _avInputCut = Sym<AvBufFn>("unterm_agentview_input_cut");
             _avInputText = Sym<AvBufFn>("unterm_agentview_input_text");
+
+#if UNITY_EDITOR_OSX
+            // macOS shadow-copy split: forward the editor's MTLDevice + command
+            // queue from the original auto-loaded bundle into this image so the
+            // renderer builds wgpu on the same GPU (see lib.rs `unity_metal`).
+            // Windows binds to Unity's own image, so it needs no bridge.
+            _setUnityDevice = Sym<SetUnityDeviceFn>("unterm_set_unity_device");
+            IntPtr unityDevice = IntPtr.Zero, unityQueue = IntPtr.Zero;
+            try
+            {
+                unityDevice = UntermOriginal.unterm_get_unity_device();
+                unityQueue = UntermOriginal.unterm_get_unity_queue();
+            }
+            catch (Exception e)
+            {
+                // Normal if Unity hasn't auto-loaded the original bundle yet (the
+                // renderer then falls back to the default adapter).
+                Debug.LogWarning(
+                    "unterm: could not read Unity's device from the original bundle: " + e.Message);
+            }
+            _setUnityDevice(unityDevice, unityQueue);
+#endif
         }
 
         private T Sym<T>(string name) where T : Delegate
@@ -477,6 +520,9 @@ namespace Unterm.Editor
             _avInputDown = null; _avInputDrag = null; _avInputKey = null;
             _avInputInsert = null; _avInputSetPreedit = null; _avInputUndo = null; _avInputRedo = null; _avInputSelectAll = null;
             _avInputCopy = null; _avInputCut = null; _avInputText = null;
+#if UNITY_EDITOR_OSX
+            _setUnityDevice = null;
+#endif
 
             if (!_stable && !string.IsNullOrEmpty(_shadowPath) && File.Exists(_shadowPath))
             {

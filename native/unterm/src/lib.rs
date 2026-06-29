@@ -1185,3 +1185,112 @@ unsafe fn view_string(
 // Keep `c_void` referenced so a header generator records the opaque handle type.
 #[doc(hidden)]
 pub type _UntermHandle = *mut c_void;
+
+// ---- Share Unity's Metal device across the macOS shadow-copy image split ----
+//
+// macOS keeps the shadow-copy loader (the renderer runs in a private `dlopen`ed
+// image so the terminal registry survives domain reloads — see UntermNative.cs).
+// `UnityPluginLoad` therefore fires only in the *original* bundle Unity loads,
+// not in the shadow image that renders. So the original image captures the
+// editor's `MTLDevice`/`MTLCommandQueue` and hands their raw pointers to the C#
+// loader, which forwards them to the shadow image; `gpu::init_gpu` then builds
+// wgpu directly on those (via `wgpu-hal`'s `device_from_raw`/`queue_from_raw`),
+// so the IOSurface render target lands on the editor's own GPU and queue. The
+// Obj-C runtime is process-global, so retaining the pointer in the shadow image
+// is sound even though it was created in the original one.
+//
+// (Original idea, cross-image bridge, and device+queue sharing: @aosoft, PR #1.
+// Ported from wgpu 22 / metal-rs to wgpu 29 / objc2.)
+#[cfg(target_os = "macos")]
+mod unity_metal {
+    use std::ffi::c_void;
+    use std::sync::atomic::{AtomicPtr, Ordering};
+    use std::sync::OnceLock;
+
+    use objc2::rc::Retained;
+    use unity_native_plugin::interface::UnityInterfaces;
+    use unity_native_plugin::metal::{
+        UnityGraphicsMetalV1, UnityGraphicsMetalV1Interface, UnityGraphicsMetalV2,
+        UnityGraphicsMetalV2Interface,
+    };
+
+    // ---- Original auto-loaded bundle: capture device + queue at UnityPluginLoad ----
+
+    static UNITY_INTERFACES: OnceLock<&'static UnityInterfaces> = OnceLock::new();
+
+    unity_native_plugin::unity_native_plugin_entry_point! {
+        fn unity_plugin_load(interfaces: &'static UnityInterfaces) {
+            let _ = UNITY_INTERFACES.set(interfaces);
+        }
+        fn unity_plugin_unload() {}
+    }
+
+    /// Raw `id<MTLDevice>` of the editor's Metal device (null until
+    /// `UnityPluginLoad` has run with graphics ready). Read by the C# loader from
+    /// the *original* bundle and forwarded to the shadow image. The pointer is
+    /// borrowed (+0): Unity owns the device for the process lifetime, and the
+    /// shadow image retains it before use.
+    #[no_mangle]
+    pub extern "C" fn unterm_get_unity_device() -> *mut c_void {
+        let Some(interfaces) = UNITY_INTERFACES.get() else {
+            return std::ptr::null_mut();
+        };
+        if let Some(metal) = interfaces.interface::<UnityGraphicsMetalV2>() {
+            if let Some(device) = metal.metal_device() {
+                return Retained::as_ptr(&device) as *mut c_void;
+            }
+        }
+        if let Some(metal) = interfaces.interface::<UnityGraphicsMetalV1>() {
+            if let Some(device) = metal.metal_device() {
+                return Retained::as_ptr(&device) as *mut c_void;
+            }
+        }
+        std::ptr::null_mut()
+    }
+
+    /// Raw `id<MTLCommandQueue>` of the editor's queue (null if unavailable — only
+    /// the V2 interface exposes it; `gpu::init_gpu` then makes its own queue).
+    #[no_mangle]
+    pub extern "C" fn unterm_get_unity_queue() -> *mut c_void {
+        let Some(interfaces) = UNITY_INTERFACES.get() else {
+            return std::ptr::null_mut();
+        };
+        if let Some(metal) = interfaces.interface::<UnityGraphicsMetalV2>() {
+            if let Some(queue) = metal.command_queue() {
+                return Retained::as_ptr(&queue) as *mut c_void;
+            }
+        }
+        std::ptr::null_mut()
+    }
+
+    // ---- Shadow-copied image: receive the raw pointers from the C# bridge ----
+
+    static SHADOW_DEVICE: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
+    static SHADOW_QUEUE: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
+
+    /// Called by the C# loader after `Load`, passing the device + queue pointers
+    /// read from the original bundle. A late null device (original not ready) must
+    /// not clobber a value the GPU may already have been built on, so a null
+    /// device is ignored once one is set.
+    #[no_mangle]
+    pub unsafe extern "C" fn unterm_set_unity_device(device: *mut c_void, queue: *mut c_void) {
+        if !device.is_null() {
+            SHADOW_DEVICE.store(device, Ordering::Release);
+            SHADOW_QUEUE.store(queue, Ordering::Release);
+        }
+    }
+
+    /// The captured Unity `id<MTLDevice>` (null if unknown), for `gpu::init_gpu`.
+    pub fn shadow_device_ptr() -> *mut c_void {
+        SHADOW_DEVICE.load(Ordering::Acquire)
+    }
+
+    /// The captured Unity `id<MTLCommandQueue>` (null if unavailable).
+    pub fn shadow_queue_ptr() -> *mut c_void {
+        SHADOW_QUEUE.load(Ordering::Acquire)
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub use unity_metal::{shadow_device_ptr, shadow_queue_ptr};
+

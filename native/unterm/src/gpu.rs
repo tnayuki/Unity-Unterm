@@ -39,24 +39,99 @@ fn init_gpu() -> Gpu {
         backend_options: wgpu::BackendOptions::default(),
         display: None,
     });
-    let adapter = pick_adapter(&instance);
+    let (device, queue) = open_device(&instance);
 
-    let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+    let cache = Cache::new(&device);
+    Gpu { device, queue, cache }
+}
+
+/// The device descriptor shared by every adapter open. Uses the adapter's real
+/// limits, not downlevel defaults — the latter cap `max_texture_dimension_2d` at
+/// 2048, so a window wider/taller than that failed to build its render target
+/// (panicking the create, which left the terminal showing only "ready").
+fn device_descriptor(adapter: &wgpu::Adapter) -> wgpu::DeviceDescriptor<'static> {
+    wgpu::DeviceDescriptor {
         label: Some("unterm-device"),
         required_features: wgpu::Features::empty(),
-        // Use the adapter's real limits, not downlevel defaults — the latter cap
-        // max_texture_dimension_2d at 2048, so a window wider/taller than that
-        // failed to build its render target (panicking the create, which left the
-        // terminal showing only "ready").
         required_limits: adapter.limits(),
         memory_hints: wgpu::MemoryHints::default(),
         experimental_features: wgpu::ExperimentalFeatures::disabled(),
         trace: wgpu::Trace::Off,
-    }))
-    .expect("unterm: failed to create device");
+    }
+}
 
-    let cache = Cache::new(&device);
-    Gpu { device, queue, cache }
+/// Open the render device. Off macOS, take the high-performance adapter (Windows
+/// matches Unity's adapter inside `pick_adapter`).
+#[cfg(not(target_os = "macos"))]
+fn open_device(instance: &wgpu::Instance) -> (wgpu::Device, wgpu::Queue) {
+    let adapter = pick_adapter(instance);
+    pollster::block_on(adapter.request_device(&device_descriptor(&adapter)))
+        .expect("unterm: failed to create device")
+}
+
+/// Open the render device on macOS, on the editor's own `MTLDevice`/queue.
+///
+/// The IOSurface target is a Metal texture created on *this* wgpu device, then
+/// handed to Unity for `CreateExternalTexture`; a texture is bound to its origin
+/// device, so the two must be the same GPU. So we build wgpu directly on the
+/// device (and command queue) Unity captured at `UnityPluginLoad` and bridged in
+/// (see lib.rs `unity_metal`). With no captured device (headless tests, or Unity
+/// not ready yet), fall back to the default adapter.
+#[cfg(target_os = "macos")]
+fn open_device(instance: &wgpu::Instance) -> (wgpu::Device, wgpu::Queue) {
+    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::HighPerformance,
+        force_fallback_adapter: false,
+        compatible_surface: None,
+    }))
+    .expect("unterm: no suitable GPU adapter");
+
+    let device_ptr = crate::shadow_device_ptr();
+    if device_ptr.is_null() {
+        return pollster::block_on(adapter.request_device(&device_descriptor(&adapter)))
+            .expect("unterm: failed to create device");
+    }
+
+    // `create_device_from_hal` uses the OpenDevice's device/queue (not the
+    // adapter's), so the adapter only serves as the backend/parent handle here.
+    let open = unsafe { unity_open_device(device_ptr, crate::shadow_queue_ptr()) };
+    log::info!("unterm: rendering on the editor's own MTLDevice");
+    unsafe { adapter.create_device_from_hal::<wgpu::hal::api::Metal>(open, &device_descriptor(&adapter)) }
+        .expect("unterm: failed to create device from Unity's MTLDevice")
+}
+
+/// Build a wgpu-hal `OpenDevice` from Unity's raw `id<MTLDevice>` and (optional)
+/// `id<MTLCommandQueue>`. We retain both (the Obj-C runtime is process-global, so
+/// retaining a pointer made in the original image is fine); wgpu then owns the
+/// retains for the device's lifetime.
+#[cfg(target_os = "macos")]
+unsafe fn unity_open_device(
+    device_ptr: *mut std::ffi::c_void,
+    queue_ptr: *mut std::ffi::c_void,
+) -> wgpu::hal::OpenDevice<wgpu::hal::api::Metal> {
+    use objc2::rc::Retained;
+    use objc2::runtime::ProtocolObject;
+    use objc2_metal::{MTLCommandQueue, MTLDevice};
+
+    let device: Retained<ProtocolObject<dyn MTLDevice>> =
+        Retained::retain(device_ptr.cast()).expect("unterm: null Unity MTLDevice");
+
+    let queue: Retained<ProtocolObject<dyn MTLCommandQueue>> = if queue_ptr.is_null() {
+        device
+            .newCommandQueue()
+            .expect("unterm: newCommandQueue failed")
+    } else {
+        Retained::retain(queue_ptr.cast()).expect("unterm: null Unity MTLCommandQueue")
+    };
+
+    // unterm never issues GPU timestamp queries, so this period is cosmetic; 1.0
+    // (ns/tick) is correct for Apple Silicon and AMD (Intel would be 83.333).
+    let timestamp_period = 1.0;
+
+    wgpu::hal::OpenDevice {
+        device: wgpu::hal::metal::Device::device_from_raw(device, wgpu::Features::empty()),
+        queue: wgpu::hal::metal::Queue::queue_from_raw(queue, timestamp_period),
+    }
 }
 
 /// Pick the GPU adapter. On Windows the zero-copy surface shares a texture handle
@@ -66,6 +141,7 @@ fn init_gpu() -> Gpu {
 /// (captured in `UnityPluginLoad`); fall back to high-performance if unknown or
 /// unmatched. Elsewhere there's no cross-device sharing, so just take the
 /// high-performance adapter.
+#[cfg(not(target_os = "macos"))]
 fn pick_adapter(instance: &wgpu::Instance) -> wgpu::Adapter {
     #[cfg(windows)]
     if let Some((vendor, device)) = crate::unity::unity_adapter_ids() {
