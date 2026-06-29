@@ -31,7 +31,6 @@ mod renderer;
 mod shell;
 mod surface;
 mod term;
-#[cfg(windows)]
 mod unity;
 
 use std::collections::HashMap;
@@ -1185,75 +1184,4 @@ unsafe fn view_string(
 // Keep `c_void` referenced so a header generator records the opaque handle type.
 #[doc(hidden)]
 pub type _UntermHandle = *mut c_void;
-
-// ---- Render on the editor's own Metal device (macOS) ----
-//
-// The bundle is auto-loaded by Unity as an editor native plugin, so
-// `UnityPluginLoad` runs and captures the editor's `MTLDevice`/`MTLCommandQueue`.
-// The C# loader binds the renderer to that *same* image (`dlopen` RTLD_NOLOAD —
-// no shadow copy), so `gpu::init_gpu` reads the captured device directly here and
-// builds wgpu on it via `wgpu-hal`'s `device_from_raw`/`queue_from_raw`. The
-// IOSurface render target then lands on the editor's own GPU + queue.
-//
-// (Device + queue sharing originated in @aosoft's PR #1, which bridged the device
-// across a shadow-copy image split; the shadow copy was later dropped, so the
-// bridge is gone and the capture is read in-image.)
-#[cfg(target_os = "macos")]
-pub(crate) mod unity_metal {
-    use std::sync::OnceLock;
-
-    use objc2::rc::Retained;
-    use objc2::runtime::ProtocolObject;
-    use objc2_metal::{MTLCommandQueue, MTLDevice};
-    use unity_native_plugin::interface::UnityInterfaces;
-    use unity_native_plugin::metal::{
-        UnityGraphicsMetalV1, UnityGraphicsMetalV1Interface, UnityGraphicsMetalV2,
-        UnityGraphicsMetalV2Interface,
-    };
-
-    static UNITY_INTERFACES: OnceLock<&'static UnityInterfaces> = OnceLock::new();
-
-    unity_native_plugin::unity_native_plugin_entry_point! {
-        fn unity_plugin_load(interfaces: &'static UnityInterfaces) {
-            let _ = UNITY_INTERFACES.set(interfaces);
-        }
-        fn unity_plugin_unload() {}
-    }
-
-    /// The editor's Metal device, captured at `UnityPluginLoad` (`None` until
-    /// Unity's graphics are up, e.g. in headless tests). Read directly by
-    /// `gpu::init_gpu` — the renderer shares this image, so no bridge is needed.
-    pub fn unity_device() -> Option<Retained<ProtocolObject<dyn MTLDevice>>> {
-        let interfaces = UNITY_INTERFACES.get()?;
-        if let Some(metal) = interfaces.interface::<UnityGraphicsMetalV2>() {
-            if let Some(device) = metal.metal_device() {
-                return Some(device);
-            }
-        }
-        if let Some(metal) = interfaces.interface::<UnityGraphicsMetalV1>() {
-            if let Some(device) = metal.metal_device() {
-                return Some(device);
-            }
-        }
-        None
-    }
-
-    /// The editor's command queue (only the V2 interface exposes it; `gpu` makes
-    /// its own queue on the device when absent).
-    pub fn unity_queue() -> Option<Retained<ProtocolObject<dyn MTLCommandQueue>>> {
-        let interfaces = UNITY_INTERFACES.get()?;
-        if let Some(metal) = interfaces.interface::<UnityGraphicsMetalV2>() {
-            return metal.command_queue();
-        }
-        None
-    }
-
-    /// Touched by the C# loader (`[DllImport]`) to make Unity load this `.dylib`
-    /// as a native plugin and run `UnityPluginLoad` (capturing the editor's
-    /// device) before the renderer binds. Returns whether the device is captured.
-    #[no_mangle]
-    pub extern "C" fn unterm_unity_metal_init() -> bool {
-        unity_device().is_some()
-    }
-}
 

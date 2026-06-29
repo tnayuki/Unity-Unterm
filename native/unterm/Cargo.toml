@@ -60,9 +60,9 @@ objc2-io-surface = "0.3"
 # bridged into objc2's `&IOSurfaceRef` for the Metal texture call.
 core-foundation = "0.10"
 core-foundation-sys = "0.8"
-# Capture the editor's MTLDevice when Unity auto-loads the original bundle
-# (UnityPluginLoad). Its `registryID` is bridged to the shadow-copy image so the
-# renderer's wgpu adapter matches Unity's GPU (see gpu.rs / lib.rs).
+# Capture the editor's MTLDevice/queue at UnityPluginLoad so the renderer can
+# build wgpu on Unity's own GPU (see `unity_metal` in lib.rs). Same crate as the
+# Windows D3D path below.
 unity-native-plugin = { version = "0.9", features = ["metal"] }
 
 # Windows zero-copy path: create a shared D3D12 render target on wgpu's device
@@ -78,6 +78,9 @@ windows = { version = "0.62", features = [
     "Win32_Graphics_Dxgi",
     "Win32_Graphics_Dxgi_Common",
 ] }
+# Same crate the macOS side uses; the d3d features pull in the
+# IUnityGraphicsD3D11/D3D12 interfaces for the device capture in unity.rs.
+unity-native-plugin = { version = "0.9", features = ["d3d11", "d3d12"] }
 
 [dev-dependencies]
 # Headless verification: dump the rendered terminal to a PNG without the Editor.

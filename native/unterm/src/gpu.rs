@@ -75,7 +75,7 @@ fn open_device(instance: &wgpu::Instance) -> (wgpu::Device, wgpu::Queue) {
 /// handed to Unity for `CreateExternalTexture`; a texture is bound to its origin
 /// device, so the two must be the same GPU. So we build wgpu directly on the
 /// device (and command queue) Unity captured at `UnityPluginLoad` (read in-image
-/// via lib.rs `unity_metal`). With no captured device (headless tests, or Unity
+/// via `crate::unity`). With no captured device (headless tests, or Unity
 /// graphics not up), fall back to the default adapter.
 #[cfg(target_os = "macos")]
 fn open_device(instance: &wgpu::Instance) -> (wgpu::Device, wgpu::Queue) {
@@ -86,7 +86,7 @@ fn open_device(instance: &wgpu::Instance) -> (wgpu::Device, wgpu::Queue) {
     }))
     .expect("unterm: no suitable GPU adapter");
 
-    let Some(device) = crate::unity_metal::unity_device() else {
+    let Some(device) = crate::unity::unity_device() else {
         log::info!("unterm: editor MTLDevice unavailable (UnityPluginLoad not run); using default adapter");
         return pollster::block_on(adapter.request_device(&device_descriptor(&adapter)))
             .expect("unterm: failed to create device");
@@ -95,7 +95,7 @@ fn open_device(instance: &wgpu::Instance) -> (wgpu::Device, wgpu::Queue) {
     // `create_device_from_hal` uses the OpenDevice's device/queue (not the
     // adapter's), so the adapter only serves as the backend/parent handle here.
     log::info!("unterm: rendering on the editor's own MTLDevice");
-    let open = unsafe { unity_open_device(device, crate::unity_metal::unity_queue()) };
+    let open = unsafe { unity_open_device(device, crate::unity::unity_queue()) };
     unsafe { adapter.create_device_from_hal::<wgpu::hal::api::Metal>(open, &device_descriptor(&adapter)) }
         .expect("unterm: failed to create device from Unity's MTLDevice")
 }
