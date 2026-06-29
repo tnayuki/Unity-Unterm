@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Reflection;
 using System.Text.RegularExpressions;
+using Unity.CodeEditor;
 using UnityEditor;
 using UnityEditor.ShortcutManagement;
 using UnityEngine;
@@ -178,21 +179,7 @@ namespace Unterm.Editor
             return !string.IsNullOrEmpty(path) && File.Exists(path) && !Directory.Exists(path);
         }
 
-        // Double-click hijack: only when enabled in Preferences and the asset is an
-        // editable text file. Returning true suppresses the default external editor.
-        [UnityEditor.Callbacks.OnOpenAsset(0)]
-        private static bool OnOpen(int instanceID, int line)
-        {
-            if (!UntermCodeEditorPrefs.HijackDoubleClick) return false;
-            string path = AssetDatabase.GetAssetPath(instanceID);
-            if (string.IsNullOrEmpty(path) || Directory.Exists(path) || !File.Exists(path))
-                return false;
-            if (!IsEditable(path)) return false;
-            OpenPath(path);
-            return true;
-        }
-
-        // Text files we'll open on double-click (don't hijack binary assets).
+        // Text files we'll open (don't open binary assets in a text editor).
         private static readonly string[] s_textExt =
         {
             ".cs", ".txt", ".json", ".xml", ".uxml", ".uss", ".shader", ".cginc",
@@ -203,21 +190,23 @@ namespace Unterm.Editor
         private static bool IsEditable(string path) =>
             Array.IndexOf(s_textExt, Path.GetExtension(path).ToLowerInvariant()) >= 0;
 
-        // Open a file the Claude Code agent just edited, when the "open in Unterm"
-        // preference is on. `root` resolves a project-relative path (the agent often
-        // reports paths relative to its working directory). No-op for missing or
-        // non-editable files so the agent touching, say, a binary doesn't pop a tab.
+        // Open a file path clicked in the Claude Code transcript. `root` resolves a
+        // project-relative path (the agent often reports paths relative to its
+        // working directory). Routes through the configured script editor: when Unterm
+        // is selected in External Tools the file opens here; otherwise it opens in
+        // whatever editor is configured. No-op for missing or non-editable files.
         public static void OpenFromAgent(string path, string root)
         {
-            if (!UntermCodeEditorPrefs.HijackDoubleClick || string.IsNullOrEmpty(path)) return;
+            if (string.IsNullOrEmpty(path)) return;
             if (!Path.IsPathRooted(path) && !string.IsNullOrEmpty(root))
                 path = Path.Combine(root, path);
             if (Directory.Exists(path) || !File.Exists(path) || !IsEditable(path)) return;
-            OpenPath(path);
+            CodeEditor.Editor.CurrentCodeEditor?.OpenProject(Path.GetFullPath(path), -1, -1);
         }
 
-        // Reuse an already-open window for the same file; otherwise a new one.
-        private static void OpenPath(string path)
+        // Reuse an already-open window for the same file; otherwise a new one. `line`
+        // is 1-based (-1 = none) and jumps the caret once the editor is ready.
+        internal static void OpenPath(string path, int line = -1)
         {
             string full = Path.GetFullPath(path);
             foreach (var w in Resources.FindObjectsOfTypeAll<UntermCodeEditorWindow>())
@@ -226,6 +215,7 @@ namespace Unterm.Editor
                     Path.GetFullPath(w._filePath) == full)
                 {
                     w.Focus();
+                    w.RequestGoto(line);
                     return;
                 }
             }
@@ -236,7 +226,25 @@ namespace Unterm.Editor
             win.minSize = new Vector2(320, 200);
             DockIntoCenter(win);
             win.LoadFile(path);
+            win._pendingLine = line; // applied once the native editor is ready
             win.Focus();
+        }
+
+        // Jump the caret to a 1-based line (-1 = none). Deferred to OnEditorUpdate
+        // when the native editor isn't ready yet (a freshly opened window).
+        private int _pendingLine = -1;
+        private void RequestGoto(int line)
+        {
+            if (line <= 0) return;
+            if (_native != null && _editorId != 0)
+            {
+                _native.EditorGotoLine(Eid, (uint)(line - 1));
+                Repaint();
+            }
+            else
+            {
+                _pendingLine = line;
+            }
         }
 
         // Dock `win` as a tab into the central editing area. Unity 6.3: the target's
@@ -1330,6 +1338,13 @@ namespace Unterm.Editor
         private void OnEditorUpdate()
         {
             if (_native == null || _editorId == 0) return;
+            // A line jump requested before the editor was ready (fresh window).
+            if (_pendingLine > 0)
+            {
+                _native.EditorGotoLine(Eid, (uint)(_pendingLine - 1));
+                _pendingLine = -1;
+                Repaint();
+            }
             // Pick up external changes (e.g. the Claude Code agent editing the file)
             // even while this window stays focused — not just on OnFocus. Throttled.
             if (EditorApplication.timeSinceStartup - _lastExtCheck > 1.0)
@@ -1892,40 +1907,6 @@ namespace Unterm.Editor
         {
             var w = args.context as UntermCodeEditorWindow ?? focusedWindow as UntermCodeEditorWindow;
             w?.Save();
-        }
-    }
-
-    /// <summary>
-    /// Preferences for the Unterm code editor (stored in EditorPrefs).
-    /// </summary>
-    internal static class UntermCodeEditorPrefs
-    {
-        private const string HijackKey = "Unterm.CodeEditor.HijackDoubleClick";
-
-        public static bool HijackDoubleClick
-        {
-            get => EditorPrefs.GetBool(HijackKey, false);
-            set => EditorPrefs.SetBool(HijackKey, value);
-        }
-
-        [SettingsProvider]
-        public static SettingsProvider CreateProvider()
-        {
-            return new SettingsProvider("Preferences/Unterm", SettingsScope.User)
-            {
-                label = "Unterm",
-                guiHandler = _ =>
-                {
-                    EditorGUILayout.Space();
-                    bool v = EditorGUILayout.ToggleLeft(
-                        new GUIContent("Open files in Unterm Code Editor on double-click",
-                            "When on, double-clicking a file in the Project window opens it in the " +
-                            "Unterm code editor instead of the external script editor."),
-                        HijackDoubleClick);
-                    if (v != HijackDoubleClick) HijackDoubleClick = v;
-                },
-                keywords = new[] { "Unterm", "code", "editor", "double", "click" },
-            };
         }
     }
 }

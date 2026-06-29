@@ -684,8 +684,9 @@ namespace Unterm.Editor
 
                 case EventType.MouseUp when _selecting:
                     _selecting = false;
-                    // A plain click (no drag-selection) on a file path opens it in the
-                    // code editor. OpenFromAgent no-ops for non-files / when disabled.
+                    // A plain click (no drag-selection) on a file path opens it through
+                    // the configured script editor. OpenFromAgent no-ops for non-file /
+                    // non-editable tokens (the underline only marks files that exist).
                     if (!_native.AgentviewPanelHasSelection(Vid))
                     {
                         string tok = _native.AgentviewPanelTokenAt(Vid, lx, ly);
