@@ -127,6 +127,8 @@ namespace Unterm.Editor
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate void EdSetComplFn(ulong id, [MarshalAs(UnmanagedType.LPUTF8Str)] string items, uint selected);
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate void PopupShowFn([MarshalAs(UnmanagedType.LPUTF8Str)] string items, uint selected, uint scroll, float x, float y, float scale, float br, float bg, float bb, byte fr, byte fg, byte fb, byte dark);
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate void PopupHideFn();
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate void PopupSigShowFn([MarshalAs(UnmanagedType.LPUTF8Str)] string line, uint activeStart, uint activeLen, float x, float y, float scale, float br, float bg, float bb, byte fr, byte fg, byte fb, byte dark);
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate void PopupSigHideFn();
 
         private IntPtr _handle;
 
@@ -171,6 +173,7 @@ namespace Unterm.Editor
         private AvUintSetFn _edGotoLine; private EdFindFn _edFind; private AvStrFn _edReplaceSel; private EdReplaceAllFn _edReplaceAll;
         private AvBufFn _edWordPrefix; private EdCompleteFn _edComplete; private EdSetComplFn _edSetCompletions; private AvUintGetFn _edCaretOffset;
         private PopupShowFn _popupShow; private PopupHideFn _popupHide;
+        private PopupSigShowFn _popupSigShow; private PopupSigHideFn _popupSigHide;
 
         public bool IsLoaded => _handle != IntPtr.Zero;
 
@@ -345,6 +348,8 @@ namespace Unterm.Editor
             // Windows bundle (no such symbols yet) still loads.
             _popupShow = SymOpt<PopupShowFn>("unterm_popup_show");
             _popupHide = SymOpt<PopupHideFn>("unterm_popup_hide");
+            _popupSigShow = SymOpt<PopupSigShowFn>("unterm_popup_sig_show");
+            _popupSigHide = SymOpt<PopupSigHideFn>("unterm_popup_sig_hide");
         }
 
         private T Sym<T>(string name) where T : Delegate
@@ -574,6 +579,10 @@ namespace Unterm.Editor
         public void PopupShow(string items, uint selected, uint scroll, float x, float y, float scale, Color bg, Color32 fg, bool dark) =>
             _popupShow?.Invoke(items ?? "", selected, scroll, x, y, scale, bg.r, bg.g, bg.b, fg.r, fg.g, fg.b, (byte)(dark ? 1 : 0));
         public void PopupHide() => _popupHide?.Invoke();
+        public bool PopupSigAvailable => _popupSigShow != null;
+        public void PopupSigShow(string line, uint activeStart, uint activeLen, float x, float y, float scale, Color bg, Color32 fg, bool dark) =>
+            _popupSigShow?.Invoke(line ?? "", activeStart, activeLen, x, y, scale, bg.r, bg.g, bg.b, fg.r, fg.g, fg.b, (byte)(dark ? 1 : 0));
+        public void PopupSigHide() => _popupSigHide?.Invoke();
         /// The caret's absolute character offset in the document (for semantic completion).
         public int EditorCaretOffset(ulong id) => (int)_edCaretOffset(id);
 

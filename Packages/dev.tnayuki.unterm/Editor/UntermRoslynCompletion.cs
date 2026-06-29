@@ -618,5 +618,95 @@ namespace Unterm.Editor
                 default: return m.Name;
             }
         }
+
+        // --- signature help (parameter hints) ----------------------------------
+
+        public sealed class SigItem
+        {
+            public string Prefix;                                  // "Translate("
+            public List<string> Parameters = new List<string>();   // ["Vector3 translation", "Space relativeTo"]
+            public string Suffix;                                  // ") : void"
+        }
+
+        public sealed class SigHelp
+        {
+            public List<SigItem> Items = new List<SigItem>();      // overloads
+            public int ActiveSignature;
+            public int ActiveParameter;
+        }
+
+        /// Signature help for the call surrounding the caret: finds the enclosing
+        /// invocation/object-creation argument list, resolves its overloads, and marks
+        /// the active parameter (by commas before the caret). Returns null when the
+        /// caret isn't inside a call's parentheses.
+        public static SigHelp SignatureHelp(string text, int position)
+        {
+            if (string.IsNullOrEmpty(text)) return null;
+            position = Math.Max(0, Math.Min(position, text.Length));
+            try
+            {
+                var tree = CSharpSyntaxTree.ParseText(text);
+                var root = tree.GetRoot();
+                var token = root.FindToken(position);
+                ArgumentListSyntax argList = null;
+                InvocationExpressionSyntax inv = null;
+                ObjectCreationExpressionSyntax oc = null;
+                for (var nd = token.Parent; nd != null; nd = nd.Parent)
+                {
+                    if (nd is InvocationExpressionSyntax i && i.ArgumentList != null
+                        && position > i.ArgumentList.SpanStart && position <= i.ArgumentList.Span.End)
+                    { inv = i; argList = i.ArgumentList; break; }
+                    if (nd is ObjectCreationExpressionSyntax o && o.ArgumentList != null
+                        && position > o.ArgumentList.SpanStart && position <= o.ArgumentList.Span.End)
+                    { oc = o; argList = o.ArgumentList; break; }
+                }
+                if (argList == null) return null;
+
+                int active = 0;
+                foreach (var sep in argList.Arguments.GetSeparators())
+                    if (sep.SpanStart < position) active++;
+
+                var comp = CSharpCompilation.Create(
+                    "__sig", new[] { tree }, References(),
+                    new CSharpCompilationOptions(OutputKind.DynamicallyLinkedLibrary));
+                var model = comp.GetSemanticModel(tree);
+
+                IEnumerable<IMethodSymbol> methods;
+                if (inv != null)
+                {
+                    methods = model.GetMemberGroup(inv.Expression).OfType<IMethodSymbol>();
+                    if (!methods.Any() && model.GetSymbolInfo(inv).Symbol is IMethodSymbol only)
+                        methods = new[] { only };
+                }
+                else
+                {
+                    var t = model.GetTypeInfo(oc.Type).Type ?? model.GetSymbolInfo(oc.Type).Symbol as ITypeSymbol;
+                    methods = t?.GetMembers(".ctor").OfType<IMethodSymbol>()
+                                .Where(c => c.DeclaredAccessibility == Accessibility.Public)
+                              ?? Enumerable.Empty<IMethodSymbol>();
+                }
+
+                string Short(ITypeSymbol ty) =>
+                    ty == null ? "" : ty.ToDisplayString(SymbolDisplayFormat.MinimallyQualifiedFormat);
+                var help = new SigHelp { ActiveParameter = active };
+                foreach (var m in methods.Where(x => x != null).Distinct().OrderBy(x => x.Parameters.Length))
+                {
+                    var it = new SigItem
+                    {
+                        Prefix = (m.MethodKind == MethodKind.Constructor
+                                    ? (m.ContainingType?.Name ?? m.Name) : m.Name) + "(",
+                        Suffix = ")" + (m.MethodKind == MethodKind.Constructor ? "" : " : " + Short(m.ReturnType)),
+                    };
+                    foreach (var p in m.Parameters) it.Parameters.Add((Short(p.Type) + " " + p.Name).Trim());
+                    help.Items.Add(it);
+                }
+                if (help.Items.Count == 0) return null;
+                help.ActiveSignature = 0;
+                for (int i = 0; i < help.Items.Count; i++)
+                    if (help.Items[i].Parameters.Count > active) { help.ActiveSignature = i; break; }
+                return help;
+            }
+            catch { return null; }
+        }
     }
 }

@@ -114,6 +114,7 @@ namespace Unterm.Editor
         // native popup can be (re)shown from EditorApplication.update where
         // GUIToScreenPoint is unavailable.
         private float _popupAnchorX, _popupAnchorY, _popupScale = 1f;
+        private float _popupAnchorTopY; // caret TOP (points); the signature hint anchors above it
         // Member-completion cache: the full member list for a given member-access, so
         // typing more of the member name filters in C# instead of re-running Roslyn.
         private List<(string insert, string label, char kind)> _memberCache;
@@ -130,6 +131,11 @@ namespace Unterm.Editor
         private int _complScroll; // popup view offset (top index); wheel moves this
         private int _complPrefixLen;
         private const int ComplRows = 10; // visible popup rows (matches native MAX_ROWS)
+        // Signature help (parameter hints), computed on UntermSignatureWorker.
+        private long _sigSeq;             // 0 = none in flight
+        private int _sigReqOff = -1;      // caret offset the in-flight/last request was for
+        private UntermRoslynCompletion.SigHelp _sig;
+        private bool _sigOpen;
         private static readonly string[] s_csKeywords =
         {
             "abstract", "as", "async", "await", "base", "bool", "break", "byte", "case",
@@ -369,6 +375,7 @@ namespace Unterm.Editor
             AssemblyReloadEvents.beforeAssemblyReload -= OnBeforeReload;
             EditorApplication.update -= OnEditorUpdate;
             _native?.PopupHide();
+            _native?.PopupSigHide();
             Teardown(keepView: s_reloading);
         }
 
@@ -390,6 +397,7 @@ namespace Unterm.Editor
             // The popup is a floating panel; don't leave it on screen when the editor
             // isn't focused.
             CloseCompletion();
+            CloseSignatureHelp();
         }
 
         private void LoadNative()
@@ -752,6 +760,10 @@ namespace Unterm.Editor
                 }
             }
 
+            // Escape dismisses the signature hint (when the completion popup didn't
+            // already consume it above).
+            if (_sigOpen && e.keyCode == KeyCode.Escape) { CloseSignatureHelp(); e.Use(); return; }
+
             // Swallow the Enter that committed an IME composition.
             if (_composeJustEnded &&
                 (e.keyCode == KeyCode.Return || e.keyCode == KeyCode.KeypadEnter))
@@ -794,6 +806,7 @@ namespace Unterm.Editor
                 _native.EditorKey(Eid, n, e.control, e.alt, e.shift);
                 MarkDirty();
                 if (_complOpen) UpdateCompletion(1);
+                if (_sigOpen) RequestSignatureHelp();
                 RenderView(); Repaint(); e.Use();
                 return;
             }
@@ -802,6 +815,7 @@ namespace Unterm.Editor
                 _native.EditorKey(Eid, "DeleteWordForward", e.control, e.alt, e.shift);
                 MarkDirty();
                 if (_complOpen) UpdateCompletion(1);
+                if (_sigOpen) RequestSignatureHelp();
                 RenderView(); Repaint(); e.Use();
                 return;
             }
@@ -878,6 +892,9 @@ namespace Unterm.Editor
                 MarkDirty();
                 if (_complOpen && (name == "Backspace" || name == "Delete")) UpdateCompletion(1);
                 else if (name == "Return") CloseCompletion();
+                // Keep the parameter hint in sync as the caret moves/edits within a call
+                // (re-resolves the active parameter, or closes when leaving the call).
+                if (_sigOpen) RequestSignatureHelp();
                 RenderView();
                 Repaint();
                 e.Use();
@@ -1294,12 +1311,20 @@ namespace Unterm.Editor
             ShowWordCompletion(_native.EditorWordPrefix(Eid), minLen);
         }
 
-        // Apply a finished background completion result (main thread, off the editor tick).
         // Per-frame editor tick (registered on EditorApplication.update). A thin
         // dispatcher: each deferred/polled concern is its own method.
         private void OnEditorUpdate()
         {
             if (_native == null || _editorId == 0) return;
+            PollSignatureTask();
+            // While a hint is shown, re-evaluate whenever the caret moved by ANY means
+            // (arrows, click, edits) so it tracks the active parameter and closes once
+            // the caret leaves the call — the per-key hooks alone miss plain motion.
+            if (_sigOpen && _sigSeq == 0)
+            {
+                int caret = _native.EditorCaretOffset(Eid);
+                if (caret != _sigReqOff) RequestSignatureHelp();
+            }
             PollCompletion();
         }
 
@@ -1326,6 +1351,39 @@ namespace Unterm.Editor
             if (_memberCache != null) ShowFromCache(wp, mode);
             else if (mode == 0) ShowWordCompletion(wp, 1); // Roslyn unavailable → word fallback
             else CloseCompletion();
+        }
+
+        // Apply a finished signature-help request: a null result (caret not inside a
+        // call) hides the native hint; otherwise (re)show it (also repositions it as
+        // the caret moves within the call).
+        private void PollSignatureTask()
+        {
+            if (_sigSeq == 0) return;
+            if (!UntermSignatureWorker.TryTake(_sigSeq, out var sig)) return;
+            _sigSeq = 0;
+            _sig = sig;
+            _sigOpen = sig != null && sig.Items.Count > 0;
+            PushSignature();
+        }
+
+        // Ask the worker for parameter hints at the caret (off the typing path).
+        private void RequestSignatureHelp()
+        {
+            if (_native == null || _editorId == 0 || _langToken != "cs") return;
+            string text = _native.EditorText(Eid);
+            int off = _native.EditorCaretOffset(Eid);
+            UntermRoslynCompletion.EnsureReferences(); // main-thread (Unity API)
+            _sigReqOff = off;
+            _sigSeq = UntermSignatureWorker.Submit(text, off);
+        }
+
+        private void CloseSignatureHelp()
+        {
+            _sigSeq = 0;
+            if (!_sigOpen && _sig == null) { _native?.PopupSigHide(); return; }
+            _sig = null;
+            _sigOpen = false;
+            _native?.PopupSigHide();
         }
 
         // Filter the cached symbol list by `wp` and show the popup. Cheap; runs
@@ -1522,13 +1580,39 @@ namespace Unterm.Editor
                 string ns = UntermRoslynCompletion.NamespaceFromUnimportedLabel(label);
                 if (!string.IsNullOrEmpty(ns)) _native.EditorAddUsing(Eid, ns);
             }
+            // Methods/constructors: auto-insert "()" (VS Code behavior). Put the caret
+            // between the parens if it takes parameters, else after them. (Override
+            // inserts a full member with its own body, so skip it there.)
+            bool wantSig = false;
+            if (_cacheMode != 5 && (kind == 'M' || kind == 'X') && !insert.EndsWith(")"))
+            {
+                _native.EditorInsert(Eid, "()");
+                if (MethodHasParams(label)) { _native.EditorKey(Eid, "LeftArrow", false, false, false); wantSig = true; }
+            }
             MarkDirty();
             CloseCompletion(); // clears the popup and re-renders
+            if (wantSig) RequestSignatureHelp(); // show parameter hints for the new call
+        }
+
+        // True if the completion label's signature shows at least one parameter
+        // (e.g. "Translate(Vector3) : void" → true, "ToString() : string" → false).
+        private static bool MethodHasParams(string label)
+        {
+            int a = label.IndexOf('(');
+            if (a < 0) return false;
+            int b = label.IndexOf(')', a + 1);
+            return b > a + 1;
         }
 
         // Called after typed text commits, to open/refilter as the user types.
         private void OnTextTyped(string committed)
         {
+            // Signature help: (re)evaluate when entering or editing a call's argument
+            // list (or to dismiss it on the closing paren / leaving the call). Use
+            // Contains, not ==, so a multi-char IME commit like "Foo(" still triggers.
+            if (committed.IndexOf('(') >= 0 || committed.IndexOf(')') >= 0
+                || committed.IndexOf(',') >= 0 || _sigOpen)
+                RequestSignatureHelp();
             // Open completion immediately (no prefix typed yet) when the new character
             // makes a context that knows what to offer: a member dot, an attribute
             // bracket, or an argument/new/case/assignment spot — see UpdateCompletion's
@@ -1556,10 +1640,13 @@ namespace Unterm.Editor
             float gy = rect.y + cy / ppp;
             float gh = Mathf.Max(14f, chh / ppp);
 
-            // Cache the caret's screen position (points) for the native completion popup.
+            // Cache the caret's screen position (points) for the native popups: the
+            // completion list hangs from the caret bottom, the signature hint sits
+            // above the caret top.
             var sp = GUIUtility.GUIToScreenPoint(new Vector2(gx, gy + gh));
             _popupAnchorX = sp.x;
             _popupAnchorY = sp.y;
+            _popupAnchorTopY = GUIUtility.GUIToScreenPoint(new Vector2(gx, gy)).y;
             _popupScale = ppp;
 
             // Clamp the focused field's cached TextEditor caret to the current buffer:
@@ -1589,6 +1676,38 @@ namespace Unterm.Editor
             }
             if (focusedWindow == this)
                 Input.compositionCursorPos = new Vector2(gx, gy + gh * 1.5f);
+        }
+
+        // Draw the parameter-hint box just above the caret (or below if no room),
+        // with the active parameter bolded and an overload count.
+        // Push the parameter hint to the native signature panel (anchored above the
+        // caret), or hide it. The native renderer colors the active parameter, so we
+        // pass the plain line plus the active parameter's char range.
+        private void PushSignature()
+        {
+            if (_native == null || _editorId == 0 || !_native.PopupSigAvailable) return;
+            if (!_sigOpen || _sig == null || _sig.Items.Count == 0)
+            {
+                _native.PopupSigHide();
+                return;
+            }
+            var item = _sig.Items[Mathf.Clamp(_sig.ActiveSignature, 0, _sig.Items.Count - 1)];
+            var sb = new System.Text.StringBuilder();
+            sb.Append(item.Prefix);
+            int activeStart = 0, activeLen = 0;
+            for (int i = 0; i < item.Parameters.Count; i++)
+            {
+                if (i > 0) sb.Append(", ");
+                if (i == _sig.ActiveParameter) { activeStart = sb.Length; activeLen = item.Parameters[i].Length; }
+                sb.Append(item.Parameters[i]);
+            }
+            sb.Append(item.Suffix);
+            if (_sig.Items.Count > 1) sb.Append($"   (+{_sig.Items.Count - 1})");
+
+            bool dark = EditorGUIUtility.isProSkin;
+            Color32 fg = dark ? new Color32(210, 210, 214, 255) : new Color32(32, 32, 32, 255);
+            _native.PopupSigShow(sb.ToString(), (uint)activeStart, (uint)activeLen,
+                _popupAnchorX, _popupAnchorTopY, _popupScale, GetEditorBackground().linear, fg, dark);
         }
 
         private GUIStyle ImeHidden()

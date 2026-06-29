@@ -1,10 +1,11 @@
-//! Native completion popup rendered by wgpu: a borderless, non-activating,
-//! click-through OS window — an `NSPanel` on macOS, a layered `WS_POPUP` HWND on
-//! Windows — that wgpu renders into. Because it's a real OS window it can overflow
-//! the editor's bounds, and because it never activates it doesn't steal key focus
-//! from the editor (the host keeps driving selection over the FFI; this is
-//! display-only). The wgpu/glyphon rendering is shared; only the window creation,
-//! placement, and reveal/hide are platform-specific.
+//! Native floating panels rendered by wgpu: the completion list (below the caret)
+//! and the signature-help hint (above the caret). Each is a borderless,
+//! non-activating, click-through OS window — an `NSPanel` on macOS, a layered
+//! `WS_POPUP` HWND on Windows — that wgpu renders into. Because they're real OS
+//! windows they can overflow the editor's bounds, and because they never activate
+//! they don't steal key focus from the editor (the host keeps driving selection
+//! over the FFI; this is display-only). The wgpu/glyphon rendering is shared; only
+//! the window creation, placement, and reveal/hide are platform-specific.
 #![cfg(any(target_os = "macos", windows))]
 
 use std::cell::RefCell;
@@ -51,6 +52,22 @@ use windows::Win32::UI::WindowsAndMessaging::{
 const ROW: f32 = 18.0; // logical row height (scaled)
 const PAD: f32 = 6.0;
 const MAX_ROWS: usize = 10; // visible rows; the list scrolls past this
+const GAP: f64 = 2.0; // points between the caret and an above-anchored panel
+
+/// What a panel draws: a selectable completion list, or a single signature line
+/// with one parameter highlighted.
+enum Content<'a> {
+    List {
+        lines: Vec<&'a str>,
+        selected: usize,
+        scroll: usize,
+    },
+    Sig {
+        line: &'a str,
+        active: (usize, usize), // (char start, char len) of the active parameter
+        accent: Color,
+    },
+}
 
 struct Popup {
     #[cfg(target_os = "macos")]
@@ -73,10 +90,20 @@ struct Popup {
     h: u32,
 }
 
-// The window handle is an OS object (!Send/!Sync) and the popup is only ever touched
-// on the main (UI) thread, so it lives in thread-local storage.
+// The window handles are OS objects (!Send/!Sync) and the popups are only ever
+// touched on the main (UI) thread, so they live in thread-local storage. Two
+// slots: 0 = completion list, 1 = signature help.
 thread_local! {
-    static POPUP: RefCell<Option<Popup>> = const { RefCell::new(None) };
+    static P_LIST: RefCell<Option<Popup>> = const { RefCell::new(None) };
+    static P_SIG: RefCell<Option<Popup>> = const { RefCell::new(None) };
+}
+
+fn with_slot<R>(slot: u8, f: impl FnOnce(&RefCell<Option<Popup>>) -> R) -> R {
+    if slot == 0 {
+        P_LIST.with(f)
+    } else {
+        P_SIG.with(f)
+    }
 }
 
 // ------------------------------------------------------------------ macOS backend
@@ -118,7 +145,8 @@ fn create() -> Option<Popup> {
         let backing: *mut AnyObject = msg_send![content, layer];
         let _: () = msg_send![backing, addSublayer: &*layer];
         // Present drawables in lockstep with CoreAnimation transactions so a resize
-        // (window/layer geometry) and the newly-rendered frame commit atomically.
+        // (window/layer geometry) and the newly-rendered frame commit atomically —
+        // otherwise the window shows the previous, stretched drawable for a frame.
         let _: () = msg_send![&*layer, setPresentsWithTransaction: true];
     }
 
@@ -132,8 +160,9 @@ fn create() -> Option<Popup> {
     let (format, alpha) = pick_format_alpha(&surface);
     let (atlas, viewport, text, quads, swash) = make_renderers(format);
 
-    // Order the panel in once and keep it there — hidden via alpha, never orderOut —
-    // so its occlusionState stays "visible" and wgpu's acquire isn't skipped.
+    // Order the panel in once (above other windows, popUpMenu level) and keep it
+    // there — hidden via alpha, never orderOut — so its occlusionState stays
+    // "visible" and wgpu's acquire isn't skipped. Start fully transparent.
     panel.setAlphaValue(0.0);
     panel.orderFrontRegardless();
 
@@ -142,22 +171,25 @@ fn create() -> Option<Popup> {
 
 #[cfg(target_os = "macos")]
 #[allow(clippy::too_many_arguments)]
-fn show_inner(p: &mut Popup, lines: &[&str], selected: usize, scroll: usize, x: f32, y: f32, scale: f32, clear: wgpu::Color, text_color: Color, dark: bool) {
+fn show_inner(p: &mut Popup, above: bool, content: Content, x: f32, y: f32, scale: f32, clear: wgpu::Color, text_color: Color, dark: bool) {
     let s = scale.max(0.5);
     let font_size = 14.0 * s;
     let row_h = ROW * s;
     let pad = PAD * s;
-    let (wpx, hpx) = list_size(lines, font_size, row_h, pad);
+    let (wpx, hpx) = content_size(&content, font_size, row_h, pad);
 
     // Disable implicit CALayer animations so the panel doesn't animate its size
-    // when the completion list changes between keystrokes.
+    // when the content changes between keystrokes.
     let txn = class!(CATransaction);
     let _: () = unsafe { msg_send![txn, begin] };
     let _: () = unsafe { msg_send![txn, setDisableActions: true] };
 
-    // Position/size in POINTS FIRST (top-left origin caret → bottom-left AppKit), so
-    // the panel hangs from the caret bottom. configure() (exact drawableSize +
-    // matching surface size) runs AFTERWARDS so the two never disagree.
+    // Position/size in POINTS FIRST. `x`/`y` are the caret's screen position in
+    // points, top-left origin (Unity's GUIToScreenPoint); AppKit windows use points
+    // with a bottom-left origin, so the y is flipped. A below-anchored panel hangs
+    // from the caret bottom; an above-anchored one sits with its bottom just above
+    // the caret top. Setting the layer's bounds makes CAMetalLayer recompute
+    // drawableSize from bounds×contentsScale, so configure() runs AFTERWARDS.
     if let Some(mtm) = MainThreadMarker::new() {
         let screen_h = NSScreen::mainScreen(mtm)
             .map(|sc| sc.frame().size.height)
@@ -167,14 +199,22 @@ fn show_inner(p: &mut Popup, lines: &[&str], selected: usize, scroll: usize, x: 
         p.panel.setContentSize(NSSize::new(w_pts, h_pts));
         let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(w_pts, h_pts));
         let _: () = unsafe { msg_send![&*p.layer, setFrame: frame] };
-        p.panel.setFrameOrigin(NSPoint::new(x as f64, screen_h - y as f64 - h_pts));
+        let origin_x = x as f64;
+        let origin_y = if above {
+            screen_h - y as f64 + GAP
+        } else {
+            screen_h - y as f64 - h_pts
+        };
+        p.panel.setFrameOrigin(NSPoint::new(origin_x, origin_y));
     }
 
     p.configure(wpx, hpx, s);
 
-    // Render INSIDE the transaction so the geometry and the presented frame commit
-    // together; reveal (alpha 1) only if the frame was actually presented.
-    let presented = render(p, lines, selected, scroll, font_size, row_h, pad, clear, text_color, dark);
+    // Render INSIDE the transaction so the geometry above and the presented frame
+    // (presentsWithTransaction) commit together. Only reveal the panel (alpha 1) if
+    // the frame was actually presented — if wgpu's occlusion workaround skips the
+    // acquire, the drawable is stale and showing it would be the wrong-scale glitch.
+    let presented = render(p, content, font_size, row_h, pad, clear, text_color, dark);
     if presented {
         p.panel.setAlphaValue(1.0);
     }
@@ -183,8 +223,8 @@ fn show_inner(p: &mut Popup, lines: &[&str], selected: usize, scroll: usize, x: 
 }
 
 #[cfg(target_os = "macos")]
-fn hide_impl() {
-    POPUP.with(|cell| {
+fn hide_slot(slot: u8) {
+    with_slot(slot, |cell| {
         if let Some(p) = cell.borrow().as_ref() {
             p.panel.setAlphaValue(0.0);
         }
@@ -268,25 +308,31 @@ fn create() -> Option<Popup> {
 
 #[cfg(windows)]
 #[allow(clippy::too_many_arguments)]
-fn show_inner(p: &mut Popup, lines: &[&str], selected: usize, scroll: usize, x: f32, y: f32, scale: f32, clear: wgpu::Color, text_color: Color, dark: bool) {
+fn show_inner(p: &mut Popup, above: bool, content: Content, x: f32, y: f32, scale: f32, clear: wgpu::Color, text_color: Color, dark: bool) {
     let s = scale.max(0.5);
     let font_size = 14.0 * s;
     let row_h = ROW * s;
     let pad = PAD * s;
-    let (wpx, hpx) = list_size(lines, font_size, row_h, pad);
+    let (wpx, hpx) = content_size(&content, font_size, row_h, pad);
 
-    // `x`/`y` are the caret's screen position in points (top-left origin); Win32
-    // screen coordinates are physical pixels, so scale by pixels-per-point. The
-    // window is sized to the physical drawable and hangs from the caret bottom.
+    // `x`/`y` are the caret's screen position in points (Unity's GUIToScreenPoint,
+    // top-left origin); Win32 screen coordinates are physical pixels, so scale by
+    // pixels-per-point. The window is sized to the physical drawable. A below-
+    // anchored panel hangs from the caret bottom; an above-anchored one sits with
+    // its bottom just above the caret top.
     let px = (x * s) as i32;
-    let py = (y * s) as i32;
+    let py = if above {
+        (y * s) as i32 - hpx as i32 - GAP as i32
+    } else {
+        (y * s) as i32
+    };
     unsafe {
         let _ = SetWindowPos(p.hwnd, Some(HWND_TOPMOST), px, py, wpx as i32, hpx as i32, SWP_NOACTIVATE);
     }
 
     p.configure(wpx, hpx, s);
 
-    let presented = render(p, lines, selected, scroll, font_size, row_h, pad, clear, text_color, dark);
+    let presented = render(p, content, font_size, row_h, pad, clear, text_color, dark);
     if presented && !p.shown {
         unsafe {
             let _ = ShowWindow(p.hwnd, SW_SHOWNOACTIVATE);
@@ -296,8 +342,8 @@ fn show_inner(p: &mut Popup, lines: &[&str], selected: usize, scroll: usize, x: 
 }
 
 #[cfg(windows)]
-fn hide_impl() {
-    POPUP.with(|cell| {
+fn hide_slot(slot: u8) {
+    with_slot(slot, |cell| {
         if let Some(p) = cell.borrow_mut().as_mut() {
             unsafe {
                 let _ = ShowWindow(p.hwnd, SW_HIDE);
@@ -354,19 +400,12 @@ fn make_renderers(format: wgpu::TextureFormat) -> (TextAtlas, Viewport, TextRend
     (atlas, viewport, text, quads, swash)
 }
 
-/// Physical-pixel (width, height) for the popup given its lines.
-fn list_size(lines: &[&str], font_size: f32, row_h: f32, pad: f32) -> (u32, u32) {
-    let visible = lines.len().min(MAX_ROWS);
-    let max_chars = lines.iter().map(|l| l.chars().count()).max().unwrap_or(8);
-    let pw = ((max_chars as f32) * font_size * 0.6 + pad * 2.0).clamp(80.0, 900.0);
-    let ph = visible as f32 * row_h + pad;
-    (pw.ceil() as u32, ph.ceil() as u32)
-}
-
 impl Popup {
     fn configure(&mut self, w: u32, h: u32, scale: f32) {
         #[cfg(target_os = "macos")]
         {
+            // The layer renders at physical px; mark its backing scale so AppKit
+            // lays it out at the right point size.
             self.layer.setContentsScale(scale as f64);
             self.layer.setDrawableSize(NSSize::new(w as f64, h as f64));
         }
@@ -382,6 +421,10 @@ impl Popup {
         self.reconfigure();
     }
 
+    /// (Re)configure the wgpu surface to the current size — also used to recover
+    /// when `get_current_texture` reports the swapchain went Outdated/Lost after a
+    /// resize (otherwise that frame is skipped and the panel shows stale, wrongly
+    /// scaled content at the new window size).
     fn reconfigure(&self) {
         let g = gpu::gpu();
         self.surface.configure(
@@ -400,7 +443,7 @@ impl Popup {
     }
 }
 
-/// Show/refresh the completion popup (anchored below the caret). `items` are
+/// Show/refresh the completion list (slot 0, anchored BELOW the caret). `items` are
 /// '\n'-joined `kind+label` lines; `x`/`y` are the caret's screen position in POINTS
 /// (top-left origin, from Unity's GUIToScreenPoint); `scale` is pixels-per-point.
 #[allow(clippy::too_many_arguments)]
@@ -410,17 +453,45 @@ pub fn show(items: &str, selected: usize, scroll: usize, x: f32, y: f32, scale: 
         return;
     }
     let lines: Vec<&str> = items.split('\n').collect();
-    POPUP.with(|cell| {
+    show_slot(0, false, Content::List { lines, selected, scroll }, x, y, scale, clear, text_color, dark);
+}
+
+/// Hide the completion list.
+pub fn hide() {
+    hide_slot(0);
+}
+
+/// Show/refresh the signature-help hint (slot 1, anchored ABOVE the caret). `line`
+/// is the full signature; `active_start`/`active_len` are CHAR offsets of the active
+/// parameter within `line` to highlight. `x`/`y` are the caret TOP in screen points.
+#[allow(clippy::too_many_arguments)]
+pub fn show_sig(line: &str, active_start: usize, active_len: usize, x: f32, y: f32, scale: f32, clear: wgpu::Color, text_color: Color, dark: bool) {
+    if line.is_empty() {
+        hide_sig();
+        return;
+    }
+    let accent = if dark { Color::rgb(120, 170, 255) } else { Color::rgb(0, 90, 200) };
+    show_slot(1, true, Content::Sig { line, active: (active_start, active_len), accent }, x, y, scale, clear, text_color, dark);
+}
+
+/// Hide the signature-help hint.
+pub fn hide_sig() {
+    hide_slot(1);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn show_slot(slot: u8, above: bool, content: Content, x: f32, y: f32, scale: f32, clear: wgpu::Color, text_color: Color, dark: bool) {
+    with_slot(slot, |cell| {
         let mut guard = cell.borrow_mut();
         if guard.is_none() {
             *guard = create();
         }
         let Some(p) = guard.as_mut() else { return };
         // Catch wgpu validation errors instead of letting the default handler
-        // abort() the whole Unity process; on error, disable the popup.
+        // abort() the whole Unity process; on error, disable this panel.
         let g = gpu::gpu();
         let scope = g.device.push_error_scope(wgpu::ErrorFilter::Validation);
-        show_inner(p, &lines, selected, scroll, x, y, scale, clear, text_color, dark);
+        show_inner(p, above, content, x, y, scale, clear, text_color, dark);
         if let Some(err) = pollster::block_on(scope.pop()) {
             log::error!("unterm: native popup disabled after GPU error: {err}");
             disable_on_error(p);
@@ -429,12 +500,32 @@ pub fn show(items: &str, selected: usize, scroll: usize, x: f32, y: f32, scale: 
     });
 }
 
-/// Hide the completion popup. It stays alive (transparent / hidden) so the next show
-/// is cheap and, on macOS, the window's occlusionState stays "visible".
-pub fn hide() {
-    hide_impl();
+/// Physical-pixel (width, height) for the panel given its content.
+fn content_size(content: &Content, font_size: f32, row_h: f32, pad: f32) -> (u32, u32) {
+    match content {
+        Content::List { lines, .. } => {
+            let visible = lines.len().min(MAX_ROWS);
+            let max_chars = lines.iter().map(|l| l.chars().count()).max().unwrap_or(8);
+            let pw = ((max_chars as f32) * font_size * 0.6 + pad * 2.0).clamp(80.0, 900.0);
+            let ph = visible as f32 * row_h + pad;
+            (pw.ceil() as u32, ph.ceil() as u32)
+        }
+        Content::Sig { line, .. } => {
+            let chars = line.chars().count();
+            let pw = ((chars as f32) * font_size * 0.6 + pad * 2.0).clamp(80.0, 1200.0);
+            let ph = row_h + pad;
+            (pw.ceil() as u32, ph.ceil() as u32)
+        }
+    }
 }
 
+fn char_to_byte(s: &str, char_idx: usize) -> usize {
+    s.char_indices().nth(char_idx).map(|(b, _)| b).unwrap_or(s.len())
+}
+
+/// One-letter kind badge shown before a completion label. Keeps the editor's kind
+/// letters (N=namespace, T=type, E=enum, M=method, P=property, V=event, F=field,
+/// C=const, K=keyword) and maps the cryptic ones (X=ctor→M, A/L=param/local→v).
 fn kind_badge(kind: char) -> char {
     match kind {
         'X' => 'M',
@@ -447,9 +538,7 @@ fn kind_badge(kind: char) -> char {
 #[allow(clippy::too_many_arguments)]
 fn render(
     p: &mut Popup,
-    lines: &[&str],
-    selected: usize,
-    scroll: usize,
+    content: Content,
     font_size: f32,
     row_h: f32,
     pad: f32,
@@ -459,13 +548,10 @@ fn render(
 ) -> bool {
     let g = gpu::gpu();
     let (w, h) = (p.w as f32, p.h as f32);
-    let total = lines.len();
-    let visible = total.min(MAX_ROWS);
-    let top = scroll.min(total.saturating_sub(visible));
-    let win = &lines[top.min(total)..(top + visible).min(total)];
 
-    // Quads: a background fill + the selected row highlight. On Windows the layered
-    // HWND can't show per-pixel alpha, so keep the background a full opaque rectangle
+    // Quads: a subtle background fill (+ the selected row highlight for the list).
+    // On Windows the window is a non-per-pixel-alpha layered HWND, so transparent
+    // pixels composite as black — keep the background a full opaque rectangle
     // (square corners) instead of the rounded, see-through one used on macOS.
     let mut quads: Vec<Quad> = Vec::with_capacity(2);
     let shade = if dark { 0.10 } else { -0.06 };
@@ -482,42 +568,73 @@ fn render(
         ],
         radius: if cfg!(windows) { 0.0 } else { 4.0 * (font_size / 14.0) },
     });
-    if selected >= top && selected < top + visible {
-        let sel_row = selected - top;
-        quads.push(Quad {
-            x: 0.0,
-            y: pad * 0.5 + sel_row as f32 * row_h,
-            w,
-            h: row_h,
-            color: [0.30, 0.50, 0.90, 0.55],
-            radius: 0.0,
-        });
-    }
 
-    // Text: strip the 1-char kind tag and show it as a colored letter badge before
-    // the label, so e.g. a namespace (N) reads differently from a class (T) at a
-    // glance — colour alone is too subtle to tell them apart.
     let mut fs = gpu::lock_font_system();
-    let mut joined = String::new();
-    let mut kinds: Vec<char> = Vec::with_capacity(win.len());
-    for (i, line) in win.iter().enumerate() {
-        let mut chars = line.chars();
-        let kind = chars.next().unwrap_or(' ');
-        kinds.push(kind);
-        if i > 0 {
-            joined.push('\n');
-        }
-        joined.push(kind_badge(kind));
-        joined.push(' ');
-        joined.push_str(chars.as_str());
-    }
     let base = Attrs::new().family(Family::Monospace).color(text_color);
     let mut buf = Buffer::new(&mut fs, Metrics::new(font_size, row_h));
     buf.set_size(&mut fs, Some(w - pad), Some(h));
-    buf.set_text(&mut fs, &joined, &base, Shaping::Advanced, None);
-    for (bl, &kind) in buf.lines.iter_mut().zip(kinds.iter()) {
-        let label = bl.text().to_string();
-        bl.set_attrs_list(crate::input::popup_label_attrs(&label, kind, &base, dark));
+
+    match content {
+        Content::List { lines, selected, scroll } => {
+            // The host owns the scroll offset: the wheel scrolls the view without
+            // moving the selection, and arrows move the selection. Clamp defensively.
+            let total = lines.len();
+            let visible = total.min(MAX_ROWS);
+            let top = scroll.min(total.saturating_sub(visible));
+            let win = &lines[top.min(total)..(top + visible).min(total)];
+
+            // Highlight the selection only when it's within the scrolled-into-view
+            // window (after a wheel scroll the selection can be off-screen).
+            if selected >= top && selected < top + visible {
+                let sel_row = selected - top;
+                quads.push(Quad {
+                    x: 0.0,
+                    y: pad * 0.5 + sel_row as f32 * row_h,
+                    w,
+                    h: row_h,
+                    color: [0.30, 0.50, 0.90, 0.55],
+                    radius: 0.0,
+                });
+            }
+
+            // Strip the 1-char kind tag and show it as a colored letter badge before
+            // the label, so e.g. a namespace (N) reads differently from a class (T)
+            // at a glance — colour alone is too subtle to tell them apart.
+            let mut joined = String::new();
+            let mut kinds: Vec<char> = Vec::with_capacity(win.len());
+            for (i, line) in win.iter().enumerate() {
+                let mut chars = line.chars();
+                let kind = chars.next().unwrap_or(' ');
+                kinds.push(kind);
+                if i > 0 {
+                    joined.push('\n');
+                }
+                joined.push(kind_badge(kind));
+                joined.push(' ');
+                joined.push_str(chars.as_str());
+            }
+            buf.set_text(&mut fs, &joined, &base, Shaping::Advanced, None);
+            for (bl, &kind) in buf.lines.iter_mut().zip(kinds.iter()) {
+                let label = bl.text().to_string();
+                // The badge shares the kind's color (it's part of the name span).
+                bl.set_attrs_list(crate::input::popup_label_attrs(&label, kind, &base, dark));
+            }
+        }
+        Content::Sig { line, active, accent } => {
+            buf.set_text(&mut fs, line, &base, Shaping::Advanced, None);
+            let (cs, cl) = active;
+            if cl > 0 {
+                let sb = char_to_byte(line, cs);
+                let eb = char_to_byte(line, cs + cl);
+                if sb < eb {
+                    let mut al = glyphon::AttrsList::new(&base);
+                    al.add_span(sb..eb, &base.clone().color(accent));
+                    if let Some(bl) = buf.lines.get_mut(0) {
+                        bl.set_attrs_list(al);
+                    }
+                }
+            }
+        }
     }
     buf.shape_until_scroll(&mut fs, false);
 
@@ -555,6 +672,9 @@ fn render(
     use wgpu::CurrentSurfaceTexture as Cst;
     let frame = match p.surface.get_current_texture() {
         Cst::Success(t) | Cst::Suboptimal(t) => t,
+        // After a resize the swapchain can be Outdated/Lost; reconfigure and retry
+        // once so we present a correctly-sized frame instead of skipping (which
+        // would leave the resized panel showing stale, mis-scaled content).
         Cst::Outdated | Cst::Lost => {
             log::debug!("popup acquire: outdated/lost -> reconfigure+retry");
             p.reconfigure();
@@ -598,6 +718,9 @@ fn render(
         let _ = p.text.render(&p.atlas, &p.viewport, &mut pass);
     }
     g.queue.submit([enc.finish()]);
+    // With presentsWithTransaction (macOS) the present is deferred to the enclosing
+    // CA transaction's commit; wait for the GPU work to be scheduled first so the
+    // drawable actually has this frame's content at commit time. Harmless elsewhere.
     let _ = g.device.poll(wgpu::PollType::wait_indefinitely());
     frame.present();
     true

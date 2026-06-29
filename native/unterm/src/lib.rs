@@ -1670,6 +1670,41 @@ pub extern "C" fn unterm_popup_hide() {
     popup::hide();
 }
 
+/// Show the native signature-help hint (anchored ABOVE the caret). `line` is the
+/// full signature; `active_start`/`active_len` are CHAR offsets of the active
+/// parameter within `line`. `x`/`y` are the caret TOP in screen points; `scale` is
+/// pixels-per-point; background is (br,bg,bb) and text is (fr,fg,fb). macOS only.
+#[cfg(any(target_os = "macos", windows))]
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn unterm_popup_sig_show(
+    line: *const c_char,
+    active_start: u32,
+    active_len: u32,
+    x: f32,
+    y: f32,
+    scale: f32,
+    br: f32,
+    bg: f32,
+    bb: f32,
+    fr: u8,
+    fg: u8,
+    fb: u8,
+    dark: u8,
+) {
+    let line = cstr(line);
+    let clear = wgpu::Color { r: br as f64, g: bg as f64, b: bb as f64, a: 1.0 };
+    let text = glyphon::Color::rgb(fr, fg, fb);
+    popup::show_sig(&line, active_start as usize, active_len as usize, x, y, scale, clear, text, dark != 0);
+}
+
+/// Hide the native signature-help hint. macOS only.
+#[cfg(any(target_os = "macos", windows))]
+#[no_mangle]
+pub extern "C" fn unterm_popup_sig_hide() {
+    popup::hide_sig();
+}
+
 /// Accept a completion: delete `prefix_len` characters before the caret and insert
 /// `text` in their place.
 ///
