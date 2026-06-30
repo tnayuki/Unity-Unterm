@@ -1,7 +1,7 @@
 {
   "name": "dev.tnayuki.unterm",
   "displayName": "Unterm",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "unity": "6000.3",
   "description": "A native (Rust/wgpu) terminal window for the Unity Editor on macOS and Windows. Runs a real PTY-backed shell inside an EditorWindow, with IME input, mouse selection, copy/paste, and survival across domain reloads.",
   "dependencies": {
