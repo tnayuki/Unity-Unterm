@@ -27,6 +27,28 @@ start in the project root.
   so they survive C# recompiles. The window re-adopts its terminal after a
   reload instead of restarting the shell.
 
+## Claude Code
+
+Unterm has an in-Editor Claude Code agent panel — a transcript and composer that
+drive Anthropic's standalone Claude Code engine in-process, no Node required.
+
+1. Open **Preferences ▸ Unterm** and click **Download Claude Code**. The engine
+   (~214 MB) is fetched from Anthropic's official npm registry into a per-user
+   folder shared by all your projects.
+2. Sign in with your own Anthropic account: run `claude login` (or type `/login`
+   in the panel, which opens a terminal for the browser sign-in).
+3. Open the panel from **Window ▸ Unterm ▸ Claude Code**. The menu item stays
+   disabled until the engine has been downloaded.
+
+## Code editor
+
+Unterm can be your script editor too — an in-Editor code editor with tree-sitter
+highlighting and in-process Roslyn C# completion, no external application or
+solution files. Select it under **Preferences ▸ External Tools ▸ External Script
+Editor ▸ Unterm Code Editor**. Afterwards, double-clicking a script, jumping to a
+compile error, **Open C# Project**, and file paths clicked in the Claude Code
+transcript all open there.
+
 ## Platform
 
 macOS and Windows — the zero-copy display platforms. The renderer hands the

@@ -1,6 +1,10 @@
 # Changelog
 
-## [Unreleased]
+## [0.4.1] - 2026-07-01
+
+### Documentation
+
+- The README now covers downloading the Claude Code engine (**Preferences ▸ Unterm**) and selecting **Unterm Code Editor** as the External Script Editor.
 
 ### Fixed
 
