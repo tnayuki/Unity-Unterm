@@ -65,8 +65,21 @@ notify = { version = "6", default-features = false, features = ["macos_fsevent"]
 timeago = { version = "0.6.1", default-features = false, features = ["isolang", "translations"] }
 isolang = { version = "2.4.0", default-features = false }
 
+# Standalone debugger window (`unterm-debugger` bin / `debugger` module): its own
+# winit event loop + wgpu surface, so it stays live while the editor is frozen at a
+# breakpoint. Only entered by the bin; the Unity-loaded cdylib never calls into it.
+winit = "0.30"
+egui-wgpu = "0.35.0"
+egui = "0.35"
+egui-winit = "0.35"
+# Player discovery: bind the Unity multicast group with SO_REUSEPORT (shared with the
+# editor's own listener) — std's UdpSocket can't set the sockopt before bind.
+socket2 = { version = "0.5", features = ["all"] }
+
 # Graceful child shutdown: SIGTERM the `claude` process before falling back to
 # SIGKILL, so it can finalize its transcript (std's Child::kill is SIGKILL-only).
+# Also player discovery: getifaddrs enumerates interfaces so the multicast group is
+# joined on each (macOS won't receive from a secondary interface via INADDR_ANY alone).
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
@@ -89,9 +102,16 @@ objc2-io-surface = "0.3"
 # we render to with wgpu (so the list can overflow the editor window).
 objc2-app-kit = { version = "0.3", features = [
     "NSResponder", "NSWindow", "NSPanel", "NSView", "NSScreen",
+    # Debugger: observe the editor coming to the foreground (NSWorkspace notice) to
+    # tuck the debugger window just behind it.
+    "NSWorkspace",
 ] }
 objc2-quartz-core = { version = "0.3", features = ["CALayer", "CAMetalLayer"] }
 objc2-foundation = { version = "0.3", features = ["NSGeometry"] }
+# Debugger foreground-follow: the NSWorkspace observer block + the winit window's
+# NSWindow handle (to orderWindow:relativeTo: it below the editor's window).
+block2 = "0.6"
+raw-window-handle = "0.6"
 # IOSurface creation stays on the plain CoreFoundation FFI; the raw pointer is
 # bridged into objc2's `&IOSurfaceRef` for the Metal texture call.
 core-foundation = "0.10"
@@ -122,6 +142,9 @@ windows = { version = "0.62", features = [
     # Probe whether a `claude` pid from the session registry is still alive.
     "Win32_System_Threading",
     "Win32_UI_WindowsAndMessaging",
+    # Debugger foreground-follow: SetWinEventHook(EVENT_SYSTEM_FOREGROUND) to detect the
+    # editor coming forward, then SetWindowPos to slide the window just behind it.
+    "Win32_UI_Accessibility",
 ] }
 # Same crate the macOS side uses; the d3d features pull in the
 # IUnityGraphicsD3D11/D3D12 interfaces for the device capture in unity.rs.

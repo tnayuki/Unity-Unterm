@@ -110,6 +110,18 @@ pub struct InputBox {
     /// Whether the host window owns keyboard focus. The caret is only drawn while
     /// focused, so an unfocused input box (background editor window) shows no caret.
     focused: bool,
+    /// Debugger breakpoint lines (0-based), shown as gutter dots in code mode.
+    breakpoints: std::collections::HashSet<usize>,
+    /// Whether the gutter reserves a breakpoint-dot column left of the line numbers
+    /// (only when debugging is enabled — otherwise the gutter stays at its plain
+    /// line-number width and no dots are drawn).
+    bp_gutter: bool,
+    /// Read-only mode: caret movement, selection, copy, scroll and find still work,
+    /// but text mutations are ignored (used by the debugger's shared source view).
+    read_only: bool,
+    /// The debugger's current execution line (0-based), highlighted amber. Distinct
+    /// from the caret's current-line highlight in `code_mode`.
+    exec_line: Option<usize>,
     /// Code-editor behaviors: no word-wrap (+ horizontal scroll), auto-indent,
     /// auto-close brackets, current-line + matching-bracket highlight, smart Home.
     code_mode: bool,
@@ -238,6 +250,10 @@ impl InputBox {
             gutter_px: 0.0,
             gutter_cache: GutterCache::default(),
             focused: true,
+            breakpoints: std::collections::HashSet::new(),
+            bp_gutter: false,
+            read_only: false,
+            exec_line: None,
             code_mode: false,
             scroll_h: 0.0,
             caret_dirty: true,
@@ -553,6 +569,63 @@ impl InputBox {
             // Left every marker: hide the tooltip (repaint once to clear it).
             None => self.peek.take().is_some(),
         }
+    }
+
+    /// Gutter width (physical px) from the last render, for hit-testing clicks.
+    pub fn gutter_width(&self) -> f32 {
+        self.gutter_px
+    }
+
+    /// The 0-based logical line nearest physical y (clamped to the last line; for
+    /// gutter-click breakpoint toggles, which snap to a line even past text end).
+    pub fn line_at_y_clamped(&self, y: f32) -> usize {
+        let pad = PAD * self.scale;
+        let by = (y - pad).max(0.0);
+        let mut line = 0usize;
+        self.editor.with_buffer(|buf| {
+            for run in buf.layout_runs() {
+                if run.line_top <= by {
+                    line = run.line_i;
+                }
+            }
+        });
+        line
+    }
+
+    /// Toggle a breakpoint on a 0-based line.
+    pub fn toggle_breakpoint(&mut self, line: usize) {
+        if !self.breakpoints.remove(&line) {
+            self.breakpoints.insert(line);
+        }
+    }
+
+    /// Replace the breakpoint set (0-based lines).
+    pub fn set_breakpoints(&mut self, lines: &[u32]) {
+        self.breakpoints = lines.iter().map(|&l| l as usize).collect();
+    }
+
+    /// Current breakpoint lines (0-based), ascending.
+    #[allow(dead_code)] // host (C#) is the source of truth; kept for tests/future query
+    pub fn breakpoints(&self) -> Vec<u32> {
+        let mut v: Vec<u32> = self.breakpoints.iter().map(|&l| l as u32).collect();
+        v.sort_unstable();
+        v
+    }
+
+    /// Read-only mode: caret/selection/scroll/find still work; text edits are ignored.
+    pub fn set_read_only(&mut self, on: bool) {
+        self.read_only = on;
+    }
+
+    /// Reserve (and draw) the breakpoint-dot column in the gutter. Off = plain
+    /// line-number gutter at its usual width, with no dots.
+    pub fn set_bp_gutter(&mut self, on: bool) {
+        self.bp_gutter = on;
+    }
+
+    /// Highlight a 0-based execution line (the debugger's current line), or clear it.
+    pub fn set_exec_line(&mut self, line: Option<usize>) {
+        self.exec_line = line;
     }
 
     /// Scroll vertically by `dy` physical px (wheel). Clamped on the next render.
@@ -1164,6 +1237,12 @@ impl InputBox {
         self.shared.raw_texture()
     }
 
+    /// The wgpu texture view the editor renders into (for in-process compositing,
+    /// e.g. the debugger showing this as an egui image via `register_native_texture`).
+    pub fn texture_view(&self) -> &wgpu::TextureView {
+        self.shared.view()
+    }
+
     pub fn resize(&mut self, width: u32, height: u32) {
         let width = width.max(1);
         let height = height.max(1);
@@ -1227,7 +1306,7 @@ impl InputBox {
     /// Insert typed or IME-committed text at the caret. Shaping happens on the
     /// next `render` via `shape_as_needed`, so no font system is needed here.
     pub fn insert(&mut self, text: &str) {
-        if text.is_empty() {
+        if text.is_empty() || self.read_only {
             return;
         }
         // A real insert (e.g. IME commit) replaces any in-progress composition.
@@ -1340,6 +1419,22 @@ impl InputBox {
     pub fn key(&mut self, name: &str, _ctrl: bool, _alt: bool, shift: bool) {
         self.caret_dirty = true; // a key moves the caret → scroll to keep it visible
 
+        // Read-only (debugger source view): drop text-mutating keys, keep navigation.
+        if self.read_only
+            && matches!(
+                name,
+                "DeleteWordBack"
+                    | "DeleteWordForward"
+                    | "Return"
+                    | "KeypadEnter"
+                    | "Backspace"
+                    | "Delete"
+                    | "DeleteToLineStart"
+            )
+        {
+            return;
+        }
+
         // Code-aware word motion/deletion (`.` is a boundary except in floats).
         match name {
             "WordLeft" => {
@@ -1448,6 +1543,30 @@ impl InputBox {
         }
     }
 
+    /// The (line text, character column) at a physical-px point, or None over the
+    /// gutter. Non-destructive: it hit-tests via a click then restores the caret and
+    /// selection, so it can drive hover tooltips without moving the cursor.
+    pub fn pos_at_pixel(&mut self, x: f32, y: f32) -> Option<(String, usize)> {
+        if x < self.gutter_px {
+            return None;
+        }
+        let pad = PAD * self.scale;
+        let bx = (x - pad - self.gutter_px).round() as i32;
+        let by = (y - pad).round() as i32;
+        let saved_cursor = self.editor.cursor();
+        let saved_sel = self.editor.selection();
+        {
+            let mut fs = gpu::lock_font_system();
+            self.editor.action(&mut fs, Action::Click { x: bx, y: by });
+        }
+        let cur = self.editor.cursor();
+        self.editor.set_cursor(saved_cursor);
+        self.editor.set_selection(saved_sel);
+        let line = self.line_text(cur.line);
+        let col = byte_to_col(&line, cur.index);
+        Some((line, col))
+    }
+
     /// Mouse interaction at physical px relative to the box: kind 0 = click (place
     /// caret), 1 = drag (extend selection), 2 = double-click (word), 3 = triple
     /// (line).
@@ -1521,7 +1640,7 @@ impl InputBox {
     /// string removes it (on commit/cancel). The caret sits at its end.
     pub fn set_preedit(&mut self, text: &str) {
         self.clear_preedit();
-        if text.is_empty() {
+        if text.is_empty() || self.read_only {
             return;
         }
         self.preedit_anchor = Some(self.editor.cursor());
@@ -1579,13 +1698,19 @@ impl InputBox {
 
         // Code-editor gutter: width from the logical line count, shifting the text
         // area right by `gutter_w`. Zero (and no inset) when the gutter is off.
+        // With the breakpoint column enabled, a dot-sized strip is reserved LEFT of
+        // the numbers so dots and digits never overlap; without it the gutter stays
+        // at its plain line-number width.
         let line_count = self.editor.with_buffer(|b| b.lines.len()).max(1);
+        let bp_dot = (line_height * 0.52).min(font_size);
+        let bp_col = if self.bp_gutter { bp_dot + pad * 0.45 } else { 0.0 };
         let gutter_w = if self.gutter {
             let digits = ((line_count as f32).log10().floor() as usize + 1).max(2);
-            // digits + a right gap for the numbers + a left lane for the diff markers.
-            // The whole gutter is the click target for the peek, so the marker lane
-            // also gives that a comfortable width.
-            (digits as f32 * font_size * 0.6 + pad * 2.0 + 8.0 * s).ceil()
+            // digits + a right gap for the numbers + a left lane for the diff markers
+            // (+ a breakpoint-dot column between the markers and the numbers, when
+            // debugging is enabled). The whole gutter is the click target for the
+            // peek, so the marker lane also gives that a comfortable width.
+            (digits as f32 * font_size * 0.6 + pad * 2.0 + 8.0 * s + bp_col).ceil()
         } else {
             0.0
         };
@@ -1749,6 +1874,29 @@ impl InputBox {
                     w: width,
                     h: line_height,
                     color: [c, c, c, a],
+                    radius: 0.0,
+                });
+            }
+        }
+
+        // Debugger execution line: a full-width amber band behind the text.
+        if let Some(el) = self.exec_line {
+            let mut top: Option<f32> = None;
+            self.editor.with_buffer(|buf| {
+                for run in buf.layout_runs() {
+                    if run.line_i == el {
+                        top = Some(run.line_top);
+                        break;
+                    }
+                }
+            });
+            if let Some(t) = top {
+                quads.push(Quad {
+                    x: 0.0,
+                    y: pad + t,
+                    w: width,
+                    h: line_height,
+                    color: [0.902, 0.706, 0.251, 0.20],
                     radius: 0.0,
                 });
             }
@@ -1958,6 +2106,25 @@ impl InputBox {
                 }
             }
 
+            // Breakpoint dots: always drawn when set (the caller only sets breakpoints
+            // when debugging is on). Placed to the RIGHT of the diff-marker lane —
+            // `bp_gutter` reserves their own column so dots never sit on the numbers,
+            // but even without it a set breakpoint stays visible.
+            if !self.breakpoints.is_empty() {
+                let d = bp_dot;
+                for (li, top) in &tops {
+                    if self.breakpoints.contains(li) {
+                        quads.push(Quad {
+                            x: 8.0 * s + pad * 0.45,
+                            y: pad + *top + (line_height - d) * 0.5,
+                            w: d,
+                            h: d,
+                            color: [0.85, 0.16, 0.16, 1.0],
+                            radius: d * 0.5,
+                        });
+                    }
+                }
+            }
             let nc = self.text_color;
             let key = {
                 let mut h = std::collections::hash_map::DefaultHasher::new();

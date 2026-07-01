@@ -41,6 +41,7 @@ namespace Unterm.Editor
                 {
                     "unterm", "claude", "claude code", "agent", "terminal", "download",
                     "code editor", "undo", "history", "sound", "notify", "notification", "chime",
+                    "debug", "debugger", "breakpoint",
                 },
             };
         }
@@ -109,6 +110,18 @@ namespace Unterm.Editor
                 notify);
             if (nextNotify != notify)
                 UntermAgentPrefs.NotifySoundEnabled = nextNotify;
+
+            EditorGUILayout.Space();
+            EditorGUILayout.LabelField("Debugger", EditorStyles.boldLabel);
+            bool curDbg = UntermDebuggerPrefs.Enabled;
+            bool nextDbg = EditorGUILayout.Toggle(
+                new GUIContent("Enable debugging",
+                    "Enables the Window/Unterm/Debugger (Standalone Process) menu and the code editor's breakpoint " +
+                    "gutter (click left of the line numbers to set breakpoints; entering Play " +
+                    "mode with breakpoints launches the debugger)."),
+                curDbg);
+            if (nextDbg != curDbg)
+                UntermDebuggerPrefs.Enabled = nextDbg;
         }
 
         private static void DrawAction()

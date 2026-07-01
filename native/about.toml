@@ -15,6 +15,13 @@ accepted = [
     "Unlicense",
     "0BSD",
     "MPL-2.0",
+    # The debugger's egui window: clipboard-win/error-code (BSL-1.0) via
+    # egui-winit's clipboard, and egui's bundled fonts (OFL-1.1 +
+    # Ubuntu-font-1.0 via epaint_default_fonts). All permissive; the font
+    # licenses are satisfied by shipping their notices, which this generates.
+    "BSL-1.0",
+    "OFL-1.1",
+    "Ubuntu-font-1.0",
 ]
 
 # The shipped targets: macOS aarch64/x86_64 and Windows x86_64. This prunes

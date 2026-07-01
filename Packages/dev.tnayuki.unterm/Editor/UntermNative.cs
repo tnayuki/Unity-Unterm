@@ -134,6 +134,9 @@ namespace Unterm.Editor
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)] [return: MarshalAs(UnmanagedType.I1)] private delegate bool EdHoverFn(ulong id, float x, float y);
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate int EdHunkAtFn(ulong id, float x, float y);
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)] [return: MarshalAs(UnmanagedType.I1)] private delegate bool EdStageHunkFn(ulong id, uint hunk);
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate uint EdLineAtYFn(ulong id, float y);
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate void EdSetBpsFn(ulong id, IntPtr lines, UIntPtr count);
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate void EdSetBoolFn(ulong id, [MarshalAs(UnmanagedType.I1)] bool on);
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)] [return: MarshalAs(UnmanagedType.I1)] private delegate bool EdFindFn(ulong id, [MarshalAs(UnmanagedType.LPUTF8Str)] string query, [MarshalAs(UnmanagedType.I1)] bool forward, [MarshalAs(UnmanagedType.I1)] bool caseSensitive);
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate uint EdReplaceAllFn(ulong id, [MarshalAs(UnmanagedType.LPUTF8Str)] string query, [MarshalAs(UnmanagedType.LPUTF8Str)] string repl, [MarshalAs(UnmanagedType.I1)] bool caseSensitive);
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate void EdCompleteFn(ulong id, uint prefixLen, [MarshalAs(UnmanagedType.LPUTF8Str)] string text);
@@ -199,6 +202,7 @@ namespace Unterm.Editor
         private AvBufFn _edCopy; private AvBufFn _edCut; private EdMouseFn _edMouse; private EdHoverFn _edHover; private AvF1Fn _edScroll;
         private EdHunkAtFn _edHunkAt; private EdStageHunkFn _edHunkStaged; private EdStageHunkFn _edHunkHasStaged; private EdStageHunkFn _edHunkStagedOnly; private EdStageHunkFn _edStageHunk; private EdStageHunkFn _edUnstageHunk; private AvUintSetFn _edRevertHunk;
         private AvF1Fn _edSetScroll; private AvFloatFn _edScrollOffset; private AvF1Fn _edScrollH;
+        private AvFloatFn _edGutterWidth; private EdLineAtYFn _edLineAtY; private AvUintSetFn _edToggleBp; private EdSetBpsFn _edSetBps; private EdSetBoolFn _edSetBpGutter;
         private AvVoidFn _edIndent, _edOutdent, _edToggleComment, _edMoveUp, _edMoveDown, _edDuplicate, _edDeleteLine;
         private AvUintSetFn _edGotoLine; private EdFindFn _edFind; private AvStrFn _edReplaceSel; private EdReplaceAllFn _edReplaceAll;
         private AvBufFn _edWordPrefix; private EdCompleteFn _edComplete; private EdSetComplFn _edSetCompletions; private AvUintGetFn _edCaretOffset;
@@ -391,6 +395,13 @@ namespace Unterm.Editor
             _edSetScroll = Sym<AvF1Fn>("unterm_editor_set_scroll");
             _edScrollOffset = Sym<AvFloatFn>("unterm_editor_scroll_offset");
             _edScrollH = Sym<AvF1Fn>("unterm_editor_scroll_h");
+            // Optional: tolerate an older plugin .dylib that predates these symbols
+            // (features stay disabled rather than breaking the whole editor at load).
+            _edGutterWidth = SymOpt<AvFloatFn>("unterm_editor_gutter_width");
+            _edLineAtY = SymOpt<EdLineAtYFn>("unterm_editor_line_at_y");
+            _edToggleBp = SymOpt<AvUintSetFn>("unterm_editor_toggle_breakpoint");
+            _edSetBps = SymOpt<EdSetBpsFn>("unterm_editor_set_breakpoints");
+            _edSetBpGutter = SymOpt<EdSetBoolFn>("unterm_editor_set_bp_gutter");
             _edIndent = Sym<AvVoidFn>("unterm_editor_indent");
             _edOutdent = Sym<AvVoidFn>("unterm_editor_outdent");
             _edToggleComment = Sym<AvVoidFn>("unterm_editor_toggle_comment");
@@ -692,6 +703,18 @@ namespace Unterm.Editor
         public void EditorScrollH(ulong id, float dx) => _edScrollH(id, dx);
         public void EditorSetScroll(ulong id, float px) => _edSetScroll(id, px);
         public float EditorScrollOffset(ulong id) => _edScrollOffset(id);
+        public float EditorGutterWidth(ulong id) => _edGutterWidth != null ? _edGutterWidth(id) : 0f;
+        public uint EditorLineAtY(ulong id, float y) => _edLineAtY != null ? _edLineAtY(id, y) : 0u;
+        public void EditorToggleBreakpoint(ulong id, uint line) => _edToggleBp?.Invoke(id, line);
+        public void EditorSetBpGutter(ulong id, bool on) => _edSetBpGutter?.Invoke(id, on);
+        public void EditorSetBreakpoints(ulong id, uint[] lines)
+        {
+            if (_edSetBps == null) return;
+            if (lines == null || lines.Length == 0) { _edSetBps(id, IntPtr.Zero, UIntPtr.Zero); return; }
+            var h = GCHandle.Alloc(lines, GCHandleType.Pinned);
+            try { _edSetBps(id, h.AddrOfPinnedObject(), (UIntPtr)lines.Length); }
+            finally { h.Free(); }
+        }
         public void EditorIndent(ulong id) => _edIndent(id);
         public void EditorOutdent(ulong id) => _edOutdent(id);
         public void EditorToggleComment(ulong id) => _edToggleComment(id);
@@ -773,6 +796,7 @@ namespace Unterm.Editor
             _edCopy = null; _edCut = null; _edMouse = null; _edHover = null; _edScroll = null;
             _edHunkAt = null; _edHunkStaged = null; _edHunkHasStaged = null; _edHunkStagedOnly = null; _edStageHunk = null; _edUnstageHunk = null; _edRevertHunk = null;
             _edSetScroll = null; _edScrollOffset = null; _edScrollH = null; _edIndent = null; _edOutdent = null;
+            _edGutterWidth = null; _edLineAtY = null; _edToggleBp = null; _edSetBps = null;
             _edToggleComment = null; _edMoveUp = null; _edMoveDown = null; _edDuplicate = null;
             _edDeleteLine = null; _edGotoLine = null; _edFind = null; _edReplaceSel = null; _edReplaceAll = null;
             _edWordPrefix = null; _edComplete = null; _edSetCompletions = null; _edCaretOffset = null;

@@ -105,6 +105,32 @@ impl EditorView {
         self.edit.raw_texture()
     }
 
+    /// The wgpu texture view the editor renders into (for in-process compositing).
+    pub fn texture_view(&self) -> &wgpu::TextureView {
+        self.edit.texture_view()
+    }
+
+    /// Read-only mode: navigation/selection/scroll work; text edits are ignored.
+    pub fn set_read_only(&mut self, on: bool) {
+        self.edit.set_read_only(on);
+    }
+
+    /// Reserve (and draw) the gutter's breakpoint-dot column (debugging enabled).
+    pub fn set_bp_gutter(&mut self, on: bool) {
+        self.edit.set_bp_gutter(on);
+    }
+
+    /// Highlight a 0-based execution line (debugger current line), or `usize::MAX` to clear.
+    pub fn set_exec_line(&mut self, line: usize) {
+        self.edit
+            .set_exec_line(if line == usize::MAX { None } else { Some(line) });
+    }
+
+    /// The (line text, char column) under a physical-px point, for hover tooltips.
+    pub fn pos_at_pixel(&mut self, x: f32, y: f32) -> Option<(String, usize)> {
+        self.edit.pos_at_pixel(x, y)
+    }
+
     pub fn content_height(&self) -> f32 {
         self.edit.content_height()
     }
@@ -203,6 +229,27 @@ impl EditorView {
     /// Revert hunk `hunk_i` to its git-base (HEAD) content (one undoable buffer edit).
     pub fn revert_hunk(&mut self, hunk_i: usize) {
         self.edit.revert_hunk(hunk_i);
+    }
+
+    pub fn gutter_width(&self) -> f32 {
+        self.edit.gutter_width()
+    }
+
+    pub fn line_at_y(&self, y: f32) -> usize {
+        self.edit.line_at_y_clamped(y)
+    }
+
+    pub fn toggle_breakpoint(&mut self, line: usize) {
+        self.edit.toggle_breakpoint(line);
+    }
+
+    pub fn set_breakpoints(&mut self, lines: &[u32]) {
+        self.edit.set_breakpoints(lines);
+    }
+
+    #[allow(dead_code)]
+    pub fn breakpoints(&self) -> Vec<u32> {
+        self.edit.breakpoints()
     }
 
     pub fn scroll(&mut self, dy: f32) {

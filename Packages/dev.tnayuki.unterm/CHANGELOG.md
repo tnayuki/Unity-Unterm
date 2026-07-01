@@ -1,5 +1,14 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+- Unterm now ships a full Mono debugger for play mode. Enable it under Preferences ▸ Unterm ▸ Debugger and click in the code editor's gutter to set breakpoints (a dedicated dot column appears next to the line numbers); pressing Play then just debugs — the debugger attaches to the editor's Mono runtime over the soft-debugger protocol, arms your breakpoints as their types load (so a breakpoint in `Awake`/`Start` hits from the very first frame), and pops to the front when one hits. It runs as a standalone process with its own window (`Window ▸ Unterm ▸ Debugger (Standalone Process)`, ⇧⌘D), so it stays fully interactive while the editor is frozen at a breakpoint, and it persists across Play/Stop cycles.
+- The debugger window gives you the essentials of an IDE debugger, rendered with the same native code editor as Unterm's own: a project file tree, a read-only source view with the executing line highlighted, continue / step over / into / out (also `c`/`n`/`i`/`o`), pause ("break all", `p`), a call stack you can click to inspect any frame, a thread list when a stop involves multiple managed threads, and a variables panel showing locals, `this`, and inherited fields — private members included — with lazy expansion of objects and arrays (reference cycles like `transform ↔ gameObject` are handled). Hovering an identifier in the source shows its current value, and the breakpoint list jumps to source on click.
+- Breakpoints live in `Library/Unterm/breakpoints.json`, shared between the editor and the debugger and synced live in both directions: toggling in the code editor arms/disarms in a running debug session immediately (even mid-play), and toggling in the debugger — including while the editor is frozen at a breakpoint — updates the editor's gutter dots as soon as it runs again.
+- The debugger can attach to more than the editor: development builds with script debugging enabled are discovered on the network via Unity's player multicast and offered in a target picker (labelled with their project and host), and source locations reported by a player built on another machine are mapped back to this project's files for display and breakpoints.
+
 ## [0.6.0] - 2026-07-08
 
 ### Added

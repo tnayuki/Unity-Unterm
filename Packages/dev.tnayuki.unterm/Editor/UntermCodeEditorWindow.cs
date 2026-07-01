@@ -349,6 +349,8 @@ namespace Unterm.Editor
             {
                 _native.EditorSetLanguage(Eid, _langToken);
                 _native.EditorSetText(Eid, text);
+                if (UntermDebuggerPrefs.Enabled)
+                    _native.EditorSetBreakpoints(Eid, UntermBreakpoints.For(_filePath)); // restore dots
                 _savedSerial = _native.EditorEditSerial(Eid); // baseline: just-loaded = clean
                 _native.EditorSetPath(Eid, _filePath); // fetch git texts for diff gutter markers
                 RenderView();
@@ -382,6 +384,32 @@ namespace Unterm.Editor
             // serialized flag is just the pre-reload display value).
             MarkDirty();
             UpdateTitle();
+            UntermDebuggerPrefs.Changed += OnDebuggerPrefChanged;
+            // The debugger toggling a breakpoint (while we run) writes the store; refresh
+            // this file's dots when that happens.
+            UntermBreakpoints.Changed += OnBreakpointsChanged;
+        }
+
+        // Debugging toggled in Preferences: re-apply the gutter mode (dot column) and
+        // show/clear this file's breakpoint dots immediately.
+        private void OnDebuggerPrefChanged()
+        {
+            if (_native == null || _editorId == 0) return;
+            _native.EditorSetBpGutter(Eid, UntermDebuggerPrefs.Enabled);
+            OnBreakpointsChanged();
+        }
+
+        // The shared store changed on disk (debugger-side toggle): re-apply this file's
+        // dots. No-op'd cheaply when the file/line set is unchanged.
+        private void OnBreakpointsChanged()
+        {
+            if (_native == null || _editorId == 0) return;
+            _native.EditorSetBreakpoints(Eid,
+                UntermDebuggerPrefs.Enabled && !string.IsNullOrEmpty(_filePath)
+                    ? UntermBreakpoints.For(_filePath)
+                    : Array.Empty<uint>());
+            RenderView();
+            Repaint();
         }
 
         private void OnBeforeReload()
@@ -396,6 +424,8 @@ namespace Unterm.Editor
 
         private void OnDisable()
         {
+            UntermDebuggerPrefs.Changed -= OnDebuggerPrefChanged;
+            UntermBreakpoints.Changed -= OnBreakpointsChanged;
             AssemblyReloadEvents.beforeAssemblyReload -= OnBeforeReload;
             EditorApplication.update -= OnEditorUpdate;
             _native?.PopupHide();
@@ -475,6 +505,13 @@ namespace Unterm.Editor
                     // made mid-compile).
                     _native.EditorRefreshDiff(Eid);
                 }
+
+                // Sync the breakpoint gutter to the current pref for BOTH fresh and
+                // re-adopted views (a re-adopted native view keeps its old flag, which
+                // would otherwise leave the gutter/dots out of sync after a reload).
+                _native.EditorSetBpGutter(Eid, UntermDebuggerPrefs.Enabled);
+                if (UntermDebuggerPrefs.Enabled && !string.IsNullOrEmpty(_filePath))
+                    _native.EditorSetBreakpoints(Eid, UntermBreakpoints.For(_filePath));
 
                 _refocus = true;
                 RenderView();
@@ -691,6 +728,23 @@ namespace Unterm.Editor
             switch (e.type)
             {
                 case EventType.MouseDown when e.button == 0 && rect.Contains(e.mousePosition):
+                    // Gutter clicks with debugging enabled: the thin left diff-marker
+                    // lane (~8px) keeps its Stage/Revert menu; the rest of the gutter
+                    // (breakpoint column + line numbers) toggles a breakpoint.
+                    if (UntermDebuggerPrefs.Enabled
+                        && lx < _native.EditorGutterWidth(Eid) && !string.IsNullOrEmpty(_filePath))
+                    {
+                        if (lx < 8f * ppp)
+                        {
+                            int laneHunk = _native.EditorHunkAt(Eid, lx, ly);
+                            if (laneHunk >= 0) { ShowHunkMenu(laneHunk); e.Use(); break; }
+                        }
+                        uint bpLine = _native.EditorLineAtY(Eid, ly);
+                        var set = UntermBreakpoints.Toggle(_filePath, (int)bpLine);
+                        _native.EditorSetBreakpoints(Eid, set);
+                        RenderView(); Repaint(); e.Use();
+                        break;
+                    }
                     CloseCompletion(); // a click dismisses the popup
                     // A click on a gutter diff marker opens its Stage/Revert menu
                     // instead of moving the caret (VS Code-style).

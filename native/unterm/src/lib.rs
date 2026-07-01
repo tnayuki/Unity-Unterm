@@ -18,6 +18,7 @@ mod agentview;
 mod browser;
 mod clock;
 mod control;
+pub mod debugger;
 mod diff;
 mod editops;
 mod editorview;
@@ -36,6 +37,7 @@ mod popup;
 mod pty;
 mod quads;
 mod renderer;
+pub mod sdb;
 mod sessions;
 mod shell;
 #[cfg(any(target_os = "macos", windows))]
@@ -1840,6 +1842,43 @@ pub extern "C" fn unterm_editor_unstage_hunk(id: u64, hunk_i: u32) -> bool {
 #[no_mangle]
 pub extern "C" fn unterm_editor_revert_hunk(id: u64, hunk_i: u32) {
     with_editor(id, (), |e| e.revert_hunk(hunk_i as usize));
+}
+
+/// Gutter width (physical px) from the last render, so the host can tell whether a
+/// click landed in the gutter (breakpoint column) vs. the text area.
+#[no_mangle]
+pub extern "C" fn unterm_editor_gutter_width(id: u64) -> f32 {
+    with_editor(id, 0.0, |e| e.gutter_width())
+}
+
+/// The 0-based source line at physical y (for mapping a gutter click to a line).
+#[no_mangle]
+pub extern "C" fn unterm_editor_line_at_y(id: u64, y: f32) -> u32 {
+    with_editor(id, 0, |e| e.line_at_y(y) as u32)
+}
+
+/// Toggle a breakpoint dot on a 0-based line.
+#[no_mangle]
+pub extern "C" fn unterm_editor_toggle_breakpoint(id: u64, line: u32) {
+    with_editor(id, (), |e| e.toggle_breakpoint(line as usize));
+}
+
+/// Reserve (and draw) the gutter's breakpoint-dot column — on when debugging is
+/// enabled in the editor preferences, off for a plain line-number gutter.
+#[no_mangle]
+pub extern "C" fn unterm_editor_set_bp_gutter(id: u64, on: bool) {
+    with_editor(id, (), |e| e.set_bp_gutter(on));
+}
+
+/// Replace the breakpoint set (0-based lines), e.g. to restore on file open.
+#[no_mangle]
+pub unsafe extern "C" fn unterm_editor_set_breakpoints(id: u64, lines: *const u32, count: usize) {
+    let slice = if lines.is_null() || count == 0 {
+        &[][..]
+    } else {
+        unsafe { std::slice::from_raw_parts(lines, count) }
+    };
+    with_editor(id, (), |e| e.set_breakpoints(slice));
 }
 
 /// Scroll vertically by `dy` physical px (mouse wheel).
