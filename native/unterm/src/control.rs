@@ -115,7 +115,40 @@ impl Conv {
     }
 
     pub fn push_user(&mut self, text: &str) {
+        // Slash commands run through the CLI are recorded as synthetic user messages
+        // wrapped in `<command-*>` / `<local-command-*>` tags (seen on resume replay;
+        // live user events skip text via `apply_tool_results`, so no double-render).
+        // Show them cleanly instead of as raw tags.
+        let t = text.trim();
+        // Boilerplate the CLI wraps output in, plus harness task-completion pings —
+        // pure noise, drop them. (The caveat is also `isMeta` and already dropped in
+        // `reconstruct_transcript`; kept here as a belt-and-suspenders guard.)
+        if t.starts_with("<local-command-caveat>") || t.starts_with("<task-notification>") {
+            return;
+        }
+        // A slash-command invocation → "/name args".
+        if let Some(name) = tag_inner(t, "command-name") {
+            let args = tag_inner(t, "command-args").unwrap_or_default();
+            let (name, args) = (name.trim(), args.trim());
+            let line = if args.is_empty() { name.to_string() } else { format!("{name} {args}") };
+            self.push_block('u', line);
+            return;
+        }
+        // A command's stdout → a plain result line (agent role: no user bubble).
+        if let Some(out) = tag_inner(t, "local-command-stdout").or_else(|| tag_inner(t, "local-command-stderr")) {
+            let out = out.trim();
+            if !out.is_empty() {
+                self.push_block('a', out.to_string());
+            }
+            return;
+        }
         self.push_block('u', text.to_string());
+    }
+
+    /// A short marker standing in for a compaction summary (the verbose summary is
+    /// still in the engine's real context; the transcript just notes the boundary).
+    fn push_compact_marker(&mut self) {
+        self.push_block('a', "[continued from a compacted conversation]".to_string());
     }
 
     /// Append a queued (not-yet-sent) user prompt, kept as a dimmed `'q'` block in
@@ -441,6 +474,18 @@ pub fn reconstruct_transcript(session_id: &str) -> (Conv, Option<String>) {
                         .map(crate::clock::parse_iso8601_secs)
                         .unwrap_or(0);
                     conv.clock = (ts != 0).then_some(ts);
+                    // Live sessions render user *text* only via `send()` (incoming user
+                    // events apply tool_results only), so the CLI's synthetic user turns
+                    // never show live. On replay they would — filter them to match:
+                    // `isMeta` marks harness-injected turns (auto "Continue…" nudges,
+                    // system reminders, the caveat); a compact summary becomes a marker.
+                    if role == "user" && v["isMeta"].as_bool().unwrap_or(false) {
+                        continue;
+                    }
+                    if role == "user" && v["isCompactSummary"].as_bool().unwrap_or(false) {
+                        conv.push_compact_marker();
+                        continue;
+                    }
                     conv.apply_message(role, &v["message"]["content"]);
                 }
             }
@@ -1149,6 +1194,16 @@ fn truncate(s: &str, max: usize) -> String {
         let head: String = s.chars().take(max).collect();
         format!("{head}…")
     }
+}
+
+/// The text between the first `<tag>` and its matching `</tag>` (None if absent).
+/// Used to unwrap the CLI's synthetic `<command-*>` / `<local-command-*>` messages.
+fn tag_inner(text: &str, tag: &str) -> Option<String> {
+    let open = format!("<{tag}>");
+    let start = text.find(&open)? + open.len();
+    let close = format!("</{tag}>");
+    let rel = text[start..].find(&close)?;
+    Some(text[start..start + rel].to_string())
 }
 
 /// Parse an `AskUserQuestion` tool input into its questions.

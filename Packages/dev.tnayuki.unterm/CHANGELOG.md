@@ -16,6 +16,7 @@
 
 ### Fixed
 
+- A resumed Claude Code conversation no longer shows the CLI's synthetic messages as raw user bubbles: slash-command invocations render as `/name args`, their output as a plain result line, and harness-injected turns (the local-command caveat, auto "Continue…" nudges, system reminders, task-completion pings) are dropped, while a compaction summary collapses to a short boundary marker. These never appeared during a live session, so a reopened transcript now matches what you saw live.
 - The Claude Code agent panel can no longer crash the Editor on a rendering error: its render and poll entry points are now contained at the native boundary the way the terminal's already were, a full glyph atlas skips the frame instead of aborting, and a background-worker panic no longer wedges a session by leaving a mutex poisoned.
 - Background C# autocomplete and signature-help failures are now surfaced once in the Console instead of being silently swallowed, so a broken completion is diagnosable without flooding the log.
 - The autocomplete and signature-help worker threads now shut down cleanly when the Editor reloads its assemblies, instead of being aborted mid-analysis and leaking an OS event handle on every reload.
