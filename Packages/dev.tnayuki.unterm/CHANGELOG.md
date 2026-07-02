@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- The Claude Code agent transcript now marks pauses between messages with a small, right-aligned relative-time separator ("5 minutes ago", localized to the editor's locale via `timeago`), merging consecutive separators that resolve to the same time. Hovering a separator shows the exact local time, and the session picker lists each conversation's last activity with the same relative labels.
+
 ### Changed
 
 - The terminal renderer now reuses its per-frame cell scratch buffer instead of reallocating it every repaint, cutting steady allocator churn while a busy shell is streaming output.

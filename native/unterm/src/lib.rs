@@ -15,6 +15,7 @@
 //! ```
 
 mod agentview;
+mod clock;
 mod control;
 mod editops;
 mod editorview;
@@ -979,6 +980,39 @@ pub unsafe extern "C" fn unterm_agentview_take_host_command(id: u64, out_len: *m
 #[no_mangle]
 pub unsafe extern "C" fn unterm_agentview_panel_token_at(id: u64, x: f32, y: f32, out_len: *mut usize) -> *const c_char {
     view_string(id, out_len, |v| v.panel_token_at(x, y))
+}
+
+/// The unix stamp of the time separator under (`x`, `y`) in the transcript
+/// (physical px), or 0 when not over one — the label is relative ("5 minutes
+/// ago"), so the host uses this to show the exact time on hover.
+#[no_mangle]
+pub extern "C" fn unterm_agentview_panel_stamp_at(id: u64, x: f32, y: f32) -> u64 {
+    with_view(id, 0, |v| v.panel_stamp_at(x, y))
+}
+
+/// Snapshot buffer for [`unterm_format_relative`] (not per-view; one global).
+fn relative_snap() -> &'static Mutex<CString> {
+    static C: OnceLock<Mutex<CString>> = OnceLock::new();
+    C.get_or_init(|| Mutex::new(CString::default()))
+}
+
+/// Format a unix-seconds stamp as the same localized relative label the
+/// transcript separators use ("5 minutes ago"), for host UI like the session
+/// picker. Writes the byte length; the pointer is valid until the next call.
+///
+/// # Safety
+/// `out_len` must be writable or null.
+#[no_mangle]
+pub unsafe extern "C" fn unterm_format_relative(unix_secs: u64, out_len: *mut usize) -> *const c_char {
+    ffi_guard(std::ptr::null(), || {
+        let label = clock::format_relative(unix_secs, clock::now_secs());
+        let mut snap = relative_snap().lock_recover();
+        *snap = CString::new(label).unwrap_or_default();
+        if !out_len.is_null() {
+            unsafe { *out_len = snap.as_bytes().len() };
+        }
+        snap.as_ptr()
+    })
 }
 
 // --- transcript (panel) input ---

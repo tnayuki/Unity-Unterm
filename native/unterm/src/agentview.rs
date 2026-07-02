@@ -38,6 +38,9 @@ pub struct AgentView {
     // change serial, not a cloned copy — poll runs every editor tick, and cloning
     // the full transcript each tick just to compare it scaled with session length.
     last_transcript_serial: u64,
+    /// Last minute (unix/60) `poll` ticked the now-relative time separators on —
+    /// while one is visible, its "12 min ago" label re-renders once a minute.
+    last_minute: u64,
     last_status: String,
     last_pending_title: String,
     last_dot: usize,
@@ -97,6 +100,7 @@ impl AgentView {
             pending_host_cmd: None,
             started: Instant::now(),
             last_transcript_serial: 0,
+            last_minute: 0,
             last_status: String::new(),
             last_pending_title: String::new(),
             last_dot: usize::MAX,
@@ -158,6 +162,16 @@ impl AgentView {
         if transcript_serial != self.last_transcript_serial {
             self.last_transcript_serial = transcript_serial;
             flags |= FLAG_DIRTY;
+        }
+        // While a now-relative time separator is visible, repaint on minute
+        // ticks so its "12 min ago" label follows the clock; otherwise the
+        // tick costs one cheap stamp scan and no render.
+        let now = crate::clock::now_secs();
+        if now / 60 != self.last_minute {
+            self.last_minute = now / 60;
+            if self.driver.as_ref().is_some_and(|d| d.has_relative_stamp(now)) {
+                flags |= FLAG_DIRTY;
+            }
         }
         if status != self.last_status {
             self.last_status = status.clone();
@@ -303,6 +317,12 @@ impl AgentView {
     pub fn panel_token_at(&mut self, x: f32, y: f32) -> &CString {
         self.token_snap = clean(self.panel.token_at(x, y).unwrap_or_default());
         &self.token_snap
+    }
+
+    /// The unix stamp of the time separator under (`x`, `y`) in the transcript
+    /// (physical px), or 0 when not over one.
+    pub fn panel_stamp_at(&self, x: f32, y: f32) -> u64 {
+        self.panel.stamp_at(x, y)
     }
 
     /// The Send/Stop action: interrupt a running turn, else send the composer.

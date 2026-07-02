@@ -56,11 +56,26 @@ static NEXT_REQ: AtomicU64 = AtomicU64::new(1);
 
 pub struct Conv {
     blocks: Vec<(char, String)>,
+    /// Unix-seconds creation stamp per block, parallel to `blocks` (0 = unknown).
+    /// `serialize` marks a lull ≥ [`TIME_GAP_SECS`] between consecutive stamps
+    /// with a relative-time separator ("5 minutes ago"), chat-app style.
+    stamps: Vec<u64>,
+    /// While reconstructing a saved session, the record's own timestamp — so
+    /// historical blocks get historical stamps. `None` = live, stamp with now.
+    clock: Option<u64>,
     tools: HashMap<String, ToolEntry>, // toolUseId -> rendered tool block
     // tool_use ids we render via custom UI (ExitPlanMode / AskUserQuestion), so their
     // raw "▸ ToolName" line is suppressed in the transcript (incl. their tool_result).
     hidden_tools: HashSet<String>,
 }
+
+/// A quiet stretch this long between blocks gets a timestamp separator.
+const TIME_GAP_SECS: u64 = 5 * 60;
+
+/// While a separator is younger than this, its "N minutes ago" label changes each
+/// minute, so the panel force-repaints on minute ticks to keep it live. Beyond it
+/// the label moves by the hour at most, not worth waking an idle transcript for.
+const RELATIVE_TICK_SECS: u64 = 60 * 60;
 
 /// A tool call's rendered state. `idx` is the block it owns; `title` is the tool
 /// name; `input`/`output` are the (sanitized) call arguments and result text, kept
@@ -78,27 +93,49 @@ impl Conv {
     pub fn new() -> Self {
         Self {
             blocks: Vec::new(),
+            stamps: Vec::new(),
+            clock: None,
             tools: HashMap::new(),
             hidden_tools: HashSet::new(),
         }
     }
 
+    /// The creation stamp for a block appended right now: the reconstruction
+    /// clock while replaying a saved session, else the wall clock.
+    fn stamp_now(&self) -> u64 {
+        self.clock.unwrap_or_else(crate::clock::now_secs)
+    }
+
+    /// The one place a block enters `blocks`, so `stamps` can never fall out of
+    /// lockstep with it.
+    fn push_block(&mut self, role: char, text: String) {
+        let stamp = self.stamp_now();
+        self.blocks.push((role, text));
+        self.stamps.push(stamp);
+    }
+
     pub fn push_user(&mut self, text: &str) {
-        self.blocks.push(('u', text.to_string()));
+        self.push_block('u', text.to_string());
     }
 
     /// Append a queued (not-yet-sent) user prompt, kept as a dimmed `'q'` block in
     /// the transcript until the running turn finishes and it is promoted/sent.
     pub fn push_queued(&mut self, text: &str) {
-        self.blocks.push(('q', text.to_string()));
+        self.push_block('q', text.to_string());
     }
 
     /// Promote the oldest queued prompt to a real user turn, returning its text
     /// (None if nothing is queued).
     fn promote_first_queued(&mut self) -> Option<String> {
-        for b in self.blocks.iter_mut() {
+        let now = self.stamp_now();
+        for (i, b) in self.blocks.iter_mut().enumerate() {
             if b.0 == 'q' {
                 b.0 = 'u';
+                // It is *sent* now — restamp so the gap separator reflects when
+                // the turn actually ran, not when it was queued.
+                if let Some(s) = self.stamps.get_mut(i) {
+                    *s = now;
+                }
                 return Some(b.1.clone());
             }
         }
@@ -133,6 +170,9 @@ impl Conv {
             return;
         }
         self.blocks.remove(i);
+        if i < self.stamps.len() {
+            self.stamps.remove(i);
+        }
         for e in self.tools.values_mut() {
             if e.idx > i {
                 e.idx -= 1;
@@ -146,11 +186,12 @@ impl Conv {
         }
         if let Some((r, t)) = self.blocks.last_mut() {
             if *r == role {
+                // Streaming continuation: the block keeps its start stamp.
                 t.push_str(s);
                 return;
             }
         }
-        self.blocks.push((role, s.to_string()));
+        self.push_block(role, s.to_string());
     }
 
     /// Record a `tool_use`: set/refresh the title + input summary and mark the call
@@ -165,7 +206,7 @@ impl Conv {
             e.glyph = "▸";
         } else {
             let idx = self.blocks.len();
-            self.blocks.push(('x', String::new()));
+            self.push_block('x', String::new());
             let title = if name.is_empty() { "(tool)".to_string() } else { name.to_string() };
             self.tools.insert(
                 id.to_string(),
@@ -185,7 +226,7 @@ impl Conv {
         } else {
             // A result with no preceding tool_use (shouldn't happen): stub a block.
             let idx = self.blocks.len();
-            self.blocks.push(('x', String::new()));
+            self.push_block('x', String::new());
             self.tools.insert(
                 id.to_string(),
                 ToolEntry { idx, title: "(tool)".to_string(), glyph, input: String::new(), output },
@@ -218,7 +259,7 @@ impl Conv {
     }
 
     fn note_closed(&mut self) {
-        self.blocks.push(('a', "[connection closed]".to_string()));
+        self.push_block('a', "[connection closed]".to_string());
     }
 
     /// Apply one Anthropic message's `content` (string or block array). Used for
@@ -295,11 +336,51 @@ impl Conv {
     }
 
     pub fn serialize(&self) -> String {
-        self.blocks
-            .iter()
-            .map(|(r, t)| format!("{r}{US}{t}"))
-            .collect::<Vec<_>>()
-            .join(&RS.to_string())
+        // Mark the transcript's opening and its conversation lulls with a
+        // timestamp separator (an 's' block): the first stamped block always gets
+        // one (so the top shows when the conversation started), and thereafter one
+        // appears whenever consecutive blocks are ≥ TIME_GAP_SECS apart — chat-app
+        // style, never per line. The block body is the RAW unix stamp; the panel
+        // formats it against the clock at layout time, so a now-relative "12 min
+        // ago" label can age without this memoized string going stale.
+        let mut out: Vec<String> = Vec::with_capacity(self.blocks.len());
+        let mut prev: Option<u64> = None;
+        for (i, (r, t)) in self.blocks.iter().enumerate() {
+            let stamp = self.stamps.get(i).copied().unwrap_or(0);
+            if stamp != 0 {
+                let gap = prev.is_none_or(|p| stamp.saturating_sub(p) >= TIME_GAP_SECS);
+                if gap {
+                    out.push(format!("s{US}{stamp}"));
+                }
+                prev = Some(stamp);
+            }
+            out.push(format!("{r}{US}{t}"));
+        }
+        out.join(&RS.to_string())
+    }
+
+    /// Whether the transcript has a separator young enough that its label changes
+    /// minute-to-minute ("5 minutes ago" → "6 minutes ago") — the UI forces a
+    /// repaint on minute ticks while this holds, so the label follows the clock.
+    /// Past the window the label only changes by the hour (or slower), so an idle
+    /// transcript stops ticking and refreshes on the next interaction instead.
+    fn has_relative_stamp(&self, now: u64) -> bool {
+        let window = RELATIVE_TICK_SECS;
+        let mut prev: Option<u64> = None;
+        for i in 0..self.blocks.len() {
+            let stamp = self.stamps.get(i).copied().unwrap_or(0);
+            if stamp == 0 {
+                continue;
+            }
+            // Mirror `serialize`: the first stamped block and each ≥ gap boundary
+            // carry a separator.
+            let gap = prev.is_none_or(|p| stamp.saturating_sub(p) >= TIME_GAP_SECS);
+            if gap && now.saturating_sub(stamp) <= window {
+                return true;
+            }
+            prev = Some(stamp);
+        }
+        false
     }
 }
 
@@ -353,12 +434,21 @@ pub fn reconstruct_transcript(session_id: &str) -> (Conv, Option<String>) {
                 // (queue-operation, ai-title, last-prompt, attachment, ...).
                 let role = v["type"].as_str().unwrap_or("");
                 if role == "user" || role == "assistant" {
+                    // Replay under the record's own timestamp so historical blocks
+                    // get historical stamps (0/absent = unknown, no separator).
+                    let ts = v["timestamp"]
+                        .as_str()
+                        .map(crate::clock::parse_iso8601_secs)
+                        .unwrap_or(0);
+                    conv.clock = (ts != 0).then_some(ts);
                     conv.apply_message(role, &v["message"]["content"]);
                 }
             }
         }
         break;
     }
+    // Back to live stamping — blocks appended after the replay are "now" again.
+    conv.clock = None;
     (conv, cwd)
 }
 
@@ -856,6 +946,12 @@ impl Driver {
         self.state.transcript_serial.load(Ordering::Acquire)
     }
 
+    /// Whether a now-relative time separator is on screen (see
+    /// [`Conv::has_relative_stamp`]); drives the panel's minute-tick repaint.
+    pub fn has_relative_stamp(&self, now: u64) -> bool {
+        self.state.conv.lock_recover().has_relative_stamp(now)
+    }
+
 
     pub fn status(&self) -> String {
         self.state.status.lock_recover().clone()
@@ -1297,5 +1393,50 @@ fn handle_control_request(state: &Arc<State>, v: &Value) {
             }));
         }
         _ => state.write_control_error(&request_id, "unsupported control request"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn serialize_marks_time_gaps_only() {
+        let mut c = Conv::new();
+        c.clock = Some(1_000_000);
+        c.push_user("first");
+        c.clock = Some(1_000_000 + 60); // 1 min later: no separator
+        c.append_role('a', "quick reply");
+        c.clock = Some(1_000_000 + 60 + TIME_GAP_SECS); // long lull: separator
+        c.push_user("after lunch");
+        let s = c.serialize();
+        let blocks: Vec<&str> = s.split(RS).collect();
+        // One separator opens the transcript; another marks the lull. The 1-min
+        // reply in between carries none. → [s, first, reply, s, after lunch].
+        assert_eq!(blocks.len(), 5, "opening + lull separators: {s:?}");
+        // Separators carry the raw stamp; the panel formats it at layout time.
+        assert_eq!(blocks[0], &format!("s{US}{}", 1_000_000), "opening: {:?}", blocks[0]);
+        let lull = format!("s{US}{}", 1_000_000 + 60 + TIME_GAP_SECS);
+        assert_eq!(blocks[3], &lull, "lull separator: {:?}", blocks[3]);
+        // The lull is fresh relative to "now" just after it → minute ticks on;
+        // past the tick window → off.
+        let stamp = 1_000_000 + 60 + TIME_GAP_SECS;
+        assert!(c.has_relative_stamp(stamp + 60));
+        assert!(!c.has_relative_stamp(stamp + RELATIVE_TICK_SECS + 60));
+    }
+
+    #[test]
+    fn serialize_skips_unknown_stamps() {
+        let mut c = Conv::new();
+        c.clock = Some(1_000_000);
+        c.push_user("stamped");
+        c.push_block('a', "unstamped".to_string());
+        c.stamps[1] = 0; // unknown: never participates in gap logic
+        c.clock = Some(1_000_000 + 2 * TIME_GAP_SECS);
+        c.push_user("much later");
+        let s = c.serialize();
+        // Opening separator + one for the gap measured stamped→stamped across the
+        // unknown block. → [s, stamped, unstamped, s, much later].
+        assert_eq!(s.split(RS).count(), 5, "{s:?}");
     }
 }

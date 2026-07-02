@@ -87,6 +87,7 @@ namespace Unterm.Editor
 
         private float _scroll; // physical px, 0 = latest
         private bool _selecting;       // dragging a transcript selection
+        private ulong _hoverStamp;     // unix stamp of the hovered time separator (0 = none)
         private bool _inputDragging;   // dragging an input-box selection
         private double _lastTouch;     // editor time of the last session-index bump (throttle)
 
@@ -119,6 +120,7 @@ namespace Unterm.Editor
 
         private void OnEnable()
         {
+            wantsMouseMove = true; // hover on transcript time separators
             s_reloading = false;
             AssemblyReloadEvents.beforeAssemblyReload += OnBeforeReload;
             EditorApplication.update += OnEditorUpdate;
@@ -631,6 +633,7 @@ namespace Unterm.Editor
                 // Native frame is top-down; Texture2D samples bottom-up, so flip V.
                 GUI.DrawTextureWithTexCoords(rect, _tex, new Rect(0, 1, 1, -1));
                 DrawScrollbar(rect);
+                DrawStampTooltip(rect);
             }
             else
             {
@@ -657,7 +660,10 @@ namespace Unterm.Editor
             if (_native == null || _viewId == 0) return;
             var e = Event.current;
             if (!rect.Contains(e.mousePosition) && e.type != EventType.MouseDrag && e.type != EventType.MouseUp)
+            {
+                if (_hoverStamp != 0) { _hoverStamp = 0; Repaint(); }
                 return;
+            }
 
             // The scrollbar strip belongs to DrawScrollbar's GUI.VerticalScrollbar;
             // don't swallow a click there or the bar can never be grabbed.
@@ -700,7 +706,46 @@ namespace Unterm.Editor
                     ShowContextMenu();
                     e.Use();
                     break;
+
+                case EventType.MouseMove:
+                {
+                    // Hovering a relative time separator reveals the exact time.
+                    ulong stamp = _native.AgentviewPanelStampAt(Vid, lx, ly);
+                    if (stamp != _hoverStamp) { _hoverStamp = stamp; Repaint(); }
+                    break;
+                }
             }
+        }
+
+        // The separator labels are relative ("5 minutes ago"); hovering one shows
+        // the absolute local time in a small box by the cursor.
+        private void DrawStampTooltip(Rect rect)
+        {
+            if (_hoverStamp == 0 || Event.current.type != EventType.Repaint) return;
+            var mp = Event.current.mousePosition;
+            if (!rect.Contains(mp)) return;
+            var local = DateTimeOffset.FromUnixTimeSeconds((long)_hoverStamp).ToLocalTime();
+            var content = new GUIContent(local.ToString("yyyy-MM-dd HH:mm"));
+            var label = EditorStyles.miniLabel;
+            var size = label.CalcSize(content);
+            const float padX = 6f, padY = 3f;
+            var r = new Rect(mp.x - size.x - padX * 2 - 8f, mp.y + 14f, size.x + padX * 2, size.y + padY * 2);
+            if (r.x < rect.x) r.x = mp.x + 12f;                 // flip right if clipped
+            if (r.yMax > rect.yMax) r.y = mp.y - r.height - 6f; // flip above if clipped
+            // EditorStyles.helpBox is translucent and lets the panel texture bleed
+            // through, so paint an opaque fill + 1px border ourselves, then the text.
+            bool pro = EditorGUIUtility.isProSkin;
+            EditorGUI.DrawRect(r, pro ? new Color(0.16f, 0.16f, 0.16f) : new Color(0.94f, 0.94f, 0.94f));
+            var border = pro ? new Color(0f, 0f, 0f, 0.6f) : new Color(0f, 0f, 0f, 0.25f);
+            EditorGUI.DrawRect(new Rect(r.x, r.y, r.width, 1f), border);
+            EditorGUI.DrawRect(new Rect(r.x, r.yMax - 1f, r.width, 1f), border);
+            EditorGUI.DrawRect(new Rect(r.x, r.y, 1f, r.height), border);
+            EditorGUI.DrawRect(new Rect(r.xMax - 1f, r.y, 1f, r.height), border);
+            var textRect = new Rect(r.x + padX, r.y + padY, size.x, size.y);
+            var prev = label.normal.textColor;
+            label.normal.textColor = pro ? new Color(0.85f, 0.85f, 0.85f) : new Color(0.1f, 0.1f, 0.1f);
+            GUI.Label(textRect, content, label);
+            label.normal.textColor = prev; // shared editor style: restore
         }
 
         private void ShowContextMenu()
@@ -1221,6 +1266,11 @@ namespace Unterm.Editor
             foreach (var s in sessions)
             {
                 string title = string.IsNullOrEmpty(s.title) ? "(untitled)" : s.title;
+                if (s.updated > 0 && _native != null)
+                {
+                    long unix = (s.updated - DateTime.UnixEpoch.Ticks) / TimeSpan.TicksPerSecond;
+                    if (unix > 0) title += " — " + _native.FormatRelative((ulong)unix);
+                }
                 string label = title.Replace('/', '∕');
                 // GenericMenu keys items by label, so same-titled conversations would
                 // collapse into one row. Append a zero-width space until the label is

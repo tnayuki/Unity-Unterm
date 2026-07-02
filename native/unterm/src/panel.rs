@@ -63,6 +63,8 @@ enum Role {
     /// An ExitPlanMode plan: Markdown like an agent block, but laid out in a
     /// capped-height, internally-scrollable box so a long plan can't dominate.
     Plan,
+    /// A time-gap separator ("+12 min" / "14:05"): small, dim, right-aligned.
+    Stamp,
 }
 
 impl Role {
@@ -73,6 +75,7 @@ impl Role {
             'x' => Role::Tool,
             'q' => Role::Queued,
             'p' => Role::Plan,
+            's' => Role::Stamp,
             _ => Role::Agent,
         }
     }
@@ -86,6 +89,9 @@ struct Block {
     role: Role,
     /// Header text (the folded view for a tool; the whole body otherwise).
     text: String,
+    /// Time separators only: the raw unix stamp behind the rendered label, kept
+    /// so hovering the label can reveal the exact time. 0 for every other role.
+    stamp: u64,
     /// Tool blocks only: the toolUseId (stable fold-state key), a short one-line
     /// input preview shown next to the header, and the unfolded detail (full input +
     /// result output). Empty/None for every other role.
@@ -108,6 +114,7 @@ struct Measured {
     table: Option<TableMeasured>, // a drawn grid of cells (overrides `buffer`)
     tool_key: Option<u64>, // tool blocks: fold-state key (click-to-toggle target)
     header_h: f32,         // tool blocks: height of the header line(s), for the hit rect
+    stamp: u64,            // time separators: raw unix stamp (0 otherwise)
 }
 
 /// A measured table: positioned cell buffers plus the grid-line/header rects to
@@ -141,6 +148,8 @@ struct LaidBlock {
     /// Content-hash key + max scroll, so the wheel handler can scroll this block.
     code_key: Option<u64>,
     max_hscroll: f32,
+    /// Time separators: raw unix stamp behind the label (0 otherwise), for hover.
+    stamp: u64,
 }
 
 /// A caret position: byte offset into block `block`'s text.
@@ -164,43 +173,65 @@ fn parse_blocks(text: &str) -> Vec<Block> {
         return vec![Block {
             role: Role::Agent,
             text: text.to_string(),
+            stamp: 0,
             tool_id: None,
             tool_preview: String::new(),
             tool_detail: String::new(),
         }];
     }
-    text.split(RS)
-        .filter(|s| !s.is_empty())
-        .map(|chunk| {
-            let mut it = chunk.splitn(2, US);
-            let tag = it.next().unwrap_or("a").chars().next().unwrap_or('a');
-            let body = it.next().unwrap_or("");
-            let role = Role::from_tag(tag);
-            // A tool body is `<id>{US}<header>{US}<preview>{US}<detail>` (see
-            // control::Conv); other roles carry their text verbatim.
-            if role == Role::Tool {
-                let mut f = body.splitn(4, US);
-                let id = f.next().unwrap_or("");
-                let header = f.next().unwrap_or("");
-                let preview = f.next().unwrap_or("");
-                let detail = f.next().unwrap_or("");
-                return Block {
-                    role,
-                    text: header.to_string(),
-                    tool_id: (!id.is_empty()).then(|| id.to_string()),
-                    tool_preview: preview.to_string(),
-                    tool_detail: detail.to_string(),
-                };
-            }
-            Block {
+    let now = crate::clock::now_secs();
+    // Consecutive separators that format to the *same* label (e.g. two lulls both
+    // "2 hours ago" once viewed from now) are redundant — drop all but the first,
+    // so a run of same-age groups merges. Tracked across intervening message
+    // blocks, since that's exactly when duplicates appear.
+    let mut last_stamp_label: Option<String> = None;
+    let mut out: Vec<Block> = Vec::new();
+    for chunk in text.split(RS).filter(|s| !s.is_empty()) {
+        let mut it = chunk.splitn(2, US);
+        let tag = it.next().unwrap_or("a").chars().next().unwrap_or('a');
+        let body = it.next().unwrap_or("");
+        let role = Role::from_tag(tag);
+        // A tool body is `<id>{US}<header>{US}<preview>{US}<detail>` (see
+        // control::Conv); other roles carry their text verbatim.
+        if role == Role::Tool {
+            let mut f = body.splitn(4, US);
+            let id = f.next().unwrap_or("");
+            let header = f.next().unwrap_or("");
+            let preview = f.next().unwrap_or("");
+            let detail = f.next().unwrap_or("");
+            out.push(Block {
                 role,
-                text: body.to_string(),
-                tool_id: None,
-                tool_preview: String::new(),
-                tool_detail: String::new(),
+                text: header.to_string(),
+                stamp: 0,
+                tool_id: (!id.is_empty()).then(|| id.to_string()),
+                tool_preview: preview.to_string(),
+                tool_detail: detail.to_string(),
+            });
+            continue;
+        }
+        // A time-gap separator carries its raw unix stamp; format it against the
+        // clock here so a "12 min ago" label ages with the display while the
+        // serialized transcript stays memoizable.
+        if role == Role::Stamp {
+            let stamp = body.trim().parse::<u64>().unwrap_or(0);
+            let label = crate::clock::format_relative(stamp, now);
+            if last_stamp_label.as_deref() == Some(label.as_str()) {
+                continue; // same time as the previous separator → merge
             }
-        })
-        .collect()
+            last_stamp_label = Some(label.clone());
+            out.push(Block { role, text: label, stamp, tool_id: None, tool_preview: String::new(), tool_detail: String::new() });
+            continue;
+        }
+        out.push(Block {
+            role,
+            text: body.to_string(),
+            stamp: 0,
+            tool_id: None,
+            tool_preview: String::new(),
+            tool_detail: String::new(),
+        });
+    }
+    out
 }
 
 pub struct PanelRenderer {
@@ -704,6 +735,23 @@ impl PanelRenderer {
         self.shared.raw_texture()
     }
 
+    /// The unix stamp of the time separator under (`x`, `y`) in physical px, or 0
+    /// when the point isn't over one — lets the host reveal the exact time on
+    /// hover (the rendered label is only relative).
+    pub fn stamp_at(&self, x: f32, y: f32) -> u64 {
+        for l in &self.laid {
+            if l.stamp == 0 {
+                continue;
+            }
+            let w = measure_width(&l.buffer);
+            let h = measure_height(&l.buffer);
+            if x >= l.tx && x <= l.tx + w && y >= l.ty && y <= l.ty + h {
+                return l.stamp;
+            }
+        }
+        0
+    }
+
     pub fn resize(&mut self, width: u32, height: u32) {
         let width = width.max(1);
         let height = height.max(1);
@@ -752,6 +800,9 @@ impl PanelRenderer {
         // The render target's identity: resize and the Windows placeholder→shared
         // upgrade both hand out a new texture that must be drawn to.
         (self.shared.raw_texture() as usize).hash(&mut h);
+        // Time-gap labels format against the clock at layout time ("12 min ago"),
+        // so the key rolls once a minute — a same-minute repaint still skips.
+        (crate::clock::now_secs() / 60).hash(&mut h);
         h.finish()
     }
 
@@ -910,9 +961,17 @@ impl PanelRenderer {
                 m.header_h = header_h;
                 vec![m]
             } else {
-                vec![build_plain(
+                let mut m = build_plain(
                     &mut fs, b, content_w, font_size, line_height, card_pad, faces.regular, text_color,
-                )]
+                );
+                // Timestamp separators sit at the right edge: `indent` shifts a
+                // block's left edge, so indent by the leftover width. Keep the raw
+                // stamp on the item so hovering the label can reveal the exact time.
+                if matches!(b.role, Role::Stamp) {
+                    m.indent = (content_w - measure_width(&m.buffer)).max(0.0);
+                    m.stamp = b.stamp;
+                }
+                vec![m]
             };
 
             if b.role == Role::Plan {
@@ -1062,13 +1121,13 @@ impl PanelRenderer {
                         for c in &tbl.cells {
                             self.laid.push(LaidBlock {
                                 buffer: c.buffer.clone(), text: c.text.clone(), tx: tx + c.dx, ty: plan_y + c.dy,
-                                hscroll: 0.0, clip: Some(clip), code_key: None, max_hscroll: 0.0,
+                                hscroll: 0.0, clip: Some(clip), code_key: None, max_hscroll: 0.0, stamp: 0,
                             });
                         }
                     } else {
                         self.laid.push(LaidBlock {
                             buffer: m.buffer.clone(), text: m.text.clone(), tx, ty: plan_y,
-                            hscroll: 0.0, clip: Some(clip), code_key: None, max_hscroll: 0.0,
+                            hscroll: 0.0, clip: Some(clip), code_key: None, max_hscroll: 0.0, stamp: 0,
                         });
                     }
                     plan_y += m.height + gap;
@@ -1121,6 +1180,7 @@ impl PanelRenderer {
                         clip: None,
                         code_key: None,
                         max_hscroll: 0.0,
+                        stamp: 0,
                     });
                 }
                 y += m.height + gap;
@@ -1195,6 +1255,7 @@ impl PanelRenderer {
                 clip,
                 code_key,
                 max_hscroll,
+                stamp: m.stamp,
             });
             y += m.height + gap;
         }
@@ -1442,7 +1503,15 @@ fn build_plain(
         Role::Thought => dim(text_color, 150),
         Role::Tool => dim(text_color, 205),
         Role::Queued => dim(text_color, 120),
+        Role::Stamp => dim(text_color, 130),
         _ => text_color,
+    };
+    // Timestamp separators render small (tool-preview size) so they read as
+    // metadata, not conversation.
+    let (font_size, line_height) = if matches!(b.role, Role::Stamp) {
+        (font_size * 0.84, line_height * 0.84)
+    } else {
+        (font_size, line_height)
     };
     let mut buffer = Buffer::new(fs, Metrics::new(font_size, line_height));
     buffer.set_size(fs, Some(inner_w.max(1.0)), None);
@@ -1474,6 +1543,7 @@ fn build_plain(
         table: None,
         tool_key: None,
         header_h: 0.0,
+        stamp: 0,
     }
 }
 
@@ -1536,6 +1606,7 @@ fn build_tool(
         table: None,
         tool_key: None,
         header_h: 0.0,
+        stamp: 0,
     }
 }
 
@@ -1610,7 +1681,7 @@ fn build_md(
             let (buffer, text) =
                 shape_spans(fs, spans, content_w, font_size, line_height, false, text_color, faces);
             let height = measure_height(&buffer);
-            Some(Measured { buffer: Arc::new(buffer), text, height, card_alpha: 0.0, indent: 0.0, code: false, natural_w: 0.0, table: None, tool_key: None, header_h: 0.0 })
+            Some(Measured { buffer: Arc::new(buffer), text, height, card_alpha: 0.0, indent: 0.0, code: false, natural_w: 0.0, table: None, tool_key: None, header_h: 0.0, stamp: 0 })
         }
         MB::Heading { level, spans } => {
             let scale = match level {
@@ -1630,7 +1701,7 @@ fn build_md(
                 faces,
             );
             let height = measure_height(&buffer);
-            Some(Measured { buffer: Arc::new(buffer), text, height, card_alpha: 0.0, indent: 0.0, code: false, natural_w: 0.0, table: None, tool_key: None, header_h: 0.0 })
+            Some(Measured { buffer: Arc::new(buffer), text, height, card_alpha: 0.0, indent: 0.0, code: false, natural_w: 0.0, table: None, tool_key: None, header_h: 0.0, stamp: 0 })
         }
         MB::Code { text, lang, diff } => {
             // Code is rendered unwrapped and clipped to the card; the panel
@@ -1696,6 +1767,7 @@ fn build_md(
                 text: text.clone(),
                 height,
                 card_alpha: 0.08,
+                stamp: 0,
                 indent: 0.0,
                 code: true,
                 natural_w,
@@ -1723,7 +1795,7 @@ fn build_md(
                 faces,
             );
             let height = measure_height(&buffer);
-            Some(Measured { buffer: Arc::new(buffer), text, height, card_alpha: 0.0, indent, code: false, natural_w: 0.0, table: None, tool_key: None, header_h: 0.0 })
+            Some(Measured { buffer: Arc::new(buffer), text, height, card_alpha: 0.0, indent, code: false, natural_w: 0.0, table: None, tool_key: None, header_h: 0.0, stamp: 0 })
         }
         MB::Quote(spans) => {
             let indent = font_size;
@@ -1738,7 +1810,7 @@ fn build_md(
                 faces,
             );
             let height = measure_height(&buffer);
-            Some(Measured { buffer: Arc::new(buffer), text, height, card_alpha: 0.0, indent, code: false, natural_w: 0.0, table: None, tool_key: None, header_h: 0.0 })
+            Some(Measured { buffer: Arc::new(buffer), text, height, card_alpha: 0.0, indent, code: false, natural_w: 0.0, table: None, tool_key: None, header_h: 0.0, stamp: 0 })
         }
         MB::Table { headers, rows } => {
             build_table(fs, headers, rows, content_w, font_size, line_height, faces, text_color)
@@ -1863,6 +1935,7 @@ fn build_table(
         }),
         tool_key: None,
         header_h: 0.0,
+        stamp: 0,
     })
 }
 
