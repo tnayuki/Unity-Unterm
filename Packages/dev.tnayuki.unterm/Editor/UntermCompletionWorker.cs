@@ -1,5 +1,7 @@
+using System;
 using System.Collections.Generic;
 using System.Threading;
+using UnityEditor;
 
 namespace Unterm.Editor
 {
@@ -26,6 +28,27 @@ namespace Unterm.Editor
 
         private static readonly AutoResetEvent s_signal = new AutoResetEvent(false);
         private static Thread s_thread;
+        private static volatile bool s_stop;
+
+        // Stop the worker before the domain reloads: without this the background
+        // thread is left to be aborted mid-analysis and the AutoResetEvent leaks its
+        // OS handle. Signalled once; re-entrant Submits in the fresh domain get a
+        // clean thread because the statics are reset by the reload.
+        [InitializeOnLoadMethod]
+        private static void RegisterShutdown()
+        {
+            AssemblyReloadEvents.beforeAssemblyReload += Shutdown;
+        }
+
+        private static void Shutdown()
+        {
+            s_stop = true;
+            s_signal.Set();
+            // Only dispose the event once the loop has actually exited — disposing it
+            // out from under a blocked WaitOne would throw on the worker thread.
+            if (s_thread != null && s_thread.Join(500))
+                s_signal.Dispose();
+        }
 
         /// Queue a completion request (overwriting any not-yet-started one) and return
         /// its sequence number. The reference set must already be built on the main
@@ -74,6 +97,7 @@ namespace Unterm.Editor
             while (true)
             {
                 s_signal.WaitOne();
+                if (s_stop) return;
                 // Drain: always process the LATEST pending request; if newer ones
                 // arrive while computing, the slot holds only the newest, so older
                 // ones are coalesced away.
@@ -99,7 +123,7 @@ namespace Unterm.Editor
                             default: r = UntermRoslynCompletion.GeneralCompletions(req.Text, req.Pos); break;
                         }
                     }
-                    catch { r = null; }
+                    catch (Exception e) { r = null; UntermLog.WarnOnce("completion.worker", e); }
                     lock (s_outLock)
                     {
                         s_resultSeq = req.Seq;

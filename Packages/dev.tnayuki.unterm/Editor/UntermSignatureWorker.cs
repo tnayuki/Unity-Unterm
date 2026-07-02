@@ -1,4 +1,6 @@
+using System;
 using System.Threading;
+using UnityEditor;
 
 namespace Unterm.Editor
 {
@@ -23,6 +25,24 @@ namespace Unterm.Editor
 
         private static readonly AutoResetEvent s_signal = new AutoResetEvent(false);
         private static Thread s_thread;
+        private static volatile bool s_stop;
+
+        // Stop the worker before the domain reloads so its thread isn't aborted
+        // mid-analysis and the AutoResetEvent doesn't leak its OS handle. See the
+        // matching note in UntermCompletionWorker.
+        [InitializeOnLoadMethod]
+        private static void RegisterShutdown()
+        {
+            AssemblyReloadEvents.beforeAssemblyReload += Shutdown;
+        }
+
+        private static void Shutdown()
+        {
+            s_stop = true;
+            s_signal.Set();
+            if (s_thread != null && s_thread.Join(500))
+                s_signal.Dispose();
+        }
 
         public static long Submit(string text, int pos)
         {
@@ -66,6 +86,7 @@ namespace Unterm.Editor
             while (true)
             {
                 s_signal.WaitOne();
+                if (s_stop) return;
                 while (true)
                 {
                     Request req;
@@ -77,7 +98,7 @@ namespace Unterm.Editor
                     }
                     UntermRoslynCompletion.SigHelp r;
                     try { r = UntermRoslynCompletion.SignatureHelp(req.Text, req.Pos); }
-                    catch { r = null; }
+                    catch (Exception e) { r = null; UntermLog.WarnOnce("signature.worker", e); }
                     lock (s_outLock)
                     {
                         s_resultSeq = req.Seq;
