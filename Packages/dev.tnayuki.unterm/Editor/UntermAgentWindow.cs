@@ -68,7 +68,7 @@ namespace Unterm.Editor
         [SerializeField] private bool _reconnectPending;
 
         private static readonly string[] s_modes =
-            { "default", "plan", "acceptEdits", "bypassPermissions" };
+            { "default", "auto", "plan", "acceptEdits", "bypassPermissions" };
 
         // Claude session ids currently driven by some agent window in this editor
         // process. The picker greys out (non-selectable, no label) a session open
@@ -1410,13 +1410,25 @@ namespace Unterm.Editor
         private void CyclePermissionMode()
         {
             int i = Array.IndexOf(s_modes, _permissionMode);
-            SetPermissionMode(s_modes[(i + 1) % s_modes.Length]);
+            // Skip "auto" when the current model doesn't support it (else Shift+Tab
+            // would land on a mode the engine ignores).
+            for (int step = 1; step <= s_modes.Length; step++)
+            {
+                string next = s_modes[(i + step) % s_modes.Length];
+                if (next == "auto" && !CurrentModelSupportsAuto()) continue;
+                SetPermissionMode(next);
+                return;
+            }
         }
 
         private void SetModelSelection(string model)
         {
             _modelSelection = model ?? "";
             if (_native != null && _viewId != 0) _native.AgentviewSetModel(Vid, _modelSelection);
+            // Clamp: "auto" isn't valid on a model that doesn't support it (e.g. Haiku),
+            // so drop back to "default" when switching to one — as the Zed adapter does.
+            if (_permissionMode == "auto" && !CurrentModelSupportsAuto())
+                SetPermissionMode("default");
             Repaint();
         }
 
@@ -1448,6 +1460,7 @@ namespace Unterm.Editor
 
         private string ModeLabel() => _permissionMode switch
         {
+            "auto" => "Auto",
             "plan" => "Plan",
             "acceptEdits" => "Accept",
             "bypassPermissions" => "Bypass",
@@ -1480,10 +1493,22 @@ namespace Unterm.Editor
             return v;
         }
 
+        // Whether the current model advertises auto permission mode (Fable/Opus yes,
+        // Haiku no). The engine reports this per model in the roster; gate the "Auto"
+        // mode on it the way the Zed adapter does. False until the roster loads.
+        private bool CurrentModelSupportsAuto()
+        {
+            string sel = string.IsNullOrEmpty(_modelSelection) ? "default" : _modelSelection;
+            foreach (var mi in Models())
+                if (ModelKey(mi.value) == ModelKey(sel))
+                    return mi.supportsAutoMode;
+            return false;
+        }
+
         // One entry of the engine's advertised model roster (extra fields like
         // supportedEffortLevels are present in the JSON but unused here — JsonUtility
         // ignores them).
-        [Serializable] private struct ModelInfo { public string value; public string displayName; }
+        [Serializable] private struct ModelInfo { public string value; public string displayName; public bool supportsAutoMode; }
         [Serializable] private struct ModelList { public ModelInfo[] items; }
 
         private string _modelsJson;
@@ -1676,6 +1701,10 @@ namespace Unterm.Editor
         {
             var m = new GenericMenu();
             m.AddItem(new GUIContent("Default (ask)"), _permissionMode == "default", () => SetPermissionMode("default"));
+            // "Auto" (a model classifier approves/denies prompts) only works on models
+            // that advertise it — offer it only there, like the Zed adapter.
+            if (CurrentModelSupportsAuto())
+                m.AddItem(new GUIContent("Auto"), _permissionMode == "auto", () => SetPermissionMode("auto"));
             m.AddItem(new GUIContent("Plan"), _permissionMode == "plan", () => SetPermissionMode("plan"));
             m.AddItem(new GUIContent("Accept edits"), _permissionMode == "acceptEdits", () => SetPermissionMode("acceptEdits"));
             m.AddItem(new GUIContent("Bypass permissions"), _permissionMode == "bypassPermissions", () => SetPermissionMode("bypassPermissions"));
