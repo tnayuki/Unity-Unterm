@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-07-03
+
 ### Added
 
 - The Claude Code agent now offers the **Auto** permission mode (a model classifier approves or denies each permission prompt), in the mode dropdown and the Shift+Tab cycle. It's offered only on models that advertise support for it (per the engine's roster — e.g. not Haiku), and switching to an unsupported model drops the session back to Default.
