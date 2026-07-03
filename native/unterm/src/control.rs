@@ -512,7 +512,6 @@ enum Pending {
         tool_name: String,
         input: Value,
         title: String,
-        detail: String,
     },
     /// An `AskUserQuestion` tool call: the questions are presented one at a time,
     /// answers accumulate, and the whole set is returned at once. stdio mode never
@@ -1033,12 +1032,10 @@ impl Driver {
     pub fn pending_view(&self) -> Option<(String, Vec<(String, String, String)>)> {
         let guard = self.state.pending.lock_recover();
         match guard.as_ref()? {
-            Pending::Permission { title, detail, .. } => {
-                let body = if detail.is_empty() {
-                    format!("Permission requested: {title}")
-                } else {
-                    format!("Permission requested: {title}\n{detail}")
-                };
+            Pending::Permission { title, .. } => {
+                // Just the tool name: the command is already shown (and expandable) in
+                // the tool block right above, so repeating it here reads as a duplicate.
+                let body = format!("Permission requested: {title}");
                 let opts = [
                     ("allow_once", "Allow"),
                     ("allow_always", "Always allow"),
@@ -1425,13 +1422,11 @@ fn handle_control_request(state: &Arc<State>, v: &Value) {
             if let Some(allow) = remembered {
                 state.write_permission(&request_id, allow, &input);
             } else {
-                let detail = describe_tool(&input);
                 *state.pending.lock_recover() = Some(Pending::Permission {
                     request_id,
                     tool_name,
                     input,
                     title,
-                    detail,
                 });
             }
         }

@@ -210,7 +210,10 @@ impl AgentView {
             if let Some(plan) = d.pending_plan() {
                 push_plan(&mut text, &plan);
             }
-            push_note(&mut text, &title);
+            // A distinct card, not dim status text — and no "Thinking" indicator: the
+            // session is blocked on the user's decision, not thinking.
+            push_notice(&mut text, &title);
+            return text;
         }
         let status = d.status();
         let label = match status.as_str() {
@@ -534,6 +537,15 @@ impl AgentView {
 fn push_note(text: &mut String, body: &str) {
     text.push(RS);
     text.push('t');
+    text.push(US);
+    text.push_str(body);
+}
+
+/// A pending-permission request: a full-colour `Notice` card (see [`Role::Notice`]),
+/// so it stands out as an actionable prompt rather than dim status text.
+fn push_notice(text: &mut String, body: &str) {
+    text.push(RS);
+    text.push('n');
     text.push(US);
     text.push_str(body);
 }

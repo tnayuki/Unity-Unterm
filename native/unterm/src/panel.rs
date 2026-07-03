@@ -65,6 +65,9 @@ enum Role {
     Plan,
     /// A time-gap separator ("+12 min" / "14:05"): small, dim, right-aligned.
     Stamp,
+    /// A pending-permission request awaiting the user: a full-colour card so it
+    /// reads as an actionable prompt, not dim status text.
+    Notice,
 }
 
 impl Role {
@@ -76,12 +79,13 @@ impl Role {
             'q' => Role::Queued,
             'p' => Role::Plan,
             's' => Role::Stamp,
+            'n' => Role::Notice,
             _ => Role::Agent,
         }
     }
     /// Whether the block gets a card background.
     fn carded(self) -> bool {
-        matches!(self, Role::User | Role::Tool | Role::Queued)
+        matches!(self, Role::User | Role::Tool | Role::Queued | Role::Notice)
     }
 }
 
@@ -1526,6 +1530,7 @@ fn build_plain(
     buffer.shape_until_scroll(fs, false);
     let text_h = measure_height(&buffer);
     let card_alpha = match b.role {
+        Role::Notice => 0.14,
         Role::User => 0.10,
         Role::Tool => 0.06,
         Role::Queued => 0.05,
