@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- The Claude Code agent composer now honours the same caret-navigation shortcuts as the code editor — word-wise motion (⌥←/→, Ctrl+←/→ on Windows/Linux), line and document ends (⌘←/→, ⌘↑/↓, Home/End), and word / line deletion (⌥/⌘+Backspace, ⌥+Delete) — which were already wired up in the editor but had been missed in the composer.
+
 ## [0.5.1] - 2026-07-04
 
 ### Fixed

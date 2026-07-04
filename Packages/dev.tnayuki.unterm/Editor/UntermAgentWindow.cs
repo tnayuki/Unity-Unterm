@@ -943,6 +943,38 @@ namespace Unterm.Editor
                 }
             }
 
+            // Caret motion: arrows / Home / End, plus modifier combos (word, line
+            // start/end, document start/end, page) — same shortcuts as the code
+            // editor. Resolved per-platform, then forwarded as a semantic name.
+            string motion = ResolveMotion(e);
+            if (motion != null)
+            {
+                _native.AgentviewInputKey(Vid, motion, e.control, e.alt, e.shift);
+                RenderView(); Repaint(); e.Use();
+                return;
+            }
+
+            // Word / line deletion. macOS: Option+Backspace = delete word, Cmd+
+            // Backspace = delete to line start, Option+Delete = delete word forward.
+            // Windows/Linux: Ctrl+Backspace/Delete = delete word.
+            if (e.keyCode == KeyCode.Backspace && (e.alt || e.command || e.control))
+            {
+#if UNITY_EDITOR_OSX
+                string n = e.command ? "DeleteToLineStart" : "DeleteWordBack";
+#else
+                string n = "DeleteWordBack";
+#endif
+                _native.AgentviewInputKey(Vid, n, e.control, e.alt, e.shift);
+                RenderView(); Repaint(); e.Use();
+                return;
+            }
+            if (e.keyCode == KeyCode.Delete && (e.alt || e.control))
+            {
+                _native.AgentviewInputKey(Vid, "DeleteWordForward", e.control, e.alt, e.shift);
+                RenderView(); Repaint(); e.Use();
+                return;
+            }
+
             // Enter/editing keys: hand them to Rust (Enter=send, Shift+Enter=newline,
             // the rest are caret/edit operations). Plain printable input is left to
             // the hidden IME field.
@@ -952,12 +984,6 @@ namespace Unterm.Editor
                 KeyCode.KeypadEnter => "Return",
                 KeyCode.Backspace => "Backspace",
                 KeyCode.Delete => "Delete",
-                KeyCode.LeftArrow => "LeftArrow",
-                KeyCode.RightArrow => "RightArrow",
-                KeyCode.UpArrow => "UpArrow",
-                KeyCode.DownArrow => "DownArrow",
-                KeyCode.Home => "Home",
-                KeyCode.End => "End",
                 _ => null,
             };
             if (name != null)
@@ -969,6 +995,45 @@ namespace Unterm.Editor
                 e.Use();
                 return;
             }
+        }
+
+        // Map an arrow/Home/End keystroke (with modifiers) to a semantic motion name
+        // the composer understands — the same shortcuts as the code editor. Returns
+        // null for non-motion keys. macOS: Cmd+←/→ = line start/end, Cmd+↑/↓ =
+        // document start/end, Option+←/→ = word. Windows/Linux: Ctrl+←/→ = word,
+        // Ctrl+Home/End = document.
+        private static string ResolveMotion(Event e)
+        {
+#if UNITY_EDITOR_OSX
+            bool word = e.alt;
+            bool ends = e.command;
+            switch (e.keyCode)
+            {
+                case KeyCode.LeftArrow:  return word ? "WordLeft"  : ends ? "LineStart" : "LeftArrow";
+                case KeyCode.RightArrow: return word ? "WordRight" : ends ? "LineEnd"   : "RightArrow";
+                case KeyCode.UpArrow:    return ends ? "DocStart" : "UpArrow";
+                case KeyCode.DownArrow:  return ends ? "DocEnd"   : "DownArrow";
+                case KeyCode.Home:       return "LineStart";
+                case KeyCode.End:        return "LineEnd";
+                case KeyCode.PageUp:     return "PageUp";
+                case KeyCode.PageDown:   return "PageDown";
+                default: return null;
+            }
+#else
+            bool word = e.control;
+            switch (e.keyCode)
+            {
+                case KeyCode.LeftArrow:  return word ? "WordLeft"  : "LeftArrow";
+                case KeyCode.RightArrow: return word ? "WordRight" : "RightArrow";
+                case KeyCode.UpArrow:    return "UpArrow";
+                case KeyCode.DownArrow:  return "DownArrow";
+                case KeyCode.Home:       return e.control ? "DocStart" : "LineStart";
+                case KeyCode.End:        return e.control ? "DocEnd"   : "LineEnd";
+                case KeyCode.PageUp:     return "PageUp";
+                case KeyCode.PageDown:   return "PageDown";
+                default: return null;
+            }
+#endif
         }
 
         // Mouse on the input strip: click places the caret (or hits the Send/Stop
