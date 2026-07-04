@@ -130,6 +130,7 @@ namespace Unterm.Editor
         private void OnFocus()
         {
             _refocus = true; // re-park the IME field on the caret for typing
+            if (_native != null && _viewId != 0) { _native.AgentviewSetFocus(Vid, true); RenderView(measureInput: false); Repaint(); }
 #if UNITY_EDITOR_WIN
             // The Windows editor doesn't auto-engage the OS IME for a custom IMGUI
             // window (Auto leaves it off here), so Japanese/CJK composition never
@@ -153,6 +154,7 @@ namespace Unterm.Editor
             // The `/`-completion popup is a separate OS window — dismiss it when this
             // window loses focus so it doesn't linger over other editors.
             CloseSlash();
+            if (_native != null && _viewId != 0) { _native.AgentviewSetFocus(Vid, false); RenderView(measureInput: false); Repaint(); }
 #if UNITY_EDITOR_WIN
             Input.imeCompositionMode = IMECompositionMode.Auto;
 #endif
@@ -1164,6 +1166,12 @@ namespace Unterm.Editor
         private void DrawImeField(Rect stripRect)
         {
             if (_native == null || _viewId == 0) return;
+            // No keyboard focus → skip the hidden IME field entirely. It only exists
+            // to anchor composition and receive typing (both need focus), and its
+            // transparent-text TextField still draws a thin text cursor at the caret —
+            // which must not linger on a background (unfocused) window.
+            if (focusedWindow != this && !_composing && string.IsNullOrEmpty(Input.compositionString))
+                return;
             float ppp = EditorGUIUtility.pixelsPerPoint;
             _native.AgentviewCaret(Vid, out float cx, out float cy, out float _, out float chh);
             float gx = stripRect.x + cx / ppp;

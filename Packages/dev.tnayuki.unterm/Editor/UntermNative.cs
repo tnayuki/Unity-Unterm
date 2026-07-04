@@ -162,7 +162,7 @@ namespace Unterm.Editor
         private AvDownFn _avPanelDown; private AvDragFn _avPanelDrag; private AvScrollHFn _avPanelScrollH; private AvScrollHFn _avPanelScrollV;
         private AvVoidFn _avPanelSelectAll; private AvVoidFn _avPanelSelectClear; private AvBoolFn _avPanelHasSelection; private AvBufFn _avPanelSelectedText;
         private AvBoolFn _avThinking;
-        private AvInputDownFn _avInputDown; private AvDragFn _avInputDrag; private AvInputKeyFn _avInputKey;
+        private AvInputDownFn _avInputDown; private AvDragFn _avInputDrag; private AvInputKeyFn _avInputKey; private SetFocusFn _avSetFocus;
         private AvStrFn _avInputInsert; private AvStrFn _avInputSetPreedit; private AvVoidFn _avInputUndo; private AvVoidFn _avInputRedo; private AvVoidFn _avInputSelectAll;
         private AvBufFn _avInputCopy; private AvBufFn _avInputCut; private AvBufFn _avInputText;
         // Code editor view bindings (reusing several Av*/terminal delegate shapes).
@@ -171,7 +171,7 @@ namespace Unterm.Editor
         private AvUintSetFn _edSetUndoLimit;
         private AvVoidFn _edRender; private AvPtrFn _edRawTexture; private AvFloatFn _edContentHeight; private AvCaretFn _edCaret;
         private U64IdFn _edEditSerial;
-        private AvInputKeyFn _edKey; private AvStrFn _edInsert; private AvStrFn _edSetPreedit; private AvStrFn _edSetText; private AvStrFn _edAddUsing;
+        private AvInputKeyFn _edKey; private SetFocusFn _edSetFocus; private AvStrFn _edInsert; private AvStrFn _edSetPreedit; private AvStrFn _edSetText; private AvStrFn _edAddUsing;
         private AvBufFn _edText; private AvVoidFn _edUndo; private AvVoidFn _edRedo; private AvVoidFn _edSelectAll;
         private AvBufFn _edCopy; private AvBufFn _edCut; private EdMouseFn _edMouse; private AvF1Fn _edScroll;
         private AvF1Fn _edSetScroll; private AvFloatFn _edScrollOffset; private AvF1Fn _edScrollH;
@@ -303,6 +303,7 @@ namespace Unterm.Editor
             _avInputDown = Sym<AvInputDownFn>("unterm_agentview_input_down");
             _avInputDrag = Sym<AvDragFn>("unterm_agentview_input_drag");
             _avInputKey = Sym<AvInputKeyFn>("unterm_agentview_input_key");
+            _avSetFocus = Sym<SetFocusFn>("unterm_agentview_set_focus");
             _avInputInsert = Sym<AvStrFn>("unterm_agentview_input_insert");
             _avInputSetPreedit = Sym<AvStrFn>("unterm_agentview_input_set_preedit");
             _avInputUndo = Sym<AvVoidFn>("unterm_agentview_input_undo");
@@ -327,6 +328,7 @@ namespace Unterm.Editor
             _edEditSerial = Sym<U64IdFn>("unterm_editor_edit_serial");
             _edCaret = Sym<AvCaretFn>("unterm_editor_caret");
             _edKey = Sym<AvInputKeyFn>("unterm_editor_key");
+            _edSetFocus = Sym<SetFocusFn>("unterm_editor_set_focus");
             _edInsert = Sym<AvStrFn>("unterm_editor_insert");
             _edSetPreedit = Sym<AvStrFn>("unterm_editor_set_preedit");
             _edSetText = Sym<AvStrFn>("unterm_editor_set_text");
@@ -535,6 +537,8 @@ namespace Unterm.Editor
         /// Enter sends, Shift+Enter newlines, the rest edits — all handled in Rust.
         public void AgentviewInputKey(ulong id, string name, bool ctrl, bool alt, bool shift) =>
             _avInputKey(id, name ?? string.Empty, ctrl, alt, shift);
+        /// Host keyboard focus for the composer; hides the caret while unfocused.
+        public void AgentviewSetFocus(ulong id, bool focused) => _avSetFocus(id, focused);
         public void AgentviewInputInsert(ulong id, string text) { if (!string.IsNullOrEmpty(text)) _avInputInsert(id, text); }
         public void AgentviewInputSetPreedit(ulong id, string text) => _avInputSetPreedit(id, text ?? "");
         public void AgentviewInputUndo(ulong id) => _avInputUndo(id);
@@ -565,6 +569,8 @@ namespace Unterm.Editor
             _edCaret(id, out x, out y, out w, out h);
         public void EditorKey(ulong id, string name, bool ctrl, bool alt, bool shift) =>
             _edKey(id, name ?? string.Empty, ctrl, alt, shift);
+        /// Host keyboard focus for the code editor; hides the caret while unfocused.
+        public void EditorSetFocus(ulong id, bool focused) => _edSetFocus(id, focused);
         public void EditorInsert(ulong id, string text) { if (!string.IsNullOrEmpty(text)) _edInsert(id, text); }
         public void EditorSetPreedit(ulong id, string text) => _edSetPreedit(id, text ?? "");
         public void EditorSetText(ulong id, string text) => _edSetText(id, text ?? string.Empty);
@@ -646,12 +652,12 @@ namespace Unterm.Editor
             _avPanelDown = null; _avPanelDrag = null; _avPanelScrollH = null; _avPanelScrollV = null;
             _avPanelSelectAll = null; _avPanelSelectClear = null; _avPanelHasSelection = null; _avPanelSelectedText = null;
             _avThinking = null;
-            _avInputDown = null; _avInputDrag = null; _avInputKey = null;
+            _avInputDown = null; _avInputDrag = null; _avInputKey = null; _avSetFocus = null;
             _avInputInsert = null; _avInputSetPreedit = null; _avInputUndo = null; _avInputRedo = null; _avInputSelectAll = null;
             _avInputCopy = null; _avInputCut = null; _avInputText = null;
             _edCreate = null; _edExists = null; _edDestroy = null; _edResize = null; _edSetScale = null; _edSetUndoLimit = null;
             _edSetFont = null; _edSetTheme = null; _edSetLanguage = null; _edRender = null; _edRawTexture = null;
-            _edContentHeight = null; _edEditSerial = null; _edCaret = null; _edKey = null; _edInsert = null; _edSetPreedit = null;
+            _edContentHeight = null; _edEditSerial = null; _edCaret = null; _edKey = null; _edSetFocus = null; _edInsert = null; _edSetPreedit = null;
             _edSetText = null; _edAddUsing = null; _edText = null; _edUndo = null; _edRedo = null; _edSelectAll = null;
             _edCopy = null; _edCut = null; _edMouse = null; _edScroll = null;
             _edSetScroll = null; _edScrollOffset = null; _edScrollH = null; _edIndent = null; _edOutdent = null;

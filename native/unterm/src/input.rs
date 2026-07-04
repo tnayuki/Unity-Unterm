@@ -91,6 +91,9 @@ pub struct InputBox {
     gutter_px: f32,
     /// Cached gutter number buffers (see [`GutterCache`]).
     gutter_cache: GutterCache,
+    /// Whether the host window owns keyboard focus. The caret is only drawn while
+    /// focused, so an unfocused input box (background editor window) shows no caret.
+    focused: bool,
     /// Code-editor behaviors: no word-wrap (+ horizontal scroll), auto-indent,
     /// auto-close brackets, current-line + matching-bracket highlight, smart Home.
     code_mode: bool,
@@ -185,6 +188,7 @@ impl InputBox {
             gutter: false,
             gutter_px: 0.0,
             gutter_cache: GutterCache::default(),
+            focused: true,
             code_mode: false,
             scroll_h: 0.0,
             caret_dirty: true,
@@ -337,6 +341,12 @@ impl InputBox {
     /// auto-close brackets, current-line + matching-bracket highlight, smart Home).
     pub fn set_code_mode(&mut self, on: bool) {
         self.code_mode = on;
+    }
+
+    /// Host keyboard focus. The caret is hidden while unfocused, so a background
+    /// editor window doesn't show a stray blinking-position bar.
+    pub fn set_focused(&mut self, on: bool) {
+        self.focused = on;
     }
 
     /// Set the absolute vertical scroll (px); the next render clamps it.
@@ -1493,8 +1503,9 @@ impl InputBox {
             }
         }
 
-        // Caret quad from the editor's cursor position (buffer-relative px).
-        if let Some((cx, cy)) = self.editor.cursor_position() {
+        // Caret quad from the editor's cursor position (buffer-relative px). Only
+        // while the host window has focus — an unfocused input box shows no caret.
+        if let Some((cx, cy)) = self.editor.cursor_position().filter(|_| self.focused) {
             let x = text_left + cx as f32 - hoff;
             let y = pad + cy as f32;
             self.caret = [x, y, 2.0 * s, line_height];

@@ -88,6 +88,10 @@ impl EditorView {
         self.edit.caret_rect()
     }
 
+    pub fn set_focused(&mut self, focused: bool) {
+        self.edit.set_focused(focused);
+    }
+
     pub fn key(&mut self, name: &str, ctrl: bool, alt: bool, shift: bool) {
         self.edit.key(name, ctrl, alt, shift);
     }

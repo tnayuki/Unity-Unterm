@@ -394,6 +394,7 @@ namespace Unterm.Editor
         private void OnFocus()
         {
             _refocus = true;
+            if (_native != null && _editorId != 0) { _native.EditorSetFocus(Eid, true); RenderView(); Repaint(); }
 #if UNITY_EDITOR_WIN
             Input.imeCompositionMode = IMECompositionMode.On;
 #endif
@@ -403,6 +404,7 @@ namespace Unterm.Editor
 
         private void OnLostFocus()
         {
+            if (_native != null && _editorId != 0) { _native.EditorSetFocus(Eid, false); RenderView(); Repaint(); }
 #if UNITY_EDITOR_WIN
             Input.imeCompositionMode = IMECompositionMode.Auto;
 #endif
@@ -1660,6 +1662,12 @@ namespace Unterm.Editor
         private void DrawImeField(Rect rect)
         {
             if (_native == null || _editorId == 0) return;
+            // No keyboard focus → skip the hidden IME field entirely. It only exists
+            // to anchor composition and receive typing (both need focus), and its
+            // transparent-text TextField still draws a thin text cursor at the caret —
+            // which must not linger on a background (unfocused) window.
+            if (focusedWindow != this && !_composing && string.IsNullOrEmpty(Input.compositionString))
+                return;
             float ppp = EditorGUIUtility.pixelsPerPoint;
             _native.EditorCaret(Eid, out float cx, out float cy, out float _, out float chh);
             float gx = rect.x + cx / ppp;

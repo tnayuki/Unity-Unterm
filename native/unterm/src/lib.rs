@@ -1163,6 +1163,12 @@ pub unsafe extern "C" fn unterm_agentview_input_key(
     with_view(id, (), |v| v.input_key(&name, ctrl, alt, shift));
 }
 
+/// Host keyboard focus for the composer; hides the caret while unfocused.
+#[no_mangle]
+pub extern "C" fn unterm_agentview_set_focus(id: u64, focused: bool) {
+    with_view(id, (), |v| v.set_focused(focused));
+}
+
 /// Insert text into the composer (paste / IME commit).
 ///
 /// # Safety
@@ -1512,6 +1518,12 @@ pub unsafe extern "C" fn unterm_editor_key(
 ) {
     let name = cstr(name);
     with_editor(id, (), |e| e.key(&name, ctrl, alt, shift));
+}
+
+/// Host keyboard focus for the code editor; hides the caret while unfocused.
+#[no_mangle]
+pub extern "C" fn unterm_editor_set_focus(id: u64, focused: bool) {
+    with_editor(id, (), |e| e.set_focused(focused));
 }
 
 /// Insert text at the caret (typing / paste / IME commit).

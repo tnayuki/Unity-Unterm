@@ -285,6 +285,9 @@ impl AgentView {
     pub fn caret_rect(&self) -> [f32; 4] {
         self.input.caret_rect()
     }
+    pub fn set_focused(&mut self, focused: bool) {
+        self.input.set_focused(focused);
+    }
     pub fn set_scroll(&mut self, scroll: f32) {
         self.scroll = scroll.max(0.0);
     }
