@@ -5,6 +5,7 @@
 ### Added
 
 - The Claude Code agent's in-Editor Unity tools gained several capabilities: `unity_capture` renders a Game camera or the Scene view to a screenshot the agent can actually see (URP/HDRP via render requests, built-in via `Camera.Render`); `unity_package` drives the Package Manager (list / info / add / remove); `unity_menu` can now search menu-item paths instead of only executing a path you already know; `unity_script` can validate C# syntax through the bundled Roslyn without waiting for a domain reload; and `unity_editor`'s state read now reports the Unity version, platform, play-mode transition, active scene path, current selection, active tool, tags, and layers instead of just play/pause/compiling and the scene name.
+- The Claude Code agent is now told, up front, that it is running embedded inside the Unity Editor: each session is spawned with an appended system prompt naming the Unity version and the project's product name and pointing the agent at the in-process `unterm-unity` MCP tools, so it reaches for them over shell commands when a task touches the running editor.
 
 ### Fixed
 

@@ -691,6 +691,14 @@ impl Driver {
             args.push(effort);
         }
         let workdir: std::path::PathBuf = if cwd.is_empty() { ".".into() } else { cwd.into() };
+        // Ground the agent in its host up front: it runs embedded in the Unity
+        // Editor, so name the editor version / project and point it at the
+        // unterm-unity MCP tools. Spawn-time only — live editor state (scene,
+        // play mode, selection) is pulled via the unity_editor tool instead.
+        if let Some(ctx) = unity_context(&workdir) {
+            args.push("--append-system-prompt".into());
+            args.push(ctx);
+        }
         // The exact cwd matters on resume: `claude --resume` only finds a session
         // under the project dir derived from this directory, so log it to verify.
         log::info!(
@@ -716,18 +724,44 @@ impl Driver {
                 // console window.
                 use std::os::windows::process::CommandExt;
                 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+                // Quote whitespace-carrying args (the system prompt) so cmd.exe
+                // keeps each one a single argument.
+                let joined = args
+                    .iter()
+                    .map(|a| {
+                        if a.chars().any(char::is_whitespace) {
+                            format!("\"{a}\"")
+                        } else {
+                            a.clone()
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ");
                 let mut c = Command::new("cmd");
-                c.args(["/c", &format!("{cmd} {}", args.join(" "))])
+                c.args(["/c", &format!("{cmd} {joined}")])
                     .creation_flags(CREATE_NO_WINDOW);
                 c
             }
             #[cfg(not(windows))]
             {
                 // The login+interactive shell sources the user's rc so `claude`
-                // resolves despite the minimal GUI PATH.
+                // resolves despite the minimal GUI PATH. Single-quote
+                // whitespace-carrying args (the system prompt) so the shell
+                // keeps each one a single argument.
+                let joined = args
+                    .iter()
+                    .map(|a| {
+                        if a.chars().any(char::is_whitespace) {
+                            format!("'{}'", a.replace('\'', r"'\''"))
+                        } else {
+                            a.clone()
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ");
                 let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
                 let mut c = Command::new(shell);
-                c.args(["-lic", &format!("exec {cmd} {}", args.join(" "))]);
+                c.args(["-lic", &format!("exec {cmd} {joined}")]);
                 c
             }
         };
@@ -1227,6 +1261,49 @@ fn parse_questions(input: &Value) -> Vec<Question> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Static "you are inside Unity" grounding for `--append-system-prompt`: the
+/// editor version read from ProjectSettings/ProjectVersion.txt plus the project
+/// folder name. `None` when `cwd` is not a Unity project root. Kept to a single
+/// line without quote characters so it survives the shell-joined spawn paths
+/// verbatim on every OS. Live editor state deliberately stays out — it goes
+/// stale the moment the user hits Play; the agent pulls it via unity_editor.
+fn unity_context(project: &std::path::Path) -> Option<String> {
+    let text =
+        std::fs::read_to_string(project.join("ProjectSettings").join("ProjectVersion.txt")).ok()?;
+    let version = text
+        .lines()
+        .find_map(|l| l.strip_prefix("m_EditorVersion:"))
+        .map(str::trim)
+        .filter(|v| !v.is_empty())?
+        .to_string();
+    // The real project name is PlayerSettings.productName, not the folder name
+    // (they diverge once the repo is cloned/renamed); the agent already knows the
+    // folder from its cwd, so name the product. Fall back to "this project".
+    let name =
+        unity_product_name(project).unwrap_or_else(|| "this project".to_string());
+    Some(format!(
+        "You are running embedded inside the Unity Editor (Unity {version}) in the Unity project {name}; \
+         the working directory is the project root. Editor operations and live editor state \
+         (scenes, GameObjects, components, console logs, screenshots, in-memory C# execution) \
+         are available as unterm-unity MCP tools; prefer them over shell commands for anything \
+         that touches the running editor."
+    ))
+}
+
+/// PlayerSettings.productName from ProjectSettings/ProjectSettings.asset — the
+/// Unity project's display name (line-scanned; the field is a top-level scalar
+/// that appears once). `None` when the file is missing or the name is empty.
+fn unity_product_name(project: &std::path::Path) -> Option<String> {
+    let text =
+        std::fs::read_to_string(project.join("ProjectSettings").join("ProjectSettings.asset"))
+            .ok()?;
+    text.lines()
+        .find_map(|l| l.trim_start().strip_prefix("productName:"))
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_string)
 }
 
 /// The stream-json input line for a user prompt.
