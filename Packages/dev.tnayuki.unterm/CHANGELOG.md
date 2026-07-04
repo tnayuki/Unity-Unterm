@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-07-04
+
 ### Fixed
 
 - Double-clicking a scene (or any non-code asset) in the Project window no longer opens it as text in the Unterm code editor when Unterm is selected as the External Script Editor. Unterm now only claims the extensions Unity treats as project code — its C# project-generation set plus whatever you add under Project Settings ▸ Editor, and the `json`/`asmdef`/`asmref`/`log` formats Unity's own VSCode/Rider packages force-add — and declines everything else so Unity's native handler opens it. The same filter now governs which transcript path-clicks open in the editor.
