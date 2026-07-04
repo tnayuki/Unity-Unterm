@@ -62,11 +62,35 @@ namespace Unterm.Editor
             return arr.ToString(Formatting.None);
         }
 
+        // Calls whose handler returned an UntermDeferredResult: polled each tick
+        // until the result is ready. Lost on a domain reload — the native side
+        // then times the call out (~30s), which is the intended backstop.
+        private static readonly List<(ulong id, UntermDeferredResult deferred)> _pending = new();
+
         /// Drain queued tool calls from the native MCP server, run them on the
         /// (current) main thread, and post results back. Call from EditorApplication.update.
         public static void Poll(UntermNative native)
         {
             if (native == null) return;
+
+            // Finish deferred calls whose result is now available.
+            for (int i = _pending.Count - 1; i >= 0; i--)
+            {
+                string result;
+                try
+                {
+                    object r = _pending[i].deferred.Poll();
+                    if (r == null) continue; // still pending
+                    result = Serialize(r);
+                }
+                catch (Exception e)
+                {
+                    result = ToolResult("error: " + e.Message, true);
+                }
+                native.McpRespond(_pending[i].id, result);
+                _pending.RemoveAt(i);
+            }
+
             string callJson;
             while (!string.IsNullOrEmpty(callJson = native.McpNextCall()))
             {
@@ -81,8 +105,12 @@ namespace Unterm.Editor
                     if (!_tools.TryGetValue(name, out var tool))
                         throw new Exception("unknown tool: " + name);
                     object r = tool.Handler(args);
-                    string text = r as string ?? JsonConvert.SerializeObject(r, Formatting.Indented);
-                    result = ToolResult(text, false);
+                    if (r is UntermDeferredResult deferred)
+                    {
+                        _pending.Add((id, deferred));
+                        continue; // answered later, from the loop above
+                    }
+                    result = Serialize(r);
                 }
                 catch (Exception e)
                 {
@@ -90,6 +118,16 @@ namespace Unterm.Editor
                 }
                 native.McpRespond(id, result);
             }
+        }
+
+        /// A handler result as the MCP result JSON: a raw {content:[...]} JObject
+        /// passes through untouched (e.g. image content from unity_capture);
+        /// anything else is serialized and wrapped as text content.
+        private static string Serialize(object r)
+        {
+            if (r is JObject raw && raw["content"] is JArray) return raw.ToString(Formatting.None);
+            string text = r as string ?? JsonConvert.SerializeObject(r, Formatting.Indented);
+            return ToolResult(text, false);
         }
 
         private static string ToolResult(string text, bool isError) =>
@@ -142,7 +180,8 @@ namespace Unterm.Editor
             // unity_editor: live editor state + play/undo control + refresh + tags.
             Register("unity_editor",
                 "Query and control the Unity editor. " +
-                "action: state (read), play, pause, stop, undo, redo, refresh (asset import + recompile), " +
+                "action: state (read: play/pause/compiling, active scene, selection, active tool, tags, layers), " +
+                "play, pause, stop, undo, redo, refresh (asset import + recompile), " +
                 "add_tag, remove_tag (name = tag).",
                 Schema(
                     ("action", "string", "state | play | pause | stop | undo | redo | refresh | add_tag | remove_tag",
@@ -165,13 +204,24 @@ namespace Unterm.Editor
                             UnityEditorInternal.InternalEditorUtility.RemoveTag((string)args["name"]);
                             return new { ok = true, tag = (string)args["name"] };
                         default:
+                        {
+                            var scene = SceneManager.GetActiveScene();
                             return new
                             {
+                                unityVersion = Application.unityVersion,
+                                platform = Application.platform.ToString(),
                                 isPlaying = EditorApplication.isPlaying,
                                 isPaused = EditorApplication.isPaused,
+                                // isPlaying alone misses the enter/exit-play window.
+                                isChanging = EditorApplication.isPlayingOrWillChangePlaymode,
                                 isCompiling = EditorApplication.isCompiling,
-                                activeScene = SceneManager.GetActiveScene().name,
+                                activeScene = new { scene.name, scene.path },
+                                activeTool = Tools.current.ToString(),
+                                selection = Selection.gameObjects.Select(g => g.name).Take(20).ToArray(),
+                                tags = UnityEditorInternal.InternalEditorUtility.tags,
+                                layers = UnityEditorInternal.InternalEditorUtility.layers,
                             };
+                        }
                     }
                 });
 
@@ -460,12 +510,24 @@ namespace Unterm.Editor
                     }
                 });
 
-            // unity_menu: execute an editor menu item.
+            // unity_menu: execute or search editor menu items.
             Register("unity_menu",
-                "Execute a Unity editor menu item by path (e.g. 'GameObject/Create Empty').",
-                Schema(("menu_path", "string", "Full menu item path", null)),
+                "Unity editor menu items. action: execute (menu_path, e.g. 'GameObject/Create Empty'), " +
+                "search (query -> matching menu paths; use it instead of guessing a path).",
+                Schema(
+                    ("action", "string", "execute | search", new[] { "execute", "search" }),
+                    ("menu_path", "string", "Full menu item path for execute", null),
+                    ("query", "string", "Case-insensitive substring for search", null)),
                 args =>
                 {
+                    if ((string)args["action"] == "search")
+                    {
+                        string q = ((string)args["query"] ?? "").ToLowerInvariant();
+                        var paths = AllMenuPaths()
+                            .Where(p => p.ToLowerInvariant().Contains(q))
+                            .Distinct().OrderBy(p => p).Take(100).ToArray();
+                        return new { count = paths.Length, paths };
+                    }
                     string path = (string)args["menu_path"];
                     bool ok = !string.IsNullOrEmpty(path) && EditorApplication.ExecuteMenuItem(path);
                     return new { ok, menu_path = path };
@@ -528,12 +590,13 @@ namespace Unterm.Editor
                     }
                 });
 
-            // unity_script: create / read / delete C# scripts (triggers recompile).
+            // unity_script: create / read / delete / validate C# scripts.
             Register("unity_script",
-                "C# script files. action: create (path + content), read (path), delete (path). " +
+                "C# script files. action: create (path + content), read (path), delete (path), " +
+                "validate (path; fast Roslyn syntax check without waiting for a recompile). " +
                 "create/delete trigger an asset import and recompile.",
                 Schema(
-                    ("action", "string", "create | read | delete", new[] { "create", "read", "delete" }),
+                    ("action", "string", "create | read | delete | validate", new[] { "create", "read", "delete", "validate" }),
                     ("path", "string", "Assets-relative path (e.g. Assets/Scripts/Foo.cs)", null),
                     ("content", "string", "File content for create", null)),
                 args =>
@@ -552,6 +615,16 @@ namespace Unterm.Editor
                         }
                         case "delete":
                             return new { ok = AssetDatabase.DeleteAsset(path) };
+                        case "validate":
+                        {
+                            string abs = ToAbsolute(path);
+                            if (!File.Exists(abs)) return new { ok = false, error = "not found: " + path };
+                            var diags = Microsoft.CodeAnalysis.CSharp.CSharpSyntaxTree
+                                .ParseText(File.ReadAllText(abs)).GetDiagnostics()
+                                .Where(d => d.Severity == Microsoft.CodeAnalysis.DiagnosticSeverity.Error)
+                                .Select(d => d.ToString()).Take(50).ToArray();
+                            return new { ok = diags.Length == 0, diagnostics = diags };
+                        }
                         default: // read
                         {
                             string abs = ToAbsolute(path);
@@ -826,6 +899,29 @@ namespace Unterm.Editor
                 ["properties"] = properties,
                 ["required"] = props.Length > 0 ? new JArray(props[0].name) : new JArray(),
             };
+        }
+
+        /// Every known menu item path: script-defined [MenuItem]s via TypeCache,
+        /// plus built-in menus via the internal Menu.ExtractSubmenus (reflection;
+        /// silently absent if the internal API moves).
+        private static IEnumerable<string> AllMenuPaths()
+        {
+            foreach (var m in TypeCache.GetMethodsWithAttribute<MenuItem>())
+                foreach (MenuItem a in m.GetCustomAttributes(typeof(MenuItem), false))
+                    if (!a.validate)
+                        yield return a.menuItem;
+
+            var extract = typeof(Menu).GetMethod("ExtractSubmenus",
+                System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static);
+            if (extract == null) yield break;
+            foreach (var top in new[] { "File", "Edit", "Assets", "GameObject", "Component", "Tools", "Window", "Help" })
+            {
+                string[] subs = null;
+                try { subs = extract.Invoke(null, new object[] { top }) as string[]; }
+                catch (Exception e) { UntermLog.WarnOnce("menu.extractSubmenus", e); }
+                if (subs == null) continue;
+                foreach (var s in subs) yield return s;
+            }
         }
 
         private static void Register(string name, string description, JObject schema, Func<JObject, object> handler)

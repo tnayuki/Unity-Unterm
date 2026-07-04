@@ -53,6 +53,17 @@ namespace Unterm.Editor
         }
     }
 
+    /// <summary>
+    /// Returned by a tool handler to defer its result (e.g. an async Package
+    /// Manager request): UntermMcpServer polls <see cref="Poll"/> on the main
+    /// thread each editor tick until it returns the final (non-null) result.
+    /// The native side times the call out (~30s), which bounds a stuck poll.
+    /// </summary>
+    internal sealed class UntermDeferredResult
+    {
+        public Func<object> Poll;
+    }
+
     /// <summary>Shared helpers for tool handlers.</summary>
     internal static class UntermToolUtil
     {

@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- The Claude Code agent's in-Editor Unity tools gained several capabilities: `unity_capture` renders a Game camera or the Scene view to a screenshot the agent can actually see (URP/HDRP via render requests, built-in via `Camera.Render`); `unity_package` drives the Package Manager (list / info / add / remove); `unity_menu` can now search menu-item paths instead of only executing a path you already know; `unity_script` can validate C# syntax through the bundled Roslyn without waiting for a domain reload; and `unity_editor`'s state read now reports the Unity version, platform, play-mode transition, active scene path, current selection, active tool, tags, and layers instead of just play/pause/compiling and the scene name.
+
 ### Fixed
 
 - The Claude Code agent composer now honours the same caret-navigation shortcuts as the code editor — word-wise motion (⌥←/→, Ctrl+←/→ on Windows/Linux), line and document ends (⌘←/→, ⌘↑/↓, Home/End), and word / line deletion (⌥/⌘+Backspace, ⌥+Delete) — which were already wired up in the editor but had been missed in the composer.
