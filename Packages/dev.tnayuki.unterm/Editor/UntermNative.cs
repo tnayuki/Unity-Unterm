@@ -104,6 +104,13 @@ namespace Unterm.Editor
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate IntPtr AvTokenFn(ulong id, float x, float y, out UIntPtr len);
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate ulong AvStampAtFn(ulong id, float x, float y);
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate IntPtr FormatRelativeFn(ulong unixSecs, out UIntPtr len);
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate ulong SessionsQueryFn([MarshalAs(UnmanagedType.LPUTF8Str)] string cwd, UIntPtr limit, [MarshalAs(UnmanagedType.LPUTF8Str)] string query);
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate IntPtr SessionsPollFn(ulong serial, out UIntPtr len);
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate ulong SessionsGenFn();
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate void AvSetBrowsingFn(ulong id, byte on);
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate byte AvBrowseHoverFn(ulong id, float x, float y);
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate ulong AvBrowseCountFn(ulong id);
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate IntPtr SessionsOpenElsewhereFn([MarshalAs(UnmanagedType.LPUTF8Str)] string cwd, out UIntPtr len);
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate float AvFloatFn(ulong id);
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate ulong U64IdFn(ulong id);
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate void AvF1Fn(ulong id, float v);
@@ -154,6 +161,10 @@ namespace Unterm.Editor
         private AvVoidFn _avInterrupt; private AvBufFn _avSessionId; private AvBufFn _avTitle;
         private AvBufFn _avTakeHostCommand; private AvTokenFn _avPanelTokenAt; private AvStampAtFn _avPanelStampAt;
         private FormatRelativeFn _formatRelative;
+        private SessionsQueryFn _sessionsQuery; private SessionsPollFn _sessionsPoll; private SessionsGenFn _sessionsGen;
+        private AvSetBrowsingFn _avSetBrowsing; private AvBrowseHoverFn _avBrowseHover;
+        private AvVoidFn _avBrowseToggleArchived; private AvBrowseCountFn _avBrowseArchivedCount;
+        private SessionsOpenElsewhereFn _sessionsOpenElsewhere;
         private AvStrFn _avSetPermissionMode; private AvBufFn _avPermissionMode;
         private AvStrFn _avSetModel; private AvBufFn _avModel; private AvBufFn _avModels;
         private AvBufFn _avCommands; private AvBufFn _avInputSlashPrefix; private EdCompleteFn _avInputComplete;
@@ -291,6 +302,14 @@ namespace Unterm.Editor
             _avPanelTokenAt = Sym<AvTokenFn>("unterm_agentview_panel_token_at");
             _avPanelStampAt = Sym<AvStampAtFn>("unterm_agentview_panel_stamp_at");
             _formatRelative = Sym<FormatRelativeFn>("unterm_format_relative");
+            _sessionsQuery = Sym<SessionsQueryFn>("unterm_sessions_query");
+            _sessionsPoll = Sym<SessionsPollFn>("unterm_sessions_poll");
+            _sessionsGen = Sym<SessionsGenFn>("unterm_sessions_generation");
+            _avSetBrowsing = Sym<AvSetBrowsingFn>("unterm_agentview_set_browsing");
+            _avBrowseHover = Sym<AvBrowseHoverFn>("unterm_agentview_browse_hover");
+            _avBrowseToggleArchived = Sym<AvVoidFn>("unterm_agentview_browse_toggle_archived");
+            _avBrowseArchivedCount = Sym<AvBrowseCountFn>("unterm_agentview_browse_archived_count");
+            _sessionsOpenElsewhere = Sym<SessionsOpenElsewhereFn>("unterm_sessions_open_elsewhere");
             _avPanelDown = Sym<AvDownFn>("unterm_agentview_panel_down");
             _avPanelDrag = Sym<AvDragFn>("unterm_agentview_panel_drag");
             _avPanelScrollH = Sym<AvScrollHFn>("unterm_agentview_panel_scroll_h");
@@ -517,6 +536,34 @@ namespace Unterm.Editor
         /// Localized relative label ("5 minutes ago") for a unix-seconds stamp — the
         /// same formatting the transcript separators use.
         public string FormatRelative(ulong unixSecs) { var p = _formatRelative(unixSecs, out UIntPtr len); return Utf8(p, len); }
+        /// Kick off an async session listing/search for `cwd` (limit 0 = all,
+        /// query "" = list only); returns the serial to poll. Never blocks.
+        public ulong SessionsQuery(string cwd, int limit, string query) =>
+            _sessionsQuery(cwd ?? string.Empty, (UIntPtr)(ulong)Mathf.Max(0, limit), query ?? string.Empty);
+        /// The JSON result for `serial` if ready (a `[{id,title,updated,snippet}]`
+        /// array), else null while the worker is still computing.
+        public string SessionsPoll(ulong serial)
+        {
+            var p = _sessionsPoll(serial, out UIntPtr len);
+            return p == IntPtr.Zero ? null : Utf8(p, len);
+        }
+        /// Bumped when a session file appears/vanishes on disk; the host re-lists on change.
+        public ulong SessionsGeneration() => _sessionsGen != null ? _sessionsGen() : 0;
+        /// Enter/leave the native "All Sessions" browser: the panel texture shows
+        /// the list and the composer becomes its search box.
+        public void AgentviewSetBrowsing(ulong id, bool on) { if (id != 0) _avSetBrowsing(id, on ? (byte)1 : (byte)0); }
+        /// Pointer motion over the browser list (physical px); true = hover changed.
+        public bool AgentviewBrowseHover(ulong id, float x, float y) => id != 0 && _avBrowseHover(id, x, y) != 0;
+        public void AgentviewBrowseToggleArchived(ulong id) { if (id != 0) _avBrowseToggleArchived(id); }
+        public ulong AgentviewBrowseArchivedCount(ulong id) => id == 0 ? 0 : _avBrowseArchivedCount(id);
+        /// Sessions open in other windows (newline-joined ids), greyed as non-resumable.
+        /// Newline-joined session ids driven by a live `claude` process in `cwd`'s
+        /// project (from Claude Code's session registry), for greying the picker.
+        public string SessionsOpenElsewhere(string cwd)
+        {
+            var p = _sessionsOpenElsewhere(cwd ?? string.Empty, out UIntPtr len);
+            return p == IntPtr.Zero ? string.Empty : Utf8(p, len);
+        }
         /// Transcript mouse-down: resolves permission buttons AND begins selection
         /// internally. Returns 1 if consumed.
         public byte AgentviewPanelDown(ulong id, float x, float y) => _avPanelDown(id, x, y);
@@ -645,7 +692,8 @@ namespace Unterm.Editor
             _avPanelTexture = null; _avInputTexture = null;
             _avContentHeight = null; _avInputHeight = null; _avSetScroll = null; _avCaret = null;
             _avInterrupt = null; _avSessionId = null; _avTitle = null; _avTakeHostCommand = null; _avPanelTokenAt = null;
-            _avPanelStampAt = null; _formatRelative = null;
+            _avPanelStampAt = null; _formatRelative = null; _sessionsQuery = null; _sessionsPoll = null; _sessionsGen = null;
+            _avSetBrowsing = null; _avBrowseHover = null; _avBrowseToggleArchived = null; _avBrowseArchivedCount = null; _sessionsOpenElsewhere = null;
             _avSetPermissionMode = null; _avPermissionMode = null; _avSetModel = null; _avModel = null;
             _avModels = null; _avCommands = null; _avInputSlashPrefix = null; _avInputComplete = null; _popupShowAbove = null;
             _avQueueLen = null; _avCancelQueued = null;

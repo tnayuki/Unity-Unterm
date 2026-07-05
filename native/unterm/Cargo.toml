@@ -47,11 +47,21 @@ streaming-iterator = "0.1" # consume tree-sitter 0.25's QueryCursor::captures
 # `mcp_message` requests straight in. Tool defs + execution come from the C# side.
 serde_json = "1"
 
+# Watch the project's session directory so the picker updates when sessions are
+# created/removed in the background (e.g. a `claude` CLI in the same project).
+# Cross-platform: FSEvents / inotify / ReadDirectoryChangesW under the hood.
+notify = { version = "6", default-features = false, features = ["macos_fsevent"] }
+
 # Localized relative-time labels for the transcript's gap separators ("5 minutes
 # ago", "3 日前"): `timeago` is the moment.js-style formatter, `isolang` maps the
 # editor locale to its language. All relative, so no date/timezone library.
 timeago = { version = "0.6.1", default-features = false, features = ["isolang", "translations"] }
 isolang = { version = "2.4.0", default-features = false }
+
+# Graceful child shutdown: SIGTERM the `claude` process before falling back to
+# SIGKILL, so it can finalize its transcript (std's Child::kill is SIGKILL-only).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 # IOSurface zero-copy path (macOS). Uses the same objc2-metal/objc2-io-surface
 # bindings wgpu-hal 29 builds on, so the raw MTLDevice/MTLTexture handed to
@@ -100,6 +110,8 @@ windows = { version = "0.62", features = [
     # wgpu renders into (the counterpart to the macOS NSPanel popup).
     "Win32_Graphics_Gdi",
     "Win32_System_LibraryLoader",
+    # Probe whether a `claude` pid from the session registry is still alive.
+    "Win32_System_Threading",
     "Win32_UI_WindowsAndMessaging",
 ] }
 # Same crate the macOS side uses; the d3d features pull in the

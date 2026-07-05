@@ -18,9 +18,11 @@ namespace Unterm.Editor
     /// (together with the loaded image and the editor-global MCP server,
     /// <see cref="UntermMcp"/>) survives C# domain reloads. This window re-adopts
     /// the view by id after a reload and only tears it down when the window
-    /// actually closes. Sessions are listed in a per-project index
-    /// (<see cref="UntermAgentSessions"/>) so the header dropdown can resume any
-    /// past conversation; opening a window from the menu always starts a fresh one.
+    /// actually closes. The header dropdown lists this project's past conversations
+    /// straight from Claude Code's own on-disk storage (listed async by the native
+    /// <c>sessions</c> worker) so any can be resumed, and an "All Sessions…" entry
+    /// replaces the transcript with a searchable list over the full set; opening a
+    /// window from the menu always starts a fresh one.
     /// </summary>
     public sealed class UntermAgentWindow : EditorWindow
     {
@@ -70,10 +72,28 @@ namespace Unterm.Editor
         private static readonly string[] s_modes =
             { "default", "auto", "plan", "acceptEdits", "bypassPermissions" };
 
-        // Claude session ids currently driven by some agent window in this editor
-        // process. The picker greys out (non-selectable, no label) a session open
-        // in another window so two windows never drive the same conversation.
-        private static readonly HashSet<string> s_open = new HashSet<string>();
+        // Session ids currently driven by a live `claude` process — this window's,
+        // another Unterm window's, or an external CLI — from Claude Code's own
+        // session registry (via the native side), so the picker greys out any
+        // session already open somewhere and two processes never drive the same
+        // conversation. Cached and refreshed at most ~once a second.
+        private HashSet<string> _busyIds = new HashSet<string>();
+        private double _busyIdsAt;
+
+        // The registry-backed busy set for the dropdown (the native browser reads
+        // the registry itself). Throttled so opening the menu doesn't re-scan hot.
+        private HashSet<string> BusyIds()
+        {
+            if (_native != null && EditorApplication.timeSinceStartup - _busyIdsAt > 1.0)
+            {
+                _busyIdsAt = EditorApplication.timeSinceStartup;
+                var joined = _native.SessionsOpenElsewhere(ProjectRoot);
+                _busyIds = new HashSet<string>(
+                    (joined ?? "").Split('\n'), StringComparer.Ordinal);
+                _busyIds.Remove("");
+            }
+            return _busyIds;
+        }
 
         // Transcript panel texture (zero-copy wrap of the native MTLTexture).
         private Texture2D _tex;
@@ -89,7 +109,21 @@ namespace Unterm.Editor
         private bool _selecting;       // dragging a transcript selection
         private ulong _hoverStamp;     // unix stamp of the hovered time separator (0 = none)
         private bool _inputDragging;   // dragging an input-box selection
-        private double _lastTouch;     // editor time of the last session-index bump (throttle)
+
+        // Recent sessions for the header picker, listed async from Claude Code's
+        // own storage (no local index). Refreshed on focus / menu-open; _recentSerial
+        // != 0 while a listing is in flight (drained in OnEditorUpdate).
+        private UntermSessionInfo[] _recent = Array.Empty<UntermSessionInfo>();
+        private ulong _recentSerial;
+        private ulong _sessionsGen; // last sessions-dir generation the recent list reflects
+        private const int RecentCount = 10;
+
+        // "All Sessions" browser: natively rendered in place of the transcript
+        // (the panel texture becomes the list; the composer becomes its search
+        // box). This class only tracks the mode and moves the input strip to the
+        // top — list drawing, search, hover and archiving all live in Rust.
+        private bool _browsing;
+        private float _stashScroll; // transcript scroll to restore on exit
 
         // Opened from the "Window/Unterm/Claude Code" menu (registered, and gated
         // on the CLI being installed, by ClaudeCode).
@@ -147,6 +181,37 @@ namespace Unterm.Editor
                 if (_native != null && _viewId != 0 && string.IsNullOrEmpty(_claudeSessionId))
                     RecreateView();
             }
+            RefreshRecent();
+        }
+
+        // Kick off (async) a refresh of the recent-sessions list backing the picker
+        // dropdown, so the next time it opens it's current. Drained in OnEditorUpdate.
+        private void RefreshRecent()
+        {
+            if (_native != null) _recentSerial = _native.SessionsQuery(ProjectRoot, RecentCount, "");
+        }
+
+        // Switch the transcript area to the native "All Sessions" browser.
+        private void EnterBrowse()
+        {
+            if (_native == null || _viewId == 0 || _browsing) return;
+            _browsing = true;
+            _stashScroll = _scroll;
+            _scroll = 0f; // the browser list is top-anchored
+            _native.AgentviewSetBrowsing(Vid, true);
+            _refocus = true; // park the IME field so search typing works right away
+            RenderView();
+            Repaint();
+        }
+
+        private void ExitBrowse()
+        {
+            if (!_browsing) return;
+            _browsing = false;
+            if (_native != null && _viewId != 0) _native.AgentviewSetBrowsing(Vid, false);
+            _scroll = _stashScroll;
+            RenderView();
+            Repaint();
         }
 
         private void OnLostFocus()
@@ -201,41 +266,65 @@ namespace Unterm.Editor
                 Repaint();
             }
 
-            // Record the Claude session id once established: register it as open
-            // and index it so it can be resumed/listed later. The native side also
-            // owns the tab title.
+            // Record the Claude session id once established. The transcripts are
+            // Claude Code's own storage; the picker lists them directly, and "open
+            // elsewhere" greying comes from Claude Code's session registry (which
+            // includes this window's own `claude` process), not a local set.
             string sid = _native.AgentviewSessionId(Vid);
             if (!string.IsNullOrEmpty(sid) && sid != _claudeSessionId)
-            {
-                if (!string.IsNullOrEmpty(_claudeSessionId)) s_open.Remove(_claudeSessionId);
                 _claudeSessionId = sid;
-                s_open.Add(sid);
-                UntermAgentSessions.Touch(sid, _native.AgentviewTitle(Vid));
-                _lastTouch = EditorApplication.timeSinceStartup;
 
+            // Keep the tab title following the conversation's live (ai-)title — the
+            // native side regenerates it as the chat grows, so gating this on the id
+            // first appearing (or a one-shot SwitchTo) left it stale. A title change
+            // always raises the dirty flag, so only marshal the string on dirty ticks
+            // instead of allocating one every tick. Only adopt a non-empty title, so
+            // the picker title SwitchTo set optimistically isn't clobbered during the
+            // brief gap before the native title is read.
+            if (dirty)
+            {
                 string agent = _native.AgentviewTitle(Vid);
                 if (!string.IsNullOrEmpty(agent) && titleContent.text != agent)
                     titleContent = new GUIContent(agent);
             }
-            // Bump the session's last-used time only while a turn is actually running
-            // (we sent a prompt / are receiving a reply), throttled so streaming
-            // doesn't rewrite the index every frame. NOT on open/switch/resume — so
-            // merely selecting a past session doesn't reorder it; the picker lists
-            // conversations most-recently-talked-to first.
-            else if (_native.AgentviewThinking(Vid) && !string.IsNullOrEmpty(_claudeSessionId)
-                     && EditorApplication.timeSinceStartup - _lastTouch > 3.0)
+
+            // Drain any in-flight recent-sessions listing (for the picker dropdown).
+            // (The "All Sessions" browser polls its own listing natively.)
+            if (_recentSerial != 0)
             {
-                UntermAgentSessions.Touch(_claudeSessionId, _native.AgentviewTitle(Vid));
-                _lastTouch = EditorApplication.timeSinceStartup;
+                string json = _native.SessionsPoll(_recentSerial);
+                if (json != null) { _recent = UntermSessionJson.Parse(json); _recentSerial = 0; }
+            }
+
+            // A session appeared/vanished on disk (e.g. a `claude` CLI in the same
+            // project): refresh the recent list so the dropdown stays current. The
+            // browser watches the same generation natively.
+            ulong gen = _native.SessionsGeneration();
+            if (gen != _sessionsGen)
+            {
+                _sessionsGen = gen;
+                RefreshRecent();
             }
         }
 
-        // Run a built-in command (/login, /logout) in a real interactive terminal:
-        // the stream-json session can't do the OAuth/browser flow, so shell out to
+        // Handle a command the native side hands up. `resume` (from the session
+        // browser: the host owns view lifetimes, so opening a row comes through
+        // here) switches this window's conversation; anything else is a built-in
+        // CLI command (/login, /logout) run in a real interactive terminal — the
+        // stream-json session can't do the OAuth/browser flow, so shell out to
         // the same `claude` binary the agent uses (resolved by ClaudeCode).
         // Refocusing this window afterwards reconnects.
         private void RunHostCommand(string hostCmd)
         {
+            // "resume<US>id<US>title" (US = 0x1F, the native field separator).
+            // SwitchTo leaves the browser either way: picking the open session
+            // exits it in place; anything else replaces the whole native view.
+            if (hostCmd.StartsWith("resume\x1f"))
+            {
+                var parts = hostCmd.Split('\x1f');
+                if (parts.Length >= 2) SwitchTo(parts[1], parts.Length >= 3 ? parts[2] : null);
+                return;
+            }
 #if UNITY_EDITOR_OSX || UNITY_EDITOR_WIN
             string verb = hostCmd.StartsWith("/") ? hostCmd.Substring(1) : hostCmd;
             string claude = ClaudeCode.ClaudePath;
@@ -329,10 +418,6 @@ namespace Unterm.Editor
                     }
                 }
 
-                // Register this window's conversation as open so other windows'
-                // pickers grey it out. A brand-new session has no id yet — it
-                // registers once the id is established (see OnEditorUpdate).
-                if (!string.IsNullOrEmpty(_claudeSessionId)) s_open.Add(_claudeSessionId);
 
                 ApplyFonts();
                 ApplyAgentSettings();
@@ -404,9 +489,6 @@ namespace Unterm.Editor
                 if (native != null && vid != 0 && !ownedElsewhere)
                     native.AgentviewDestroy(vid);
                 _viewId = 0;
-                // Free the session for re-adoption only if no sibling still drives it.
-                if (!ownedElsewhere && !string.IsNullOrEmpty(_claudeSessionId))
-                    s_open.Remove(_claudeSessionId);
                 native?.Dispose(); // dlclose on real teardown
             }
             // On reload: drop the managed wrapper WITHOUT dlclose so the native
@@ -430,6 +512,13 @@ namespace Unterm.Editor
         // Send/Stop button (≈28px button + padding), so the opaque IME field is
         // never laid over it.
         private const float SendButtonReserve = 40f;
+
+        // Y of the input strip's top edge: the composer docks at the window bottom;
+        // while browsing it doubles as the search box and docks under the header.
+        private float StripTop() => _browsing ? HeaderHeight : position.height - _inputHeight;
+
+        // Y of the panel (transcript / session list) top edge.
+        private float PanelTop() => _browsing ? HeaderHeight + _inputHeight : HeaderHeight;
 
         // Physical (HiDPI) pixel size of the transcript panel surface.
         private (uint, uint) CurrentPanelSize()
@@ -575,8 +664,20 @@ namespace Unterm.Editor
 
             DrawHeader();
 
+            // While browsing, Esc leaves the browser (checked before the composer
+            // key routing, which would otherwise treat Esc as an interrupt).
+            if (_browsing && Event.current.type == EventType.KeyDown
+                && Event.current.keyCode == KeyCode.Escape)
+            {
+                ExitBrowse();
+                Event.current.Use();
+                return;
+            }
+
             // Keystrokes go to the native input box; do this before the panel/IMGUI
-            // controls so Enter/arrows aren't eaten by them.
+            // controls so Enter/arrows aren't eaten by them. (While browsing the
+            // composer is the browser's search box; Enter opens the top match —
+            // resolved natively.)
             HandleInputKeys();
 
             // Follow window resizing / input auto-grow: re-render whenever the draw
@@ -590,8 +691,25 @@ namespace Unterm.Editor
                 RenderView();
             }
 
-            var rect = new Rect(0, HeaderHeight, position.width,
+            // The transcript area; while browsing the input strip moves to the top
+            // (search box), so the panel sits below it instead of above.
+            var rect = new Rect(0, PanelTop(), position.width,
                 position.height - HeaderHeight - _inputHeight);
+
+            // Hover drives the native browser's row highlight / archive icon.
+            if (_browsing && _native != null && _viewId != 0
+                && (Event.current.type == EventType.MouseMove || Event.current.type == EventType.MouseDrag))
+            {
+                float bpp = EditorGUIUtility.pixelsPerPoint;
+                var mp = Event.current.mousePosition;
+                float bx = (mp.x - rect.x) * bpp;
+                float by = (mp.y - rect.y) * bpp;
+                if (_native.AgentviewBrowseHover(Vid, bx, by))
+                {
+                    RenderView(measureInput: false);
+                    Repaint();
+                }
+            }
 
             // While the `/`-completion popup is open, the wheel scrolls the popup list
             // (host-driven: feed the offset and re-push) instead of the transcript.
@@ -636,7 +754,11 @@ namespace Unterm.Editor
                     }
                     else
                     {
-                        _scroll = Mathf.Clamp(_scroll - we.delta.y * step, 0f, MaxScroll());
+                        // Transcript scroll is bottom-anchored (0 = latest); the
+                        // browser list is top-anchored (0 = top), so the wheel's
+                        // sign flips between them.
+                        float d = we.delta.y * step;
+                        _scroll = Mathf.Clamp(_browsing ? _scroll + d : _scroll - d, 0f, MaxScroll());
                         used = true;
                     }
                 }
@@ -819,13 +941,15 @@ namespace Unterm.Editor
 
             _scroll = Mathf.Clamp(_scroll, 0f, maxScroll);
             var sbRect = new Rect(panelRect.xMax - ScrollbarWidth, panelRect.y, ScrollbarWidth, panelRect.height);
-            float value = maxScroll - _scroll; // bottom -> value at max
+            // The transcript is bottom-anchored (scroll 0 = latest); the browser
+            // list is top-anchored (scroll 0 = top).
+            float value = _browsing ? _scroll : maxScroll - _scroll;
 
             EditorGUI.BeginChangeCheck();
             float nv = GUI.VerticalScrollbar(sbRect, value, viewportH, 0f, totalH);
             if (EditorGUI.EndChangeCheck())
             {
-                _scroll = Mathf.Clamp(maxScroll - nv, 0f, maxScroll);
+                _scroll = Mathf.Clamp(_browsing ? nv : maxScroll - nv, 0f, maxScroll);
                 RenderView(measureInput: false);
                 Repaint();
             }
@@ -1138,15 +1262,18 @@ namespace Unterm.Editor
         // bottom strip width (field + Send/Stop button) minus side padding.
         private Rect InputStripRect()
         {
-            var strip = new Rect(0, position.height - _inputHeight, position.width, _inputHeight);
+            var strip = new Rect(0, StripTop(), position.width, _inputHeight);
             return new Rect(strip.x + InputPad, strip.y + InputPad / 2f,
                 InputStripWidth(), strip.height - InputPad);
         }
 
         private void DrawInput()
         {
-            var strip = new Rect(0, position.height - _inputHeight, position.width, _inputHeight);
-            EditorGUI.DrawRect(new Rect(strip.x, strip.y, strip.width, 1f),
+            var strip = new Rect(0, StripTop(), position.width, _inputHeight);
+            // Divider on the transcript-facing edge: above the composer, below the
+            // browser's search box.
+            float divY = _browsing ? strip.yMax - 1f : strip.y;
+            EditorGUI.DrawRect(new Rect(strip.x, divY, strip.width, 1f),
                 EditorGUIUtility.isProSkin ? new Color(0, 0, 0, 0.4f) : new Color(0, 0, 0, 0.15f));
 
             var stripRect = InputStripRect();
@@ -1343,6 +1470,29 @@ namespace Unterm.Editor
         // and a dropdown to start a new one or switch to another past conversation.
         private void DrawHeader()
         {
+            // Browser chrome: Back on the left, the archived-visibility toggle on
+            // the right (only offered once something is archived). The list itself
+            // is native; these are the only IMGUI pieces of the browser.
+            if (_browsing)
+            {
+                using (new GUILayout.HorizontalScope(EditorStyles.toolbar))
+                {
+                    if (GUILayout.Button("‹ Back", EditorStyles.toolbarButton, GUILayout.Width(58)))
+                    {
+                        ExitBrowse();
+                        return;
+                    }
+                    GUILayout.FlexibleSpace();
+                    if (_native != null && _viewId != 0 && _native.AgentviewBrowseArchivedCount(Vid) > 0
+                        && GUILayout.Button("Archived", EditorStyles.toolbarButton, GUILayout.Width(66)))
+                    {
+                        _native.AgentviewBrowseToggleArchived(Vid);
+                        RenderView(measureInput: false);
+                        Repaint();
+                    }
+                }
+                return;
+            }
             using (new GUILayout.HorizontalScope(EditorStyles.toolbar))
             {
                 // Session picker (shrinks so the settings dropdowns always fit).
@@ -1390,16 +1540,15 @@ namespace Unterm.Editor
         {
             var menu = new GenericMenu();
             menu.AddItem(new GUIContent("New Session"), false, NewSession);
-            var sessions = UntermAgentSessions.All();
-            if (sessions.Count > 0) menu.AddSeparator("");
+            if (_recent.Length > 0) menu.AddSeparator("");
 
             var used = new HashSet<string>();
-            foreach (var s in sessions)
+            foreach (var s in _recent)
             {
                 string title = string.IsNullOrEmpty(s.title) ? "(untitled)" : s.title;
                 if (s.updated > 0 && _native != null)
                 {
-                    long unix = (s.updated - DateTime.UnixEpoch.Ticks) / TimeSpan.TicksPerSecond;
+                    ulong unix = s.updated;
                     if (unix > 0) title += " — " + _native.FormatRelative((ulong)unix);
                 }
                 string label = title.Replace('/', '∕');
@@ -1411,32 +1560,46 @@ namespace Unterm.Editor
                 while (!used.Add(label)) label += "\u200B";
 
                 bool isCurrent = s.id == _claudeSessionId;
-                if (!isCurrent && s_open.Contains(s.id))
+                if (!isCurrent && BusyIds().Contains(s.id))
                 {
-                    // Driven by another window: shown but not selectable.
+                    // Open in another process: shown but not selectable.
                     menu.AddDisabledItem(new GUIContent(label));
                 }
                 else
                 {
                     string id = s.id;
-                    menu.AddItem(new GUIContent(label), isCurrent, () => SwitchTo(id));
+                    string t = s.title;
+                    menu.AddItem(new GUIContent(label), isCurrent, () => SwitchTo(id, t));
                 }
             }
+
+            // Full-text search over every session for this project (not just the
+            // recent few), in the transcript area.
+            menu.AddSeparator("");
+            menu.AddItem(new GUIContent("All Sessions…"), false, EnterBrowse);
             menu.DropDown(activator);
         }
 
-        // Replace this window's conversation with session `id` (resumed).
-        private void SwitchTo(string id)
+        // Replace this window's conversation with session `id` (resumed). `title`
+        // is the picker's known (ai-)title for it; set it on the tab right away,
+        // since resuming reuses an id we already hold so the per-tick title sync
+        // (gated on the id changing) wouldn't fire.
+        private void SwitchTo(string id, string title = null)
         {
-            if (_native == null || string.IsNullOrEmpty(id) || id == _claudeSessionId) return;
+            if (_native == null || string.IsNullOrEmpty(id)) return;
+            // Selecting the session already open just leaves the browser.
+            if (id == _claudeSessionId) { ExitBrowse(); return; }
+            // The destroyed view takes its browser with it; the fresh one below
+            // starts on the transcript. (Opening an archived session unarchives
+            // it natively — see the browser's resume path.)
+            _browsing = false;
             if (_viewId != 0) _native.AgentviewDestroy(Vid);
-            if (!string.IsNullOrEmpty(_claudeSessionId)) s_open.Remove(_claudeSessionId);
             _claudeSessionId = id;
-            s_open.Add(id);
             _scroll = 0f;
             var (pw, ph) = CurrentPanelSize();
             var (iw, ih) = CurrentInputSize();
             _viewId = (long)_native.AgentviewLoad(ProjectRoot, id, pw, ph, iw, ih, _effort, ClaudeCode.ClaudePath);
+            if (!string.IsNullOrEmpty(title)) titleContent = new GUIContent(title);
             ApplyFonts();
             ApplyAgentSettings();
             RenderView(); Repaint();
@@ -1446,8 +1609,8 @@ namespace Unterm.Editor
         private void NewSession()
         {
             if (_native == null) return;
+            _browsing = false; // the destroyed view takes its browser with it
             if (_viewId != 0) _native.AgentviewDestroy(Vid);
-            if (!string.IsNullOrEmpty(_claudeSessionId)) s_open.Remove(_claudeSessionId);
             _claudeSessionId = "";
             _scroll = 0f;
             var (pw, ph) = CurrentPanelSize();
@@ -1663,6 +1826,8 @@ namespace Unterm.Editor
         private void UpdateSlashCompletion()
         {
             if (_native == null || _viewId == 0 || !_native.PopupAvailable) { CloseSlash(); return; }
+            // While browsing, the composer is a search box — `/` is just text.
+            if (_browsing) { CloseSlash(); return; }
             // The popup is a separate OS window; OnGUI keeps running (and would re-open
             // it) while this window is in the background, so gate on focus here rather
             // than relying on OnLostFocus alone.

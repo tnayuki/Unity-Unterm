@@ -192,6 +192,157 @@ impl QuadRenderer {
     }
 }
 
+/// A single triangle vertex in pixel coordinates (origin top-left).
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+pub struct MeshVertex {
+    pub pos: [f32; 2],
+    pub color: [f32; 4],
+}
+
+/// Filled-triangle renderer, the companion to [`QuadRenderer`] for shapes the
+/// axis-aligned rounded rects can't express — diagonals and arbitrary polygons
+/// tessellated from an SVG-style icon path (see `browser::push_archive_icon`).
+pub struct MeshRenderer {
+    pipeline: wgpu::RenderPipeline,
+    bind_group: wgpu::BindGroup,
+    uniform_buf: wgpu::Buffer,
+    verts: Option<wgpu::Buffer>,
+    count: u32,
+}
+
+impl MeshRenderer {
+    pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("unterm-mesh-shader"),
+            source: wgpu::ShaderSource::Wgsl(MESH_SHADER.into()),
+        });
+        let uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("unterm-mesh-uniforms"),
+            size: std::mem::size_of::<Uniforms>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let bind_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("unterm-mesh-bgl"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("unterm-mesh-bg"),
+            layout: &bind_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: uniform_buf.as_entire_binding(),
+            }],
+        });
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("unterm-mesh-pl"),
+            bind_group_layouts: &[Some(&bind_layout)],
+            immediate_size: 0,
+        });
+        let vertex_layout = wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<MeshVertex>() as u64,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &[
+                wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x2, offset: 0, shader_location: 0 },
+                wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 8, shader_location: 1 },
+            ],
+        };
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("unterm-mesh-pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs"),
+                buffers: &[vertex_layout],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+        Self { pipeline, bind_group, uniform_buf, verts: None, count: 0 }
+    }
+
+    pub fn prepare(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        resolution: (f32, f32),
+        verts: &[MeshVertex],
+    ) {
+        queue.write_buffer(
+            &self.uniform_buf,
+            0,
+            bytemuck::bytes_of(&Uniforms { resolution: [resolution.0, resolution.1], _pad: [0.0; 2] }),
+        );
+        self.count = verts.len() as u32;
+        self.verts = if verts.is_empty() {
+            None
+        } else {
+            Some(device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("unterm-mesh-verts"),
+                contents: bytemuck::cast_slice(verts),
+                usage: wgpu::BufferUsages::VERTEX,
+            }))
+        };
+    }
+
+    pub fn render<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>) {
+        let Some(verts) = &self.verts else { return };
+        pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, &self.bind_group, &[]);
+        pass.set_vertex_buffer(0, verts.slice(..));
+        pass.draw(0..self.count, 0..1);
+    }
+}
+
+const MESH_SHADER: &str = r#"
+struct Uniforms { resolution: vec2<f32>, _pad: vec2<f32> };
+@group(0) @binding(0) var<uniform> u: Uniforms;
+
+struct VsOut {
+  @builtin(position) pos: vec4<f32>,
+  @location(0) color: vec4<f32>,
+};
+
+@vertex
+fn vs(@location(0) p: vec2<f32>, @location(1) color: vec4<f32>) -> VsOut {
+  var out: VsOut;
+  let ndc = vec2<f32>(p.x / u.resolution.x * 2.0 - 1.0,
+                      1.0 - p.y / u.resolution.y * 2.0);
+  out.pos = vec4<f32>(ndc, 0.0, 1.0);
+  out.color = color;
+  return out;
+}
+
+@fragment
+fn fs(in: VsOut) -> @location(0) vec4<f32> {
+  return in.color;
+}
+"#;
+
 const SHADER: &str = r#"
 struct Uniforms { resolution: vec2<f32>, _pad: vec2<f32> };
 @group(0) @binding(0) var<uniform> u: Uniforms;

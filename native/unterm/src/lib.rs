@@ -15,6 +15,7 @@
 //! ```
 
 mod agentview;
+mod browser;
 mod clock;
 mod control;
 mod editops;
@@ -34,6 +35,7 @@ mod popup;
 mod pty;
 mod quads;
 mod renderer;
+mod sessions;
 mod shell;
 mod surface;
 mod term;
@@ -889,6 +891,44 @@ pub extern "C" fn unterm_agentview_interrupt(id: u64) {
     }
 }
 
+// --- session browser ("All Sessions", drawn in place of the transcript) -----
+
+/// Enter/leave the native session browser. While on, the panel texture shows
+/// the list and the composer becomes its search box.
+#[no_mangle]
+pub extern "C" fn unterm_agentview_set_browsing(id: u64, on: u8) {
+    if let Some(v) = lock_views().get_mut(&id) {
+        v.set_browsing(on != 0);
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn unterm_agentview_browsing(id: u64) -> u8 {
+    lock_views().get(&id).map_or(0, |v| v.browsing() as u8)
+}
+
+/// Pointer motion over the browser list (physical px). Returns 1 when the
+/// hover state changed (host should re-render + repaint).
+#[no_mangle]
+pub extern "C" fn unterm_agentview_browse_hover(id: u64, x: f32, y: f32) -> u8 {
+    lock_views().get_mut(&id).map_or(0, |v| v.browse_hover(x, y) as u8)
+}
+
+/// Toggle listing archived sessions in the browser.
+#[no_mangle]
+pub extern "C" fn unterm_agentview_browse_toggle_archived(id: u64) {
+    if let Some(v) = lock_views().get_mut(&id) {
+        v.browse_toggle_archived();
+    }
+}
+
+
+/// How many of the browser's listed sessions are archived.
+#[no_mangle]
+pub extern "C" fn unterm_agentview_browse_archived_count(id: u64) -> u64 {
+    lock_views().get(&id).map_or(0, |v| v.browse_archived_count())
+}
+
 /// Set the permission mode (`default`/`plan`/`acceptEdits`/`bypassPermissions`).
 ///
 /// # Safety
@@ -1051,6 +1091,87 @@ pub unsafe extern "C" fn unterm_format_relative(unix_secs: u64, out_len: *mut us
         let label = clock::format_relative(unix_secs, clock::now_secs());
         let mut snap = relative_snap().lock_recover();
         *snap = CString::new(label).unwrap_or_default();
+        if !out_len.is_null() {
+            unsafe { *out_len = snap.as_bytes().len() };
+        }
+        snap.as_ptr()
+    })
+}
+
+// --- session picker (async listing / search) ---
+
+/// Submit an async request to list/search this project's Claude sessions:
+/// `cwd` is the project root, `limit` caps the result count (0 = all), and
+/// `query` (empty = list only) matches session titles and transcript bodies.
+/// Returns a serial to [`unterm_sessions_poll`]; the worker never blocks the
+/// caller. `cwd`/`query` must be valid C strings or null.
+///
+/// # Safety
+/// `cwd` and `query` must be null or point to valid NUL-terminated UTF-8.
+#[no_mangle]
+pub unsafe extern "C" fn unterm_sessions_query(
+    cwd: *const c_char,
+    limit: usize,
+    query: *const c_char,
+) -> u64 {
+    ffi_guard(0, || sessions::query(&cstr(cwd), limit, &cstr(query)))
+}
+
+/// The session-directory generation: bumped when a session `.jsonl` is created
+/// or removed in the background, so the host re-lists (the recent dropdown). The
+/// browser watches it internally.
+#[no_mangle]
+pub extern "C" fn unterm_sessions_generation() -> u64 {
+    ffi_guard(0, sessions::generation)
+}
+
+/// Newline-joined session ids currently driven by a live `claude` process in
+/// `cwd`'s project (from Claude Code's own `~/.claude/sessions` registry), so the
+/// host can grey out sessions open in another process. Valid until the next call.
+///
+/// # Safety
+/// `cwd` must be null or a valid NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn unterm_sessions_open_elsewhere(
+    cwd: *const c_char,
+    out_len: *mut usize,
+) -> *const c_char {
+    ffi_guard(std::ptr::null(), || {
+        let joined = sessions::open_elsewhere(&cstr(cwd)).join("\n");
+        let mut snap = open_elsewhere_snap().lock_recover();
+        *snap = CString::new(joined).unwrap_or_default();
+        if !out_len.is_null() {
+            unsafe { *out_len = snap.as_bytes().len() };
+        }
+        snap.as_ptr()
+    })
+}
+
+/// Snapshot buffer for [`unterm_sessions_open_elsewhere`] (main-thread only).
+fn open_elsewhere_snap() -> &'static Mutex<CString> {
+    static C: OnceLock<Mutex<CString>> = OnceLock::new();
+    C.get_or_init(|| Mutex::new(CString::default()))
+}
+
+/// Snapshot buffer for [`unterm_sessions_poll`] (one global; polled on the main thread).
+fn sessions_snap() -> &'static Mutex<CString> {
+    static C: OnceLock<Mutex<CString>> = OnceLock::new();
+    C.get_or_init(|| Mutex::new(CString::default()))
+}
+
+/// The JSON result for `serial` if ready, else null (still computing). The
+/// pointer is valid until the next call. Writes the byte length to `out_len`.
+///
+/// # Safety
+/// `out_len` must be writable or null.
+#[no_mangle]
+pub unsafe extern "C" fn unterm_sessions_poll(serial: u64, out_len: *mut usize) -> *const c_char {
+    ffi_guard(std::ptr::null(), || {
+        let Some(json) = sessions::poll(serial) else {
+            return std::ptr::null();
+        };
+        let mut snap = sessions_snap().lock_recover();
+        *snap = CString::new(json).unwrap_or_default();
         if !out_len.is_null() {
             unsafe { *out_len = snap.as_bytes().len() };
         }

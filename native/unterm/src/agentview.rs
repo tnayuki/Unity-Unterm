@@ -9,6 +9,7 @@
 use std::ffi::{c_void, CString};
 use std::time::Instant;
 
+use crate::browser::{BrowserView, Click};
 use crate::control::{self, Conv, Driver, RS, US};
 use crate::input::InputBox;
 use crate::mcp::McpDispatcher;
@@ -23,6 +24,24 @@ pub struct AgentView {
     fail: String,
     panel: PanelRenderer,
     input: InputBox,
+
+    /// The "All Sessions" browser, drawn in place of the transcript while
+    /// `browsing`. Created on first entry, kept across exits (cheap re-entry);
+    /// while browsing the composer doubles as its search box (the draft
+    /// composer text is stashed and restored on exit).
+    browser: Option<BrowserView>,
+    browsing: bool,
+    /// Composer draft stashed while the input box is the browser's search field.
+    stashed_draft: String,
+    /// The project root, for the browser's session store + archive file.
+    cwd: String,
+    /// Current panel size/scale/theme/font (mirrored from the host's setup calls)
+    /// so a browser created later starts in sync with the panel.
+    panel_size: (u32, u32),
+    panel_scale: f32,
+    theme_bg: [f64; 4],
+    theme_fg: [u8; 3],
+    ui_font: String,
 
     /// Vertical transcript scroll in physical px (0 = latest/bottom).
     scroll: f32,
@@ -44,6 +63,15 @@ pub struct AgentView {
     last_status: String,
     last_pending_title: String,
     last_dot: usize,
+    /// Claude Code's generated title (`ai-title`) for this session, read from its
+    /// jsonl so the tab/header matches the session picker. Empty until known;
+    /// refreshed (throttled) as the conversation grows.
+    ai_title: String,
+    ai_title_read: u64, // unix secs of the last jsonl read (throttle)
+    /// The id passed to resume this view, if any — the effective session id until
+    /// the driver re-learns it from the init event (so the title reads its jsonl
+    /// immediately on resume instead of waiting).
+    resume_id: String,
 
     // Cached NUL-terminated snapshots handed back over FFI.
     session_id_snap: CString,
@@ -73,6 +101,9 @@ impl AgentView {
         effort: String,
         claude_cmd: String,
     ) -> Self {
+        // The id we're resuming (empty for a fresh session): usable for the title
+        // read straight away, before the driver re-learns it from the init event.
+        let resume_id = resume.as_deref().unwrap_or_default().to_string();
         let (seed, resume_cwd) = match resume.as_deref() {
             Some(id) if !id.is_empty() => control::reconstruct_transcript(id),
             _ => (Conv::new(), None),
@@ -92,12 +123,21 @@ impl AgentView {
             Err(e) => (None, e.to_string()),
         };
         let mut panel = PanelRenderer::new(panel_w, panel_h);
-        panel.set_root(root);
+        panel.set_root(root.clone());
         Self {
             driver,
             fail,
             panel,
             input: InputBox::new(input_w, input_h),
+            browser: None,
+            browsing: false,
+            stashed_draft: String::new(),
+            cwd: root.to_string_lossy().into_owned(),
+            panel_size: (panel_w.max(1), panel_h.max(1)),
+            panel_scale: 1.0,
+            theme_bg: [0.05, 0.05, 0.05, 1.0],
+            theme_fg: [210, 210, 214],
+            ui_font: String::new(),
             scroll: 0.0,
             pending_ids: Vec::new(),
             pending_host_cmd: None,
@@ -107,6 +147,9 @@ impl AgentView {
             last_status: String::new(),
             last_pending_title: String::new(),
             last_dot: usize::MAX,
+            ai_title: String::new(),
+            ai_title_read: 0,
+            resume_id,
             session_id_snap: CString::default(),
             title_snap: CString::default(),
             selected_snap: CString::default(),
@@ -129,6 +172,18 @@ impl AgentView {
         }
     }
 
+    /// The session id to use now: the driver's once it's learned it from the init
+    /// event, otherwise the id we resumed with (so the title/current-highlight are
+    /// right immediately on resume instead of after init lands).
+    fn effective_id(&self) -> String {
+        let live = self.driver.as_ref().map(|d| d.session_id()).unwrap_or_default();
+        if live.is_empty() {
+            self.resume_id.clone()
+        } else {
+            live
+        }
+    }
+
     /// Whether a turn is actively running (the user sent a prompt and the agent is
     /// thinking/replying). Distinct from idle/ready, `initializing` (session
     /// startup, incl. a resume), or a spawn failure — so the host can tell real
@@ -142,8 +197,88 @@ impl AgentView {
         (self.started.elapsed().as_secs_f64() * 3.0) as usize % 4
     }
 
+    // --- Session browser ("All Sessions") -----------------------------------
+
+    /// Enter/leave the browser. While on, the panel texture shows the session
+    /// list and the composer is its search box (the draft is stashed/restored).
+    pub fn set_browsing(&mut self, on: bool) {
+        if on == self.browsing {
+            return;
+        }
+        self.browsing = on;
+        if on {
+            // Snapshot the fields the browser needs before the mutable borrow.
+            let (w, h) = self.panel_size;
+            let scale = self.panel_scale;
+            let bg = self.theme_bg;
+            let clear = wgpu::Color { r: bg[0], g: bg[1], b: bg[2], a: bg[3] };
+            let fg = glyphon::Color::rgb(self.theme_fg[0], self.theme_fg[1], self.theme_fg[2]);
+            let family = resolve_family(&self.ui_font);
+            let current = self.effective_id();
+            let cwd = self.cwd.clone();
+            let b = self
+                .browser
+                .get_or_insert_with(|| BrowserView::new(w, h, cwd));
+            b.resize(w, h);
+            b.set_scale(scale);
+            b.set_theme(clear, fg);
+            b.set_font(family);
+            b.set_current(&current);
+            b.set_scroll(0.0);
+            self.stashed_draft = self.input.text();
+            self.input.clear();
+        } else {
+            let draft = std::mem::take(&mut self.stashed_draft);
+            self.input.set_text(&draft);
+        }
+    }
+
+    pub fn browsing(&self) -> bool {
+        self.browsing
+    }
+
+    /// Pointer motion over the browser list (hover highlight + icon). Returns
+    /// true when the hover state changed (host should re-render + repaint).
+    pub fn browse_hover(&mut self, x: f32, y: f32) -> bool {
+        match (self.browsing, &mut self.browser) {
+            (true, Some(b)) => b.hover(x, y),
+            _ => false,
+        }
+    }
+
+    /// Toggle showing archived sessions in the browser list.
+    pub fn browse_toggle_archived(&mut self) {
+        if let Some(b) = &mut self.browser {
+            b.toggle_show_archived();
+        }
+    }
+
+    /// How many of the browser's listed sessions are archived (for the host's
+    /// "Archived" toggle visibility).
+    pub fn browse_archived_count(&self) -> u64 {
+        self.browser.as_ref().map(|b| b.archived_count() as u64).unwrap_or(0)
+    }
+
+    /// Open a browser row as a host command: the host owns view lifetimes (it
+    /// must destroy this view and load the picked session), so hand it up.
+    /// Using an archived session makes it current again — unarchive it here
+    /// (there is no explicit unarchive anywhere else).
+    fn browse_open(&mut self, id: String, title: String) {
+        crate::sessions::set_archived(&self.cwd, &id, false);
+        self.pending_host_cmd = Some(format!("resume{US}{id}{US}{title}"));
+    }
+
     /// Pull driver state, update the buttons/indicator, and report what changed.
     pub fn poll(&mut self) -> u32 {
+        // Browser mode: the composer text is the live search query.
+        if self.browsing {
+            let query = self.input.text();
+            let dirty = match &mut self.browser {
+                Some(b) => b.poll(query.trim()),
+                None => false,
+            };
+            return if dirty { FLAG_DIRTY } else { 0 };
+        }
         let mut flags = 0u32;
         let (status, transcript_serial, pending) = match &self.driver {
             Some(d) => (d.status(), d.transcript_serial(), d.pending_view()),
@@ -165,9 +300,27 @@ impl AgentView {
             flags |= FLAG_DIRTY;
         }
 
-        if transcript_serial != self.last_transcript_serial {
+        let transcript_changed = transcript_serial != self.last_transcript_serial;
+        if transcript_changed {
             self.last_transcript_serial = transcript_serial;
             flags |= FLAG_DIRTY;
+        }
+        // Keep the tab/header title following Claude Code's generated ai-title (what
+        // the session picker shows), read from this session's jsonl. Throttled: only
+        // when the transcript changed and ≥3s since the last read, plus a first read
+        // once the id is known.
+        let sid = self.effective_id();
+        if !sid.is_empty() {
+            let now = crate::clock::now_secs();
+            let first = self.ai_title.is_empty() && self.ai_title_read == 0;
+            if first || (transcript_changed && now.saturating_sub(self.ai_title_read) >= 3) {
+                self.ai_title_read = now.max(1);
+                let next = crate::sessions::title_for(&self.cwd, &sid).unwrap_or_default();
+                if next != self.ai_title {
+                    self.ai_title = next;
+                    flags |= FLAG_DIRTY;
+                }
+            }
         }
         // While a now-relative time separator is visible, repaint on minute
         // ticks so its "12 min ago" label follows the clock; otherwise the
@@ -236,6 +389,17 @@ impl AgentView {
     }
 
     pub fn render(&mut self) {
+        if self.browsing {
+            // The browser replaces the transcript; the composer stays rendered
+            // as the search field (no Send/Stop button while browsing).
+            self.input.set_button(0);
+            if let Some(b) = &mut self.browser {
+                b.set_scroll(self.scroll);
+                b.render();
+            }
+            self.input.render();
+            return;
+        }
         let text = self.compose();
         // Stop while a turn is running, Send otherwise.
         let btn = if self.status() == "thinking" { 2 } else { 1 };
@@ -252,6 +416,12 @@ impl AgentView {
         self.panel.set_scale(scale);
         self.input.resize(iw, ih);
         self.input.set_scale(scale);
+        self.panel_size = (pw.max(1), ph.max(1));
+        self.panel_scale = scale;
+        if let Some(b) = &mut self.browser {
+            b.resize(pw, ph);
+            b.set_scale(scale);
+        }
     }
 
     pub fn set_theme(&mut self, br: f64, bg: f64, bb: f64, ba: f64, fr: u8, fg: u8, fb: u8) {
@@ -259,24 +429,46 @@ impl AgentView {
         self.panel.set_text_color(fr, fg, fb, 255);
         self.input.set_clear_color(br, bg, bb, ba);
         self.input.set_text_color(fr, fg, fb, 255);
+        self.theme_bg = [br, bg, bb, ba];
+        self.theme_fg = [fr, fg, fb];
+        if let Some(b) = &mut self.browser {
+            b.set_theme(
+                wgpu::Color { r: br, g: bg, b: bb, a: ba },
+                glyphon::Color::rgb(fr, fg, fb),
+            );
+        }
     }
 
     pub fn set_fonts(&mut self, regular: &str, bold: &str, italic: &str, bold_italic: &str) {
         self.panel.set_fonts(regular, bold, italic, bold_italic);
         if !regular.is_empty() {
             self.input.set_font(regular);
+            self.ui_font = regular.to_string();
+            if let Some(b) = &mut self.browser {
+                b.set_font(resolve_family(regular));
+            }
         }
     }
 
     // --- Textures / metrics -------------------------------------------------
 
     pub fn panel_texture(&self) -> *mut c_void {
+        if self.browsing {
+            if let Some(b) = &self.browser {
+                return b.raw_texture();
+            }
+        }
         self.panel.raw_texture()
     }
     pub fn input_texture(&self) -> *mut c_void {
         self.input.raw_texture()
     }
     pub fn content_height(&self) -> f32 {
+        if self.browsing {
+            if let Some(b) = &self.browser {
+                return b.content_height();
+            }
+        }
         self.panel.content_height()
     }
     pub fn input_height(&self) -> f32 {
@@ -400,6 +592,17 @@ impl AgentView {
     /// Mouse-down in the transcript: resolve a permission button (→ respond) or
     /// start a selection. Returns true (the host should consume the event).
     pub fn panel_down(&mut self, x: f32, y: f32) -> bool {
+        if self.browsing {
+            let click = match &mut self.browser {
+                Some(b) => b.click(x, y),
+                None => Click::None,
+            };
+            match click {
+                Click::Resume(id, title) => self.browse_open(id, title),
+                Click::Toggled | Click::None => {}
+            }
+            return true;
+        }
         if !self.pending_ids.is_empty() {
             let idx = self.panel.hit_button(x, y);
             if idx >= 0 && (idx as usize) < self.pending_ids.len() {
@@ -424,12 +627,21 @@ impl AgentView {
         true
     }
     pub fn panel_drag(&mut self, x: f32, y: f32) {
+        if self.browsing {
+            return; // no text selection in the browser list
+        }
         self.panel.selection_update(x, y);
     }
     pub fn panel_scroll_h(&mut self, x: f32, y: f32, dx: f32) -> bool {
+        if self.browsing {
+            return false;
+        }
         self.panel.scroll_h(x, y, dx)
     }
     pub fn panel_scroll_v(&mut self, x: f32, y: f32, dy: f32) -> bool {
+        if self.browsing {
+            return false; // the host scrolls the whole list via set_scroll
+        }
         self.panel.scroll_v(x, y, dy)
     }
     pub fn panel_select_all(&mut self) {
@@ -459,9 +671,16 @@ impl AgentView {
         self.input.mouse(x, y, 1);
     }
     /// A key for the composer: Enter sends, Shift+Enter (and everything else)
-    /// goes to the editor.
+    /// goes to the editor. While browsing, Enter opens the top listed session
+    /// instead of sending anything.
     pub fn input_key(&mut self, name: &str, ctrl: bool, alt: bool, shift: bool) {
         if name == "Return" && !shift {
+            if self.browsing {
+                if let Some((id, title)) = self.browser.as_ref().and_then(|b| b.first()) {
+                    self.browse_open(id, title);
+                }
+                return;
+            }
             self.send();
         } else {
             self.input.key(name, ctrl, alt, shift);
@@ -523,17 +742,39 @@ impl AgentView {
         self.session_id_snap = clean(s);
         &self.session_id_snap
     }
-    /// First user line, for the host's session index title (capped at 48 chars).
+    /// The tab/header title: Claude Code's generated title (matching the session
+    /// picker), falling back to the first user line until that's known.
     pub fn title(&mut self) -> &CString {
-        let t = self
-            .driver
-            .as_ref()
-            .map(|d| d.transcript())
-            .unwrap_or_default();
-        let title = first_user_line(&t);
+        let title = if !self.ai_title.is_empty() {
+            self.ai_title.clone()
+        } else {
+            let t = self.driver.as_ref().map(|d| d.transcript()).unwrap_or_default();
+            first_user_line(&t)
+        };
         self.title_snap = clean(title);
         &self.title_snap
     }
+}
+
+/// Resolve the host's font string (a file path or a family name) to the family
+/// name the browser's shaper can address; loads the file into the shared
+/// FontSystem when needed (same policy as the panel's font loading).
+fn resolve_family(font: &str) -> Option<String> {
+    if font.is_empty() {
+        return None;
+    }
+    if !crate::gpu::is_font_path(font) {
+        return Some(font.to_string());
+    }
+    let mut guard = crate::gpu::lock_font_system();
+    let db = guard.db_mut();
+    if db.load_font_file(font).is_err() {
+        return None;
+    }
+    db.faces()
+        .last()
+        .and_then(|f| f.families.first())
+        .map(|(name, _)| name.clone())
 }
 
 /// Append a role-`t` note block to a role-tagged transcript string.
