@@ -11,6 +11,7 @@
 
 ### Fixed
 
+- Ending a conversation's `claude` engine (on switching sessions, starting a new one, or closing the window) now shuts it down gracefully — closing its stdin so the stream-json engine exits on its own and finalizes its transcript, escalating to SIGTERM then SIGKILL only if it lingers — instead of an immediate SIGKILL.
 - The Claude Code agent composer now honours the same caret-navigation shortcuts as the code editor — word-wise motion (⌥←/→, Ctrl+←/→ on Windows/Linux), line and document ends (⌘←/→, ⌘↑/↓, Home/End), and word / line deletion (⌥/⌘+Backspace, ⌥+Delete) — which were already wired up in the editor but had been missed in the composer.
 - The text caret in the agent composer and the code editor is now hidden while the window lacks keyboard focus, instead of leaving a blinking insertion bar (and a stray thin IME text-cursor line) on a background window.
 

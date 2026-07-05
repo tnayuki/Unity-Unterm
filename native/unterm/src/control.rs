@@ -547,7 +547,9 @@ struct QOption {
 /// (via [`Driver`]). Everything the reader mutates lives behind a `Mutex` so the
 /// UI can snapshot it from another thread without coordination.
 struct State {
-    writer: Mutex<ChildStdin>,
+    /// The child's stdin. `None` after [`State::close_stdin`] signals EOF (the
+    /// stream-json engine exits cleanly on stdin close); writes then no-op.
+    writer: Mutex<Option<ChildStdin>>,
     /// Bumped whenever [`Conv`] changes. The UI polls this (cheap) instead of
     /// cloning + comparing the full transcript every editor tick, and the
     /// serialized text is rebuilt lazily in [`Driver::transcript`] — so a
@@ -586,16 +588,24 @@ impl State {
     fn write_value(&self, v: &Value) {
         // Serialize before locking; keep the critical section to one line + flush.
         let line = format!("{v}\n");
-        let mut w = self.writer.lock_recover();
-        let _ = w.write_all(line.as_bytes()).and_then(|_| w.flush());
+        if let Some(w) = self.writer.lock_recover().as_mut() {
+            let _ = w.write_all(line.as_bytes()).and_then(|_| w.flush());
+        }
     }
 
     fn write_line(&self, line: &str) {
-        let mut w = self.writer.lock_recover();
-        let _ = w
-            .write_all(line.as_bytes())
-            .and_then(|_| w.write_all(b"\n"))
-            .and_then(|_| w.flush());
+        if let Some(w) = self.writer.lock_recover().as_mut() {
+            let _ = w
+                .write_all(line.as_bytes())
+                .and_then(|_| w.write_all(b"\n"))
+                .and_then(|_| w.flush());
+        }
+    }
+
+    /// Close the child's stdin (drop it) so the stream-json engine sees EOF and
+    /// shuts down cleanly — the protocol-level "done", used before any signal.
+    fn close_stdin(&self) {
+        let _ = self.writer.lock_recover().take();
     }
 
     /// Mark the transcript changed. Serialization is deferred to
@@ -790,7 +800,7 @@ impl Driver {
         let init_id = format!("unterm-init-{}", NEXT_REQ.fetch_add(1, Ordering::Relaxed));
 
         let state = Arc::new(State {
-            writer: Mutex::new(writer),
+            writer: Mutex::new(Some(writer)),
             // Serial 1 with a serial-0 cache: the first transcript() read
             // serializes the seed lazily.
             transcript_serial: AtomicU64::new(1),
@@ -1150,15 +1160,48 @@ impl Driver {
 impl Drop for Driver {
     fn drop(&mut self) {
         self.clear_pending();
-        // Kill + reap off the calling thread so a reload never blocks Unity's
-        // main thread. Killing closes stdout, so the reader exits on its own.
+        // Close stdin now (EOF) so the engine begins its own clean shutdown, then
+        // reap off the calling thread so a reload/switch never blocks Unity's main
+        // thread. The child exiting closes stdout, so the reader exits on its own.
+        self.state.close_stdin();
         if let Some(mut child) = self.child.take() {
-            std::thread::spawn(move || {
-                let _ = child.kill();
-                let _ = child.wait();
-            });
+            std::thread::spawn(move || shutdown_child(&mut child));
         }
     }
+}
+
+/// Reap a `claude` child that's already been asked to stop (its stdin was closed,
+/// so a stream-json engine exits on its own). Wait up to ~2s for that clean exit;
+/// if it lingers, SIGTERM (Unix) then, failing that, SIGKILL. Blocking is fine —
+/// this always runs on a throwaway thread.
+fn shutdown_child(child: &mut Child) {
+    // Grace period for the stdin-EOF clean exit.
+    for _ in 0..40 {
+        match child.try_wait() {
+            Ok(Some(_)) => return, // exited cleanly on EOF
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(50)),
+            Err(_) => break,
+        }
+    }
+    // Still alive: escalate. SIGTERM first on Unix (lets atexit handlers run),
+    // then a hard kill.
+    #[cfg(unix)]
+    {
+        // SAFETY: `kill(2)` with a pid we own; it can't be reused before our
+        // `wait` below reaps it.
+        unsafe {
+            libc::kill(child.id() as libc::pid_t, libc::SIGTERM);
+        }
+        for _ in 0..20 {
+            match child.try_wait() {
+                Ok(Some(_)) => return,
+                Ok(None) => std::thread::sleep(std::time::Duration::from_millis(50)),
+                Err(_) => break,
+            }
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 /// A short, human-readable description of what a tool call will do, for the
