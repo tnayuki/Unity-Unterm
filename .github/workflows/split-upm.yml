@@ -5,6 +5,10 @@ name: Build native + publish UPM branch
 # Windows .dll on their respective runners and publishes the package — source
 # files plus the freshly built binaries — to the `upm` branch that the install
 # URL (`...git#upm`) points at.
+#
+# Structure: two symmetric, parallel build jobs (one per platform) each upload
+# their binary as an artifact, then a single platform-neutral `publish` job
+# assembles them, runs the license gate, and pushes the `upm` branch.
 
 on:
   push:
@@ -15,6 +19,31 @@ permissions:
   contents: write
 
 jobs:
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin, x86_64-apple-darwin
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: native
+
+      - name: Build universal native bundle
+        run: native/build-macos.sh release
+
+      - name: Upload dylib artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: unterm-macos-dylib
+          path: Packages/dev.tnayuki.unterm/Editor/Plugins/macOS/unterm.dylib
+          if-no-files-found: error
+
   build-windows:
     runs-on: windows-latest
     steps:
@@ -41,29 +70,30 @@ jobs:
           path: Packages/dev.tnayuki.unterm/Editor/Plugins/Windows/x86_64/unterm.dll
           if-no-files-found: error
 
-  build-and-publish:
-    needs: build-windows
-    # Only publish on version tags. Manual runs build (and license-gate)
-    # without touching the upm distribution branch.
+  publish:
+    needs: [build-macos, build-windows]
+    # Only publish on version tags. Manual runs build both platforms (and the
+    # license gate) without touching the upm distribution branch.
     if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: macos-latest
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-apple-darwin, x86_64-apple-darwin
 
       - name: Cache cargo build
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: native
 
-      - name: Build universal native bundle
-        run: native/build-macos.sh release
+      - name: Download the macOS dylib built by build-macos
+        uses: actions/download-artifact@v4
+        with:
+          name: unterm-macos-dylib
+          path: Packages/dev.tnayuki.unterm/Editor/Plugins/macOS
 
-      - name: Download the Windows DLL built by the build-windows job
+      - name: Download the Windows DLL built by build-windows
         uses: actions/download-artifact@v4
         with:
           name: unterm-windows-dll
@@ -80,8 +110,8 @@ jobs:
         run: |
           # --fail: exit non-zero on a license that isn't in about.toml's
           # `accepted` list (e.g. a GPL/AGPL/LGPL dependency that slips in), or
-          # one we can't resolve at all. This is a single job, so failing here
-          # aborts before the publish step — nothing reaches the `upm` branch.
+          # one we can't resolve at all. Failing here aborts before the publish
+          # step — nothing reaches the `upm` branch.
           cargo about generate about.hbs --fail \
             -o "../Packages/dev.tnayuki.unterm/Third Party Notices.md"
 
@@ -94,8 +124,8 @@ jobs:
           test -f "$PKG/Editor/Plugins/macOS/unterm.dylib" || { echo "dylib missing"; exit 1; }
           test -f "$PKG/Editor/Plugins/Windows/x86_64/unterm.dll" || { echo "dll missing"; exit 1; }
 
-          # Stage the package contents (including the just-built, un-tracked
-          # binary) as the root of a fresh orphan commit. The upm branch is a
+          # Stage the package contents (including the just-downloaded, un-tracked
+          # binaries) as the root of a fresh orphan commit. The upm branch is a
           # machine-generated distribution branch, so history is disposable.
           STAGE="$(mktemp -d)"
           rsync -a "$PKG/" "$STAGE/"
