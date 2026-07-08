@@ -41,6 +41,7 @@ namespace Unterm.Editor
                 {
                     "unterm", "claude", "claude code", "agent", "terminal", "download",
                     "code editor", "undo", "history", "sound", "notify", "notification", "chime",
+                    "extension", "extensions", "open",
                 },
             };
         }
@@ -97,6 +98,20 @@ namespace Unterm.Editor
                 curLimit);
             if (nextLimit != curLimit)
                 UntermCodeEditorPrefs.UndoLimit = nextLimit;
+
+            string curExts = UntermOpenExtensions.Value;
+            string nextExts = EditorGUILayout.DelayedTextField(
+                new GUIContent("Openable extensions",
+                    "Semicolon-separated file extensions the Unterm code editor claims: " +
+                    "double-clicked assets (when Unterm is the External Script Editor) and " +
+                    "file links clicked in the agent transcript. Anything else falls through " +
+                    "to Unity's own handler or the OS default app."),
+                curExts);
+            if (nextExts != curExts)
+                UntermOpenExtensions.Value = nextExts;
+            if (nextExts != UntermOpenExtensions.Default &&
+                GUILayout.Button("Reset extensions to default", GUILayout.ExpandWidth(false)))
+                UntermOpenExtensions.Value = UntermOpenExtensions.Default;
 
             EditorGUILayout.Space();
             EditorGUILayout.LabelField("Agent", EditorStyles.boldLabel);

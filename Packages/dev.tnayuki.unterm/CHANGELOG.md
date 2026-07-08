@@ -1,5 +1,15 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+- The set of file extensions the code editor opens is now its own preference (Preferences ▸ Unterm ▸ Code Editor, semicolon-separated, with a reset button) instead of borrowing Unity's C# project-generation extension settings — Unterm never generates `.csproj` files, so tying "what opens" to a generation setting that never runs was misleading. The default covers Unity's code and text formats plus the docs, configs, and native-plugin sources an agent transcript typically links (`md`, `yml`, `toml`, `rs`, `c`/`cpp`, `java`/`kt`, `swift`, shell scripts, …), so those open in-editor out of the box.
+
+### Fixed
+
+- File-path links in the Claude Code transcript now underline every existing file instead of only a hard-coded list of code extensions, and a click always opens the file somewhere: the configured script editor first, then Unity's own asset pipeline on decline (a scene link loads the scene, a prefab opens in prefab mode, an image opens in its associated app), and the OS default app for files outside the asset database — so paths like `native/**/*.rs` or `docs/*.md` no longer show an underline that does nothing when clicked.
+
 ## [0.6.0] - 2026-07-08
 
 ### Added

@@ -923,9 +923,10 @@ namespace Unterm.Editor
 
                 case EventType.MouseUp when _selecting:
                     _selecting = false;
-                    // A plain click (no drag-selection) on a file path opens it through
-                    // the configured script editor. OpenFromAgent no-ops for non-file /
-                    // non-editable tokens (the underline only marks files that exist).
+                    // A plain click (no drag-selection) on a file path opens it: the
+                    // configured script editor first, then Unity's asset pipeline or
+                    // the OS default app on decline. OpenFromAgent no-ops for tokens
+                    // that aren't existing files (matching the underline).
                     if (!_native.AgentviewPanelHasSelection(Vid))
                     {
                         string tok = _native.AgentviewPanelTokenAt(Vid, lx, ly);

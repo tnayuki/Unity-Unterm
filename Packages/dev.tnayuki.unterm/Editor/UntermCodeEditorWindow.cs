@@ -192,17 +192,25 @@ namespace Unterm.Editor
 
         // Open a file path clicked in the Claude Code transcript. `root` resolves a
         // project-relative path (the agent often reports paths relative to its
-        // working directory). Routes through the configured script editor: when Unterm
-        // is selected in External Tools the file opens here; otherwise it opens in
-        // whatever editor is configured. No-op for missing or non-editable files.
+        // working directory). The transcript underlines every existing file, so any
+        // click must land somewhere: the configured script editor first (when Unterm
+        // is selected in External Tools, code/text files open here), then Unity's
+        // asset pipeline for anything the editor declined (a scene loads, a prefab
+        // opens in prefab mode, an image in its associated app), and the OS default
+        // app for files outside the asset database. No-op only for missing files.
         public static void OpenFromAgent(string path, string root)
         {
             if (string.IsNullOrEmpty(path)) return;
             if (!Path.IsPathRooted(path) && !string.IsNullOrEmpty(root))
                 path = Path.Combine(root, path);
-            if (Directory.Exists(path) || !File.Exists(path) ||
-                !UntermExternalCodeEditor.HandlesExtension(path)) return;
-            CodeEditor.Editor.CurrentCodeEditor?.OpenProject(Path.GetFullPath(path), -1, -1);
+            if (Directory.Exists(path) || !File.Exists(path)) return;
+            string full = Path.GetFullPath(path);
+            if (CodeEditor.Editor.CurrentCodeEditor?.OpenProject(full, -1, -1) == true)
+                return;
+            string rel = FileUtil.GetProjectRelativePath(full.Replace('\\', '/'));
+            var asset = string.IsNullOrEmpty(rel) ? null : AssetDatabase.LoadMainAssetAtPath(rel);
+            if (asset != null) AssetDatabase.OpenAsset(asset);
+            else EditorUtility.OpenWithDefaultApp(full);
         }
 
         // Reuse an already-open window for the same file; otherwise a new one. `line`

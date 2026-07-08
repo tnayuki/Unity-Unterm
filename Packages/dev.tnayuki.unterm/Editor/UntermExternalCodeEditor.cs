@@ -6,6 +6,44 @@ using UnityEngine;
 namespace Unterm.Editor
 {
     /// <summary>
+    /// The file extensions the Unterm code editor claims, user-editable under
+    /// "Preferences &gt; Unterm &gt; Code Editor" (semicolon-separated; dots and
+    /// case don't matter). The VSCode/Rider packages gate opening on Unity's C#
+    /// project-generation extension settings because for them "openable" means
+    /// "part of the generated project" — Unterm generates no .csproj at all, so
+    /// borrowing a generation setting it never runs would be misleading; it keeps
+    /// its own list instead. The default covers Unity's code/text formats plus the
+    /// docs, configs and native-plugin sources an agent transcript typically links.
+    /// </summary>
+    internal static class UntermOpenExtensions
+    {
+        private const string Key = "Unterm.CodeEditor.OpenExtensions";
+
+        public const string Default =
+            "cs;uxml;uss;shader;compute;cginc;hlsl;glslinc;template;raytrace;" +
+            "asmdef;asmref;rsp;json;log;txt;xml;md;markdown;yml;yaml;toml;ini;cfg;csv;tsv;properties;" +
+            "js;ts;py;rs;lua;sh;bat;ps1;c;h;cc;cpp;hpp;mm;m;swift;java;kt;gradle;pro;plist;html;css;" +
+            "gitignore;gitattributes";
+
+        public static string Value
+        {
+            get => EditorPrefs.GetString(Key, Default);
+            set => EditorPrefs.SetString(Key, value);
+        }
+
+        /// Whether `ext` (no dot) is in the configured list. Parses on each call —
+        /// this sits behind user clicks, never a per-frame path.
+        public static bool Contains(string ext)
+        {
+            foreach (var e in Value.Split(';'))
+                if (string.Equals(e.Trim().TrimStart('.'), ext,
+                        System.StringComparison.OrdinalIgnoreCase))
+                    return true;
+            return false;
+        }
+    }
+
+    /// <summary>
     /// Registers the Unterm code editor as a selectable "External Script Editor"
     /// (Preferences &gt; External Tools). When Unterm is chosen, every script open
     /// Unity routes through the configured editor lands in
@@ -87,30 +125,16 @@ namespace Unterm.Editor
             return true;
         }
 
-        // Decides which double-clicked assets Unterm claims: the extensions Unity
-        // treats as project code — its C# project-generation set plus whatever the
-        // user added under Project Settings &gt; Editor — together with the few text
-        // formats Unity's own VSCode/Rider packages force-add. Anything else — scenes,
-        // prefabs, materials, other assets — is declined so Unity opens it with its
-        // native handler. Shared with the transcript path-click flow in
-        // <see cref="UntermCodeEditorWindow.OpenFromAgent"/>.
+        // Decides which double-clicked assets Unterm claims: the extension list
+        // configured under Preferences &gt; Unterm (<see cref="UntermOpenExtensions"/>).
+        // Anything else — scenes, prefabs, materials, other assets — is declined so
+        // Unity opens it with its native handler. The transcript path-click flow
+        // (<see cref="UntermCodeEditorWindow.OpenFromAgent"/>) reaches this through
+        // <see cref="OpenProject"/> and falls back to Unity's own open on decline.
         internal static bool HandlesExtension(string filePath)
         {
-            string ext = Path.GetExtension(filePath).TrimStart('.').ToLowerInvariant();
-            if (ext.Length == 0) return false;
-            if (ext == "json" || ext == "asmdef" || ext == "asmref" || ext == "log")
-                return true;
-            return HasExtension(EditorSettings.projectGenerationBuiltinExtensions, ext)
-                || HasExtension(EditorSettings.projectGenerationUserExtensions, ext);
-        }
-
-        private static bool HasExtension(string[] extensions, string ext)
-        {
-            if (extensions == null) return false;
-            foreach (var e in extensions)
-                if (string.Equals(e, ext, System.StringComparison.OrdinalIgnoreCase))
-                    return true;
-            return false;
+            string ext = Path.GetExtension(filePath).TrimStart('.');
+            return ext.Length > 0 && UntermOpenExtensions.Contains(ext);
         }
     }
 }
