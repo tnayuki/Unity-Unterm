@@ -63,10 +63,17 @@ namespace Unterm.Editor
         // in edit mode. A different selected external editor never reads it.
         internal static bool NextOpenPrefersPreview;
 
+        // Unity's package id, used to recognize our stored selection by identity
+        // rather than an exact path (see TryGetInstallationForPath).
+        private const string PackageId = "dev.tnayuki.unterm";
+
         // The "installation path" Unity stores as the selected editor. Unterm is
         // in-editor (no executable), but Unity's dropdown only lists installations
         // whose path exists on disk — so we key off the package's own package.json,
-        // a real file unique to this package.
+        // a real file unique to this package. When installed via UPM this resolves
+        // into `Library/PackageCache/dev.tnayuki.unterm@<hash>/`, whose `<hash>`
+        // changes on every update — so the exact string is NOT stable across updates
+        // (TryGetInstallationForPath matches by identity to survive that).
         private static readonly string EditorKey =
             Path.GetFullPath("Packages/dev.tnayuki.unterm/package.json");
 
@@ -75,10 +82,39 @@ namespace Unterm.Editor
             try
             {
                 CodeEditor.Register(new UntermExternalCodeEditor());
+                // After a package update the stored selection still points at the
+                // PREVIOUS cache path (a git/UPM install resolves to
+                // `Library/PackageCache/dev.tnayuki.unterm@<hash>/`, and `<hash>`
+                // changes each update). Opens still route here — the current-editor
+                // resolution matches by identity — but Unity's Preferences dropdown
+                // compares exact paths, so it would show Unterm as unselected. Refresh
+                // the stored path to the current one so the dropdown stays correct.
+                // Deferred so it runs once the editor is settled, not mid-registration.
+                EditorApplication.delayCall += RefreshSelectionIfOurs;
             }
             catch (System.Exception e)
             {
                 Debug.LogError("[Unterm] External editor registration failed: " + e);
+            }
+        }
+
+        // If the selected external editor is a previous build of THIS package (its
+        // cache path changed on update), re-store the current path so the selection
+        // is recognized exactly, not just by identity. No-op when it's already current
+        // or when the user has chosen a different editor.
+        private static void RefreshSelectionIfOurs()
+        {
+            try
+            {
+                // Unity stores the selection under this pref (see CodeEditor's own
+                // CurrentEditorPath); read it directly to avoid an internal API.
+                string stored = EditorPrefs.GetString("kScriptsDefaultApp", string.Empty);
+                if (stored != EditorKey && IdentifiesPackage(stored))
+                    CodeEditor.SetExternalScriptEditor(EditorKey);
+            }
+            catch (System.Exception e)
+            {
+                Debug.LogWarning("[Unterm] External editor selection refresh failed: " + e);
             }
         }
 
@@ -89,13 +125,34 @@ namespace Unterm.Editor
 
         public bool TryGetInstallationForPath(string editorPath, out CodeEditor.Installation installation)
         {
-            if (editorPath == EditorKey)
+            // Match the current path OR any package.json belonging to this package.
+            // Unity stores the selected editor as the path it had when chosen; after a
+            // package update relocates the package (the UPM cache folder's `@<hash>`
+            // changes), that stored path no longer equals `EditorKey`. Keying only off
+            // the exact string would then make Unity treat Unterm as unselected and
+            // silently route script / Markdown opens to another editor (or the OS).
+            // Recognizing it by identity keeps the selection across updates.
+            if (editorPath == EditorKey || IdentifiesPackage(editorPath))
             {
                 installation = Installations[0];
                 return true;
             }
             installation = default;
             return false;
+        }
+
+        // Whether `editorPath` is this package's `package.json`, wherever it currently
+        // resolves — embedded (`.../dev.tnayuki.unterm/package.json`) or UPM-cached
+        // (`.../dev.tnayuki.unterm@<hash>/package.json`).
+        private static bool IdentifiesPackage(string editorPath)
+        {
+            if (string.IsNullOrEmpty(editorPath)) return false;
+            if (!string.Equals(Path.GetFileName(editorPath), "package.json",
+                    System.StringComparison.OrdinalIgnoreCase))
+                return false;
+            string dir = Path.GetFileName(Path.GetDirectoryName(editorPath) ?? "");
+            return dir == PackageId
+                || dir.StartsWith(PackageId + "@", System.StringComparison.Ordinal);
         }
 
         public void Initialize(string editorInstallationPath) { }
