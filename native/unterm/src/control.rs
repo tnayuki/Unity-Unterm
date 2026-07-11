@@ -563,6 +563,11 @@ struct State {
     session_id: Mutex<String>,
     conv: Mutex<Conv>,
     remembered: Mutex<HashMap<String, bool>>, // tool_name -> allow (session "always")
+    /// Set by a user interrupt while a turn is running: the `result` that ends
+    /// the aborted turn must NOT auto-send the next queued prompt (the user just
+    /// said "stop" — firing a queued follow-up right after would undo that).
+    /// Consumed by that `result`; cleared early when the user re-engages (`send`).
+    queue_hold: AtomicBool,
     ready: AtomicBool,
     outbox: Mutex<Vec<String>>, // prompts buffered until `initialize` completes
     mcp: Option<McpDispatcher>,
@@ -810,6 +815,7 @@ impl Driver {
             session_id: Mutex::new(String::new()),
             conv: Mutex::new(seed),
             remembered: Mutex::new(HashMap::new()),
+            queue_hold: AtomicBool::new(false),
             ready: AtomicBool::new(false),
             outbox: Mutex::new(Vec::new()),
             mcp,
@@ -856,6 +862,9 @@ impl Driver {
                 return;
             }
         }
+        // Sending anything is re-engaging: a queue parked by an interrupt may
+        // drain again once the next turn ends.
+        self.state.queue_hold.store(false, Ordering::Relaxed);
         if self.state.ready.load(Ordering::Relaxed)
             && *self.state.status.lock_recover() == "thinking"
         {
@@ -978,6 +987,13 @@ impl Driver {
         if !self.state.ready.load(Ordering::Relaxed) {
             return;
         }
+        // Park the follow-up queue: the user asked the agent to stop, so the
+        // aborted turn's `result` must not immediately fire the next queued
+        // prompt. Only when a turn is actually running — an idle interrupt has
+        // no matching `result` to consume the flag.
+        if *self.state.status.lock_recover() == "thinking" {
+            self.state.queue_hold.store(true, Ordering::Relaxed);
+        }
         let id = format!("unterm-int-{}", NEXT_REQ.fetch_add(1, Ordering::Relaxed));
         self.state.write_value(&json!({
             "type": "control_request",
@@ -1033,6 +1049,24 @@ impl Driver {
             self.state.conv.lock_recover().cancel_queued(index as usize);
         }
         self.state.sync_transcript();
+    }
+
+    /// Send the oldest queued prompt now, if idle. The manual resume for a queue
+    /// parked by an interrupt (Enter on the empty composer / the Send button).
+    /// Returns false when a turn is running or nothing is queued.
+    pub fn send_next_queued(&self) -> bool {
+        if !self.state.ready.load(Ordering::Relaxed)
+            || *self.state.status.lock_recover() != "ready"
+        {
+            return false;
+        }
+        let Some(text) = self.state.conv.lock_recover().promote_first_queued() else {
+            return false;
+        };
+        self.state.sync_transcript();
+        self.state.set_status("thinking");
+        self.state.write_line(&user_line(&text));
+        true
     }
 
     /// The serialized transcript, rebuilt from [`Conv`] only when it changed
@@ -1478,9 +1512,16 @@ fn handle_message(state: &Arc<State>, v: Value) {
         }
         Some("result") => {
             // Turn finished. Send the next queued follow-up prompt as its own turn,
-            // else go idle. (An interrupt also ends in a `result`, so the queue
-            // survives an interrupt and keeps draining.)
-            let next = state.conv.lock_recover().promote_first_queued();
+            // else go idle — except when this `result` ends a turn the user just
+            // interrupted (`queue_hold`): then the queue stays parked, dimmed in
+            // the transcript, until the user sends something or fires it with
+            // Enter on the empty composer (`Driver::send_next_queued`).
+            let held = state.queue_hold.swap(false, Ordering::Relaxed);
+            let next = if held {
+                None
+            } else {
+                state.conv.lock_recover().promote_first_queued()
+            };
             if let Some(text) = next {
                 state.sync_transcript();
                 let line = user_line(&text);

@@ -541,6 +541,13 @@ impl AgentView {
         let text = self.input.text();
         let trimmed = text.trim();
         if trimmed.is_empty() {
+            // Enter (or Send) with nothing typed: fire the next queued prompt if
+            // one is waiting — the manual resume for a queue parked by an interrupt.
+            if let Some(d) = &self.driver {
+                if d.send_next_queued() {
+                    self.scroll = 0.0;
+                }
+            }
             return;
         }
         // `/login` and `/logout` are interactive built-in CLI commands (OAuth /

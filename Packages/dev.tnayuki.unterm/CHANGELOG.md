@@ -14,6 +14,7 @@
 
 - The Unterm code editor stays selected as the External Script Editor across package updates — it's now recognized by package identity rather than the exact cached path (which changes each update), so script and link opens keep landing in Unterm instead of silently falling back to another editor.
 - File-path links in the Claude Code transcript now underline every existing file instead of only a hard-coded list of code extensions, and a click always opens the file somewhere: the configured script editor first, then Unity's own asset pipeline on decline (a scene link loads the scene, a prefab opens in prefab mode, an image opens in its associated app), and the OS default app for files outside the asset database — so paths like `native/**/*.rs` or `docs/*.md` no longer show an underline that does nothing when clicked.
+- Interrupting the Claude Code agent no longer auto-fires the next queued follow-up prompt the moment the aborted turn ends — stopping the agent now means it actually stops. Queued prompts stay dimmed in the transcript; sending a new message resumes the queue as before, or press Enter (or Send) with an empty composer to fire the next queued prompt explicitly.
 
 ## [0.6.0] - 2026-07-08
 
