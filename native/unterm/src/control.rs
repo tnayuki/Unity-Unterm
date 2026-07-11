@@ -67,6 +67,12 @@ pub struct Conv {
     // tool_use ids we render via custom UI (ExitPlanMode / AskUserQuestion), so their
     // raw "▸ ToolName" line is suppressed in the transcript (incl. their tool_result).
     hidden_tools: HashSet<String>,
+    /// The tool call currently awaiting a permission decision, if any. Its block
+    /// is serialized with an `'X'` tag so the panel re-hosts it into the pinned
+    /// prompt section (with the Allow/Deny buttons) instead of showing a separate
+    /// "Permission requested" card — the tool block already names the call and
+    /// shows its command. Cleared once the decision is made.
+    awaiting_tool: Option<String>,
 }
 
 /// A quiet stretch this long between blocks gets a timestamp separator.
@@ -97,7 +103,32 @@ impl Conv {
             clock: None,
             tools: HashMap::new(),
             hidden_tools: HashSet::new(),
+            awaiting_tool: None,
         }
+    }
+
+    /// Tag the in-progress tool call awaiting permission so the panel can pin it.
+    /// Picks the in-progress (`▸`) tool whose name matches; `desc` (the salient
+    /// argument, from `describe_tool`) breaks ties when several are open. Returns
+    /// false when no such block exists (a fallback notice card is shown instead).
+    fn set_awaiting_tool(&mut self, tool_name: &str, desc: &str) -> bool {
+        let mut best: Option<&String> = None;
+        for (id, e) in &self.tools {
+            if e.glyph != "▸" || e.title != tool_name {
+                continue;
+            }
+            // Prefer an exact argument match; otherwise take any in-progress call
+            // with this name (there's usually only one).
+            if best.is_none() || (!desc.is_empty() && e.input.starts_with(desc)) {
+                best = Some(id);
+            }
+        }
+        self.awaiting_tool = best.cloned();
+        self.awaiting_tool.is_some()
+    }
+
+    fn clear_awaiting_tool(&mut self) -> bool {
+        self.awaiting_tool.take().is_some()
     }
 
     /// The creation stamp for a block appended right now: the reconstruction
@@ -181,6 +212,12 @@ impl Conv {
 
     /// Drop the `index`-th queued prompt (0-based among queued blocks only).
     fn cancel_queued(&mut self, index: usize) {
+        self.take_queued(index);
+    }
+
+    /// Remove the `index`-th queued prompt (0-based among queued blocks only) and
+    /// return its text — for send-now / pull-back-into-composer.
+    fn take_queued(&mut self, index: usize) -> Option<String> {
         let mut seen = 0;
         let mut target = None;
         for (i, b) in self.blocks.iter().enumerate() {
@@ -192,9 +229,11 @@ impl Conv {
                 seen += 1;
             }
         }
-        if let Some(i) = target {
+        target.map(|i| {
+            let text = self.blocks[i].1.clone();
             self.remove_block(i);
-        }
+            text
+        })
     }
 
     /// Remove block `i`, keeping the tool-id → block-index map consistent.
@@ -387,7 +426,16 @@ impl Conv {
                 }
                 prev = Some(stamp);
             }
-            out.push(format!("{r}{US}{t}"));
+            // The tool call awaiting permission is tagged `'X'`, so the panel pins
+            // it (with the Allow/Deny buttons) instead of leaving it inline.
+            let role = if *r == 'x'
+                && self.awaiting_tool.as_deref() == t.split(US).next()
+            {
+                'X'
+            } else {
+                *r
+            };
+            out.push(format!("{role}{US}{t}"));
         }
         out.join(&RS.to_string())
     }
@@ -512,6 +560,10 @@ enum Pending {
         tool_name: String,
         input: Value,
         title: String,
+        /// Whether the awaiting tool's own block was found and tagged (so the
+        /// buttons pin onto it). False → fall back to a "Permission requested"
+        /// notice card so the buttons still have context.
+        anchored: bool,
     },
     /// An `AskUserQuestion` tool call: the questions are presented one at a time,
     /// answers accumulate, and the whole set is returned at once. stdio mode never
@@ -568,6 +620,10 @@ struct State {
     /// said "stop" — firing a queued follow-up right after would undo that).
     /// Consumed by that `result`; cleared early when the user re-engages (`send`).
     queue_hold: AtomicBool,
+    /// A prompt to send the moment the current turn's `result` lands — set by
+    /// send-now on a queued prompt, which interrupts the running turn. Takes
+    /// priority over (and bypasses) the queue and `queue_hold`.
+    interrupt_send: Mutex<Option<String>>,
     ready: AtomicBool,
     outbox: Mutex<Vec<String>>, // prompts buffered until `initialize` completes
     mcp: Option<McpDispatcher>,
@@ -816,6 +872,7 @@ impl Driver {
             conv: Mutex::new(seed),
             remembered: Mutex::new(HashMap::new()),
             queue_hold: AtomicBool::new(false),
+            interrupt_send: Mutex::new(None),
             ready: AtomicBool::new(false),
             outbox: Mutex::new(Vec::new()),
             mcp,
@@ -893,6 +950,11 @@ impl Driver {
         let Some(p) = self.state.pending.lock_recover().take() else {
             return;
         };
+        // The decision is made: un-pin the awaiting tool block (no-op unless a
+        // permission was anchored on one).
+        if self.state.conv.lock_recover().clear_awaiting_tool() {
+            self.state.sync_transcript();
+        }
         match p {
             Pending::Permission {
                 request_id,
@@ -994,12 +1056,70 @@ impl Driver {
         if *self.state.status.lock_recover() == "thinking" {
             self.state.queue_hold.store(true, Ordering::Relaxed);
         }
+        self.cancel_pending_for_interrupt();
+        self.write_interrupt();
+    }
+
+    fn write_interrupt(&self) {
         let id = format!("unterm-int-{}", NEXT_REQ.fetch_add(1, Ordering::Relaxed));
         self.state.write_value(&json!({
             "type": "control_request",
             "request_id": id,
             "request": { "subtype": "interrupt" }
         }));
+    }
+
+    /// Resolve a pending prompt whose turn is being interrupted: deny it so the
+    /// engine's `can_use_tool` isn't left dangling and the buttons don't outlive
+    /// the (aborted) turn they belong to.
+    fn cancel_pending_for_interrupt(&self) {
+        let Some(p) = self.state.pending.lock_recover().take() else {
+            return;
+        };
+        if self.state.conv.lock_recover().clear_awaiting_tool() {
+            self.state.sync_transcript();
+        }
+        let request_id = match p {
+            Pending::Permission { request_id, .. }
+            | Pending::Question { request_id, .. }
+            | Pending::Plan { request_id, .. } => request_id,
+        };
+        self.state.write_value(&json!({
+            "type": "control_response",
+            "response": {
+                "subtype": "success",
+                "request_id": request_id,
+                "response": { "behavior": "deny", "message": "The user interrupted the turn." }
+            }
+        }));
+    }
+
+    /// Fire the `index`-th queued prompt immediately, Zed-style: any pending
+    /// permission/plan/question is denied, the running turn is interrupted, and
+    /// the prompt is sent as its own turn the moment the aborted turn's `result`
+    /// lands. When no turn is running (e.g. a queue parked by an interrupt) it
+    /// just sends.
+    pub fn send_queued_now(&self, index: u32) {
+        let text = self.state.conv.lock_recover().take_queued(index as usize);
+        let Some(text) = text else { return };
+        if self.state.ready.load(Ordering::Relaxed)
+            && *self.state.status.lock_recover() == "thinking"
+        {
+            // Promote it to a user turn in the transcript right away — the send
+            // itself waits for the aborted turn's `result`, and the message must
+            // not vanish from view while the interrupt settles.
+            {
+                self.state.conv.lock_recover().push_user(&text);
+            }
+            self.state.sync_transcript();
+            *self.state.interrupt_send.lock_recover() = Some(text);
+            self.cancel_pending_for_interrupt();
+            // No `queue_hold`: this is a send, not a stop.
+            self.write_interrupt();
+        } else {
+            self.state.sync_transcript();
+            self.send(&text);
+        }
     }
 
     /// Set the permission mode (`default`/`plan`/`acceptEdits`/`bypassPermissions`).
@@ -1051,24 +1171,6 @@ impl Driver {
         self.state.sync_transcript();
     }
 
-    /// Send the oldest queued prompt now, if idle. The manual resume for a queue
-    /// parked by an interrupt (Enter on the empty composer / the Send button).
-    /// Returns false when a turn is running or nothing is queued.
-    pub fn send_next_queued(&self) -> bool {
-        if !self.state.ready.load(Ordering::Relaxed)
-            || *self.state.status.lock_recover() != "ready"
-        {
-            return false;
-        }
-        let Some(text) = self.state.conv.lock_recover().promote_first_queued() else {
-            return false;
-        };
-        self.state.sync_transcript();
-        self.state.set_status("thinking");
-        self.state.write_line(&user_line(&text));
-        true
-    }
-
     /// The serialized transcript, rebuilt from [`Conv`] only when it changed
     /// since the last read (memoized against [`State::transcript_serial`]).
     pub fn transcript(&self) -> String {
@@ -1110,10 +1212,16 @@ impl Driver {
     pub fn pending_view(&self) -> Option<(String, Vec<(String, String, String)>)> {
         let guard = self.state.pending.lock_recover();
         match guard.as_ref()? {
-            Pending::Permission { title, .. } => {
-                // Just the tool name: the command is already shown (and expandable) in
-                // the tool block right above, so repeating it here reads as a duplicate.
-                let body = format!("Permission requested: {title}");
+            Pending::Permission { title, anchored, .. } => {
+                // When the awaiting tool's own block is pinned (`anchored`), it
+                // already names the call and shows its command, so no separate
+                // card — the buttons attach to it. Only the unanchored fallback
+                // needs a "Permission requested: {tool}" card for context.
+                let body = if *anchored {
+                    String::new()
+                } else {
+                    format!("Permission requested: {title}")
+                };
                 let opts = [
                     ("allow_once", "Allow"),
                     ("allow_always", "Always allow"),
@@ -1188,6 +1296,7 @@ impl Driver {
     /// turn doesn't keep a stale prompt up).
     pub fn clear_pending(&self) {
         *self.state.pending.lock_recover() = None;
+        self.state.conv.lock_recover().clear_awaiting_tool();
     }
 }
 
@@ -1511,12 +1620,23 @@ fn handle_message(state: &Arc<State>, v: Value) {
             state.sync_transcript();
         }
         Some("result") => {
-            // Turn finished. Send the next queued follow-up prompt as its own turn,
-            // else go idle — except when this `result` ends a turn the user just
-            // interrupted (`queue_hold`): then the queue stays parked, dimmed in
-            // the transcript, until the user sends something or fires it with
-            // Enter on the empty composer (`Driver::send_next_queued`).
+            // Turn finished. A send-now prompt (`interrupt_send`, set when the user
+            // fired a queued prompt immediately — the interrupt that got us here)
+            // goes out first. Otherwise send the next queued follow-up as its own
+            // turn, else go idle — except when this `result` ends a turn the user
+            // just stopped (`queue_hold`): then the queue stays parked until the
+            // user sends something or fires it explicitly.
+            let inject = state.interrupt_send.lock_recover().take();
             let held = state.queue_hold.swap(false, Ordering::Relaxed);
+            if let Some(text) = inject {
+                // Already shown as a user turn (see `send_queued_now`); just send.
+                // The rest of the queue is NOT parked: once this injected turn ends
+                // and the agent settles, the remaining prompts drain one at a time
+                // as usual (only an explicit Stop/Esc holds the queue at idle).
+                state.write_line(&user_line(&text));
+                state.set_status("thinking");
+                return;
+            }
             let next = if held {
                 None
             } else {
@@ -1583,11 +1703,19 @@ fn handle_control_request(state: &Arc<State>, v: &Value) {
             if let Some(allow) = remembered {
                 state.write_permission(&request_id, allow, &input);
             } else {
+                let anchored = {
+                    let mut c = state.conv.lock_recover();
+                    c.set_awaiting_tool(&tool_name, &sanitize(&describe_tool(&input)))
+                };
+                if anchored {
+                    state.sync_transcript();
+                }
                 *state.pending.lock_recover() = Some(Pending::Permission {
                     request_id,
                     tool_name,
                     input,
                     title,
+                    anchored,
                 });
             }
         }

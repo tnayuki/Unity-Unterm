@@ -75,7 +75,7 @@ impl Role {
         match c {
             'u' => Role::User,
             't' => Role::Thought,
-            'x' => Role::Tool,
+            'x' | 'X' => Role::Tool, // 'X' = the tool call awaiting a permission decision
             'q' => Role::Queued,
             'p' => Role::Plan,
             's' => Role::Stamp,
@@ -102,6 +102,10 @@ struct Block {
     tool_id: Option<String>,
     tool_preview: String,
     tool_detail: String,
+    /// Tool blocks only: this call is awaiting a permission decision, so it is
+    /// re-hosted into the pinned prompt section (with the Allow/Deny buttons)
+    /// rather than shown inline.
+    awaiting: bool,
 }
 
 /// A shaped, measured render item: one card-able, optionally-indented buffer.
@@ -181,6 +185,7 @@ fn parse_blocks(text: &str) -> Vec<Block> {
             tool_id: None,
             tool_preview: String::new(),
             tool_detail: String::new(),
+            awaiting: false,
         }];
     }
     let now = crate::clock::now_secs();
@@ -210,6 +215,7 @@ fn parse_blocks(text: &str) -> Vec<Block> {
                 tool_id: (!id.is_empty()).then(|| id.to_string()),
                 tool_preview: preview.to_string(),
                 tool_detail: detail.to_string(),
+                awaiting: tag == 'X',
             });
             continue;
         }
@@ -223,7 +229,7 @@ fn parse_blocks(text: &str) -> Vec<Block> {
                 continue; // same time as the previous separator → merge
             }
             last_stamp_label = Some(label.clone());
-            out.push(Block { role, text: label, stamp, tool_id: None, tool_preview: String::new(), tool_detail: String::new() });
+            out.push(Block { role, text: label, stamp, tool_id: None, tool_preview: String::new(), tool_detail: String::new(), awaiting: false });
             continue;
         }
         out.push(Block {
@@ -233,6 +239,7 @@ fn parse_blocks(text: &str) -> Vec<Block> {
             tool_id: None,
             tool_preview: String::new(),
             tool_detail: String::new(),
+            awaiting: false,
         });
     }
     out
@@ -284,6 +291,22 @@ pub struct PanelRenderer {
     /// click-to-toggle. Computed each render (header line only, so the unfolded
     /// detail stays drag-selectable).
     tool_rects: Vec<(u64, [f32; 4])>,
+    /// Queued-prompt cards from the last render, in queue order: the card rect,
+    /// the send-now `↑` rect, the cancel-`×` rect, and the prompt text (so a
+    /// click can pull it back into the composer). Computed each render; only the
+    /// parts visible inside the queue section are recorded.
+    queued_rects: Vec<([f32; 4], [f32; 4], [f32; 4], String)>,
+    /// Internal vertical scroll of the capped queue section (physical px).
+    queue_scroll: f32,
+    /// Max queue_scroll (queued content beyond the capped section; 0 = no scroll).
+    queue_max: f32,
+    /// The queue section's box (physical px x,y,w,h) for wheel routing, if shown.
+    queue_rect: Option<[f32; 4]>,
+    /// The pinned prompt strip's rect (physical px), when the pending notice +
+    /// buttons are re-hosted at the panel's bottom because the inline copies are
+    /// scrolled out of view. Clicks inside it must not fall through to the
+    /// transcript covered beneath.
+    strip_rect: Option<[f32; 4]>,
     /// Internal vertical scroll of the capped ExitPlanMode plan box (physical px).
     plan_scroll: f32,
     /// Max plan_scroll (content height beyond the capped box; 0 = no scroll).
@@ -376,6 +399,11 @@ impl PanelRenderer {
             hscroll: HashMap::new(),
             expanded: HashMap::new(),
             tool_rects: Vec::new(),
+            queued_rects: Vec::new(),
+            queue_scroll: 0.0,
+            queue_max: 0.0,
+            queue_rect: None,
+            strip_rect: None,
             last_frame_key: None,
             block_cache: HashMap::new(),
             swash_cache,
@@ -722,15 +750,23 @@ impl PanelRenderer {
         false
     }
 
-    /// Scroll the capped plan box under (x, y) vertically by `dy` physical px.
-    /// Returns true if the plan box consumed it (so the host keeps the event and
-    /// doesn't scroll the whole transcript).
+    /// Scroll the capped plan box or queue section under (x, y) vertically by
+    /// `dy` physical px. Returns true if one consumed it (so the host keeps the
+    /// event and doesn't scroll the whole transcript).
     pub fn scroll_v(&mut self, x: f32, y: f32, dy: f32) -> bool {
         if let Some(r) = self.plan_rect {
             if self.plan_max > 0.5
                 && x >= r[0] && x <= r[0] + r[2] && y >= r[1] && y <= r[1] + r[3]
             {
                 self.plan_scroll = (self.plan_scroll + dy).clamp(0.0, self.plan_max);
+                return true;
+            }
+        }
+        if let Some(r) = self.queue_rect {
+            if self.queue_max > 0.5
+                && x >= r[0] && x <= r[0] + r[2] && y >= r[1] && y <= r[1] + r[3]
+            {
+                self.queue_scroll = (self.queue_scroll + dy).clamp(0.0, self.queue_max);
                 return true;
             }
         }
@@ -753,6 +789,46 @@ impl PanelRenderer {
     pub fn toggle_tool(&mut self, key: u64) {
         let e = self.expanded.entry(key).or_insert(false);
         *e = !*e;
+    }
+
+    /// Whether physical-px (x, y) is inside the pinned prompt strip (so the click
+    /// must not reach the transcript covered beneath it).
+    pub fn hit_strip(&self, x: f32, y: f32) -> bool {
+        self.strip_rect
+            .map(|r| x >= r[0] && x <= r[0] + r[2] && y >= r[1] && y <= r[1] + r[3])
+            .unwrap_or(false)
+    }
+
+    /// The queue index of the send-now `↑` at physical-px (x, y), or None.
+    pub fn hit_queued_send(&self, x: f32, y: f32) -> Option<usize> {
+        for (i, (_, r, _, _)) in self.queued_rects.iter().enumerate() {
+            if x >= r[0] && x <= r[0] + r[2] && y >= r[1] && y <= r[1] + r[3] {
+                return Some(i);
+            }
+        }
+        None
+    }
+
+    /// The queue index of the cancel-`×` at physical-px (x, y), or None.
+    pub fn hit_queued_cancel(&self, x: f32, y: f32) -> Option<usize> {
+        for (i, (_, _, r, _)) in self.queued_rects.iter().enumerate() {
+            if x >= r[0] && x <= r[0] + r[2] && y >= r[1] && y <= r[1] + r[3] {
+                return Some(i);
+            }
+        }
+        None
+    }
+
+    /// The queued card body at physical-px (x, y): its queue index + prompt text
+    /// (check `hit_queued_send`/`hit_queued_cancel` first; both glyphs sit inside
+    /// the card rect).
+    pub fn hit_queued_body(&self, x: f32, y: f32) -> Option<(usize, String)> {
+        for (i, (r, _, _, text)) in self.queued_rects.iter().enumerate() {
+            if x >= r[0] && x <= r[0] + r[2] && y >= r[1] && y <= r[1] + r[3] {
+                return Some((i, text.clone()));
+            }
+        }
+        None
     }
 
     /// Index of the button at physical-px point (x, y), or -1.
@@ -811,6 +887,7 @@ impl PanelRenderer {
         self.scale.to_bits().hash(&mut h);
         self.scroll.to_bits().hash(&mut h);
         self.plan_scroll.to_bits().hash(&mut h);
+        self.queue_scroll.to_bits().hash(&mut h);
         (self.clear.r.to_bits(), self.clear.g.to_bits(), self.clear.b.to_bits(), self.clear.a.to_bits())
             .hash(&mut h);
         self.text_color.0.hash(&mut h);
@@ -928,6 +1005,13 @@ impl PanelRenderer {
         // The contiguous run of measured items produced by the plan block, if any
         // (indices into the flattened item list).
         let mut plan_range: Option<(usize, usize)> = None;
+        // Flat index of each queued block's (single) item, in transcript order —
+        // the position within this list IS the queue index `cancel_queued` takes.
+        let mut queued_flat: Vec<usize> = Vec::new();
+        // Flat index of the pending-prompt notice card (the last 'n' block), for
+        // the pinned strip below, and of the tool call awaiting permission ('X').
+        let mut notice_idx: Option<usize> = None;
+        let mut awaiting_idx: Option<usize> = None;
         let mut flat_len = 0usize;
         // The plan box reserves `card_pad` of inner padding on each side, so its
         // Markdown is measured (wrapped) at a narrower width.
@@ -941,9 +1025,12 @@ impl PanelRenderer {
             if let Some(k) = fold_key {
                 live_tool_keys.push(k);
             }
-            let unfolded = fold_key
-                .map(|k| self.expanded.get(&k).copied().unwrap_or(false))
-                .unwrap_or(false);
+            // The tool awaiting permission is force-expanded so its full command
+            // shows next to the Allow/Deny buttons (Zed-style), like a manual unfold.
+            let unfolded = (b.awaiting && has_detail)
+                || fold_key
+                    .map(|k| self.expanded.get(&k).copied().unwrap_or(false))
+                    .unwrap_or(false);
 
             let key = {
                 let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -1012,6 +1099,15 @@ impl PanelRenderer {
             if b.role == Role::Plan {
                 plan_range = Some((flat_len, flat_len + items.len()));
             }
+            if b.role == Role::Queued {
+                queued_flat.push(flat_len);
+            }
+            if b.role == Role::Notice {
+                notice_idx = Some(flat_len);
+            }
+            if b.awaiting {
+                awaiting_idx = Some(flat_len);
+            }
             flat_len += items.len();
             groups.push((key, items));
         }
@@ -1068,11 +1164,46 @@ impl PanelRenderer {
         } else {
             rows.len() as f32 * btn_h + (rows.len() as f32 - 1.0) * gap_b
         };
-        // Buttons scroll inline with the transcript (not pinned to the bottom), so
-        // no bottom strip is reserved; they're added to the content total below and
-        // placed right after the last block, `gap` beneath it.
-        let buttons_h = if rows.is_empty() { 0.0 } else { gap + button_block_h };
-        let content_bottom = height - pad;
+        // Queued follow-up prompts live in a section pinned above the composer,
+        // not in the transcript flow — they must stay visible while the turn
+        // streams (content would otherwise push them out of view). The section is
+        // RESERVED from the viewport, capped in height, and internally scrollable.
+        let queue_heights: f32 = queued_flat.iter().map(|&i| measured[i].height).sum();
+        let queue_total: f32 = queue_heights + gap_b * queued_flat.len().saturating_sub(1) as f32;
+        let queue_inner_h = if queued_flat.is_empty() {
+            0.0
+        } else {
+            queue_total.min((height * 0.3).max(btn_h * 2.0))
+        };
+        self.queue_max = (queue_total - queue_inner_h).max(0.0);
+        self.queue_scroll = self.queue_scroll.clamp(0.0, self.queue_max);
+        let queue_reserved = if queued_flat.is_empty() { 0.0 } else { queue_inner_h + gap };
+
+        // A pending prompt is pinned as its own section above the composer (and
+        // above the queue section), never inline: buttons that scroll with the
+        // transcript have to be chased to be clicked. The pinned card is either the
+        // notice card (plan / question / unanchored permission) or the awaiting
+        // tool's own block (a permission anchored on its call). Like the queue it
+        // is RESERVED from the viewport, so nothing is covered and nothing shifts
+        // while the user scrolls.
+        let pinned_idx = notice_idx.or(awaiting_idx);
+        let prompt_pinned = pinned_idx.is_some() && !self.document;
+        let notice_card_h = if prompt_pinned {
+            // Cap the card so a long notice / command can't swallow the viewport;
+            // the overflow is clipped.
+            measured[pinned_idx.unwrap()]
+                .height
+                .min((height * 0.35).max(btn_h * 2.0))
+        } else {
+            0.0
+        };
+        let prompt_inner_h = if prompt_pinned {
+            notice_card_h + if rows.is_empty() { 0.0 } else { gap_b + button_block_h }
+        } else {
+            0.0
+        };
+        let prompt_reserved = if prompt_pinned { prompt_inner_h + gap } else { 0.0 };
+        let content_bottom = height - pad - queue_reserved - prompt_reserved;
 
         // The plan box is capped: it contributes at most `plan_region_h` to the
         // laid-out height (the overflow scrolls internally), so factor that out of
@@ -1095,10 +1226,19 @@ impl PanelRenderer {
         // Bottom-anchor when the transcript overflows; `scroll` reveals older
         // content (clamped so 0 = latest, max = top). The plan box counts as its
         // capped box height, not its full content height.
-        let total: f32 = measured.iter().map(|m| m.height).sum::<f32>()
+        // Queued items and the pinned prompt are re-hosted in the pinned sections:
+        // they (and the gap each would have taken) contribute nothing to the flow.
+        let total: f32 = (measured.iter().map(|m| m.height).sum::<f32>()
             + gap * measured.len().saturating_sub(1) as f32
             - (plan_total - plan_box_h)
-            + buttons_h;
+            - queue_heights
+            - gap * queued_flat.len() as f32
+            - if prompt_pinned {
+                measured[pinned_idx.unwrap()].height + gap
+            } else {
+                0.0
+            })
+            .max(0.0);
         self.content_h = total + pad * 2.0;
         let viewport_h = content_bottom - pad;
         let mut y = if self.document {
@@ -1122,16 +1262,28 @@ impl PanelRenderer {
             bottom: self.height as i32,
         };
         let mut quads: Vec<Quad> = Vec::new();
-        // Disclosure triangles (tool fold markers) drawn at the header's right edge,
-        // outside the selectable text. Shaped here, blitted after the laid blocks.
-        let mut deco: Vec<(Buffer, f32, f32)> = Vec::new();
+        // Decorations (tool fold triangles, queued-card controls) drawn at a card's
+        // right edge, outside the selectable text. Shaped here, blitted after the
+        // laid blocks; the optional rect is an explicit clip box (queue section),
+        // None clips with the transcript.
+        let mut deco: Vec<(Buffer, f32, f32, Option<[f32; 4]>)> = Vec::new();
         self.laid.clear();
         self.tool_rects.clear();
+        self.queued_rects.clear();
         let mut live_keys: Vec<u64> = Vec::new();
         self.plan_rect = None;
         let mut plan_box_top = 0.0_f32; // y of the plan box's top (set at its first item)
         let mut plan_y = 0.0_f32; // running y inside the plan box (offset by plan_scroll)
         for (idx, m) in measured.iter().copied().enumerate() {
+            // The pinned prompt (notice card or awaiting tool block) and queued
+            // prompts are re-hosted in the pinned sections below the transcript;
+            // they take no space in the flow (both are excluded from `total`).
+            if prompt_pinned && Some(idx) == pinned_idx {
+                continue;
+            }
+            if queued_flat.binary_search(&idx).is_ok() {
+                continue;
+            }
             // Plan items: lay out inside a capped box that scrolls internally, so a
             // long plan can't push the rest off-screen. Clip every item to the box
             // and offset by `plan_scroll`; the box advances `y` by its capped height.
@@ -1266,7 +1418,7 @@ impl PanelRenderer {
                 gb.shape_until_scroll(&mut fs, false);
                 let gw = measure_width(&gb);
                 let gx = x0 + (content_w - m.indent).max(1.0) - card_pad - gw;
-                deco.push((gb, gx, y + card_pad));
+                deco.push((gb, gx, y + card_pad, None));
             }
             // Code blocks: render unwrapped, clipped to the card, with a per-block
             // horizontal scroll (clamped to how far the longest line overflows).
@@ -1314,13 +1466,18 @@ impl PanelRenderer {
         quads.extend(self.link_underline_quads());
 
         // Action buttons: placed right after the last block (scrolling with the
-        // transcript, not pinned), wrapped into rows (each row right-aligned).
-        // Positions are indexed by button so hit-testing maps a click to its option.
+        // transcript), wrapped into rows (each row right-aligned) — or, when the
+        // prompt is pinned, inside the bottom strip. Positions are indexed by
+        // button so hit-testing maps a click to its option.
         self.button_rects.clear();
+        self.strip_rect = None;
+        self.queue_rect = None;
         let mut btn_pos: Vec<(f32, f32)> = vec![(0.0, 0.0); self.buttons.len()];
-        if !rows.is_empty() {
+        let place_buttons = |block_top: f32,
+                             quads: &mut Vec<Quad>,
+                             btn_pos: &mut Vec<(f32, f32)>|
+         -> Vec<[f32; 4]> {
             let mut rects = vec![[0.0_f32; 4]; self.buttons.len()];
-            let block_top = y;
             for (ri, row) in rows.iter().enumerate() {
                 let row_w: f32 = row.iter().map(|&i| btn_w[i]).sum::<f32>()
                     + gap_b * row.len().saturating_sub(1) as f32;
@@ -1341,18 +1498,187 @@ impl PanelRenderer {
                     bx += bw + gap_b;
                 }
             }
-            self.button_rects = rects;
+            rects
+        };
+        // Everything laid from this index on belongs to the pinned bottom sections
+        // (prompt / queue) and must NOT be clipped away with the transcript text.
+        let mut strip_laid_from: Option<usize> = None;
+        if prompt_pinned || !queued_flat.is_empty() {
+            strip_laid_from = Some(self.laid.len());
+            // One opaque backdrop (the panel clear color) under both sections:
+            // scrolled transcript content extends below `content_bottom`, and
+            // quads draw in push order, so this covers its card quads; the text
+            // over them is clipped out in the area pass below.
+            quads.push(Quad {
+                x: 0.0,
+                y: content_bottom,
+                w: width,
+                h: height - content_bottom,
+                color: [
+                    self.clear.r as f32,
+                    self.clear.g as f32,
+                    self.clear.b as f32,
+                    1.0,
+                ],
+                radius: 0.0,
+            });
+            // Swallow clicks that miss the sections' controls, so they can't
+            // reach the covered transcript.
+            self.strip_rect = Some([0.0, content_bottom, width, height - content_bottom]);
         }
 
-        // Text areas: blocks (from self.laid) then button labels.
+        // The prompt section: the pinned card (notice or awaiting tool) + buttons.
+        if prompt_pinned {
+            let nm = measured[pinned_idx.unwrap()];
+            let top = content_bottom + gap;
+            quads.push(Quad {
+                x: pad,
+                y: top,
+                w: content_w,
+                h: notice_card_h,
+                color: [overlay, overlay, overlay, 0.14],
+                radius,
+            });
+            let clip = [
+                pad + card_pad,
+                top + card_pad,
+                (content_w - card_pad * 2.0).max(1.0),
+                (notice_card_h - card_pad * 2.0).max(1.0),
+            ];
+            self.laid.push(LaidBlock {
+                buffer: nm.buffer.clone(),
+                text: nm.text.clone(),
+                tx: pad + card_pad,
+                ty: top + card_pad,
+                hscroll: 0.0,
+                clip: Some(clip),
+                code_key: None,
+                max_hscroll: 0.0,
+                stamp: 0,
+            });
+            if !rows.is_empty() {
+                self.button_rects =
+                    place_buttons(top + notice_card_h + gap_b, &mut quads, &mut btn_pos);
+            }
+        }
+
+        // The queue section, at the very bottom (its space was reserved from the
+        // viewport above). Each card carries a send-now `↑` and a cancel `×`;
+        // overflow scrolls internally.
+        if !queued_flat.is_empty() {
+            let box_top = height - pad - queue_inner_h;
+            let box_bottom = box_top + queue_inner_h;
+            self.queue_rect = Some([pad, box_top, content_w, queue_inner_h]);
+            let deco_box = Some([pad, box_top, content_w, queue_inner_h]);
+            let glyph = |fs: &mut FontSystem, s: &str| -> Buffer {
+                let mut b = Buffer::new(fs, Metrics::new(font_size, line_height));
+                b.set_size(fs, None, None);
+                b.set_text(
+                    fs,
+                    s,
+                    &Attrs::new().family(faces.regular).color(dim(text_color, 150)),
+                    Shaping::Advanced,
+                    None,
+                );
+                b.shape_until_scroll(fs, false);
+                b
+            };
+            let mut qy = box_top - self.queue_scroll;
+            for &fi in &queued_flat {
+                let qm = measured[fi];
+                let top = qy.max(box_top);
+                let bot = (qy + qm.height).min(box_bottom);
+                if bot > top {
+                    // Card background, clamped to the box (quads have no clip).
+                    quads.push(Quad {
+                        x: pad,
+                        y: top,
+                        w: content_w,
+                        h: bot - top,
+                        color: [overlay, overlay, overlay, 0.05],
+                        radius,
+                    });
+                    let xb = glyph(&mut fs, "×");
+                    let ub = glyph(&mut fs, "↑");
+                    let xw = measure_width(&xb);
+                    let uw = measure_width(&ub);
+                    let xx = pad + content_w - card_pad - xw;
+                    let ux = xx - 10.0 * s - uw;
+                    deco.push((ub, ux, qy + card_pad, deco_box));
+                    deco.push((xb, xx, qy + card_pad, deco_box));
+                    // Hit targets padded out from the bare glyphs, clamped to the
+                    // visible part of the card.
+                    let row_h = (card_pad * 2.0 + line_height).min(qm.height);
+                    let clamp_r = |r: [f32; 4]| -> [f32; 4] {
+                        let t = r[1].max(box_top);
+                        let b = (r[1] + r[3]).min(box_bottom);
+                        [r[0], t, r[2], (b - t).max(0.0)]
+                    };
+                    let send_r = clamp_r([ux - 5.0 * s, qy, uw + 5.0 * s + 5.0 * s, row_h]);
+                    let cancel_r =
+                        clamp_r([xx - 5.0 * s, qy, (pad + content_w - xx) + 5.0 * s, row_h]);
+                    let clip = [
+                        pad + card_pad,
+                        top,
+                        (content_w - card_pad * 2.0).max(1.0),
+                        (bot - top).max(0.0),
+                    ];
+                    self.laid.push(LaidBlock {
+                        buffer: qm.buffer.clone(),
+                        text: qm.text.clone(),
+                        tx: pad + card_pad,
+                        ty: qy + card_pad,
+                        hscroll: 0.0,
+                        clip: Some(clip),
+                        code_key: None,
+                        max_hscroll: 0.0,
+                        stamp: 0,
+                    });
+                    self.queued_rects.push((
+                        [pad, top, content_w, bot - top],
+                        send_r,
+                        cancel_r,
+                        qm.text.clone(),
+                    ));
+                } else {
+                    // Scrolled out of the box: keep the index ↔ queue alignment
+                    // with rects nothing can hit.
+                    self.queued_rects.push(([0.0; 4], [0.0; 4], [0.0; 4], qm.text.clone()));
+                }
+                qy += qm.height + gap_b;
+            }
+            // Scroll thumb on the box's right edge when it overflows.
+            if self.queue_max > 0.5 && queue_total > 0.0 {
+                let track = queue_inner_h;
+                let thumb_h = (track * queue_inner_h / queue_total).max(20.0 * s);
+                let thumb_y = box_top + (self.queue_scroll / self.queue_max) * (track - thumb_h);
+                quads.push(Quad {
+                    x: pad + content_w - 4.0 * s,
+                    y: thumb_y,
+                    w: 3.0 * s,
+                    h: thumb_h,
+                    color: [overlay, overlay, overlay, 0.45],
+                    radius: 1.5 * s,
+                });
+            }
+        }
+
+        // Text areas: blocks (from self.laid) then button labels. Transcript text
+        // that runs under the pinned bottom sections is clipped away (the sections'
+        // own content, laid at/after `strip_laid_from`, is exempt).
         let mut areas: Vec<TextArea> = Vec::with_capacity(self.laid.len() + btn_buffers.len());
-        for l in &self.laid {
-            let b = l.clip.map_or(bounds, |c| TextBounds {
+        for (li, l) in self.laid.iter().enumerate() {
+            let mut b = l.clip.map_or(bounds, |c| TextBounds {
                 left: c[0] as i32,
                 top: c[1] as i32,
                 right: (c[0] + c[2]) as i32,
                 bottom: (c[1] + c[3]) as i32,
             });
+            if let Some(from) = strip_laid_from {
+                if li < from {
+                    b.bottom = b.bottom.min(content_bottom as i32);
+                }
+            }
             areas.push(TextArea {
                 buffer: &l.buffer,
                 left: l.tx - l.hscroll,
@@ -1375,13 +1701,33 @@ impl PanelRenderer {
                 custom_glyphs: &[],
             });
         }
-        for (buf, gx, gy) in &deco {
+        // Decorations: transcript ones (fold triangles) clip with the transcript;
+        // queue-section ones carry their box as an explicit clip rect.
+        for (buf, gx, gy, dbox) in &deco {
+            let b = match dbox {
+                Some(c) => TextBounds {
+                    left: c[0] as i32,
+                    top: c[1] as i32,
+                    right: (c[0] + c[2]) as i32,
+                    bottom: (c[1] + c[3]) as i32,
+                },
+                None => TextBounds {
+                    left: bounds.left,
+                    top: bounds.top,
+                    right: bounds.right,
+                    bottom: if strip_laid_from.is_some() {
+                        bounds.bottom.min(content_bottom as i32)
+                    } else {
+                        bounds.bottom
+                    },
+                },
+            };
             areas.push(TextArea {
                 buffer: buf,
                 left: *gx,
                 top: *gy,
                 scale: 1.0,
-                bounds,
+                bounds: b,
                 default_color: text_color,
                 custom_glyphs: &[],
             });
@@ -1544,7 +1890,13 @@ fn build_plain(
     text_color: Color,
 ) -> Measured {
     let carded = b.role.carded();
-    let inner_w = if carded { content_w - card_pad * 2.0 } else { content_w };
+    let mut inner_w = if carded { content_w - card_pad * 2.0 } else { content_w };
+    // A queued card carries a send-now `↑` and a cancel `×` pinned at its
+    // top-right corner (drawn in the placement pass); keep the wrapped text out
+    // from under them.
+    if b.role == Role::Queued {
+        inner_w -= font_size * 3.0;
+    }
     let color = match b.role {
         Role::Thought => dim(text_color, 150),
         Role::Tool => dim(text_color, 205),

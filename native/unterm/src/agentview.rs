@@ -415,8 +415,12 @@ impl AgentView {
                 push_plan(&mut text, &plan);
             }
             // A distinct card, not dim status text — and no "Thinking" indicator: the
-            // session is blocked on the user's decision, not thinking.
-            push_notice(&mut text, &title);
+            // session is blocked on the user's decision, not thinking. A permission
+            // anchored on its tool block carries an empty title (the tool block is
+            // the card); skip the notice then and let the pinned buttons attach to it.
+            if !title.is_empty() {
+                push_notice(&mut text, &title);
+            }
             return text;
         }
         let status = d.status();
@@ -541,10 +545,13 @@ impl AgentView {
         let text = self.input.text();
         let trimmed = text.trim();
         if trimmed.is_empty() {
-            // Enter (or Send) with nothing typed: fire the next queued prompt if
-            // one is waiting — the manual resume for a queue parked by an interrupt.
+            // Enter (or Send) with nothing typed fires the next queued prompt (the
+            // head of the queue) now — Zed's empty-Enter: it resumes a queue parked
+            // by an interrupt when idle, and fast-tracks the head (interrupting the
+            // running turn) while one is in flight.
             if let Some(d) = &self.driver {
-                if d.send_next_queued() {
+                if d.queue_len() > 0 {
+                    d.send_queued_now(0);
                     self.scroll = 0.0;
                 }
             }
@@ -695,6 +702,39 @@ impl AgentView {
                 self.respond_pending(&id);
                 return true;
             }
+        }
+        // Queued prompts: `↑` fires the prompt now (interrupting the running turn),
+        // `×` cancels it, and a click anywhere else on the card pulls it back into
+        // the composer for editing (appended below any text already being typed).
+        if let Some(i) = self.panel.hit_queued_send(x, y) {
+            if let Some(d) = &self.driver {
+                d.send_queued_now(i as u32);
+            }
+            self.scroll = 0.0;
+            return true;
+        }
+        if let Some(i) = self.panel.hit_queued_cancel(x, y) {
+            if let Some(d) = &self.driver {
+                d.cancel_queued(i as u32);
+            }
+            return true;
+        }
+        if let Some((i, text)) = self.panel.hit_queued_body(x, y) {
+            if let Some(d) = &self.driver {
+                d.cancel_queued(i as u32);
+            }
+            let cur = self.input.text();
+            if cur.trim().is_empty() {
+                self.input.set_text(&text);
+            } else {
+                self.input.set_text(&format!("{cur}\n{text}"));
+            }
+            return true;
+        }
+        // A click on the pinned bottom sections that missed their controls must
+        // not fall through to the transcript covered beneath.
+        if self.panel.hit_strip(x, y) {
+            return true;
         }
         // A click on a tool's header line folds/unfolds its content instead of
         // starting a selection.
