@@ -8,6 +8,8 @@
 
 - The set of file extensions the code editor opens is now its own preference (Preferences ▸ Unterm ▸ Code Editor, semicolon-separated, with a reset button) instead of borrowing Unity's C# project-generation extension settings — Unterm never generates `.csproj` files, so tying "what opens" to a generation setting that never runs was misleading. The default covers Unity's code and text formats plus the docs, configs, and native-plugin sources an agent transcript typically links (`md`, `yml`, `toml`, `rs`, `c`/`cpp`, `java`/`kt`, `swift`, shell scripts, …), so those open in-editor out of the box.
 
+- The Claude Code agent's permission requests can now be answered from the keyboard: Enter approves (only while the composer is empty, so a follow-up being typed is never swallowed as an approval) and Escape denies. Escape without a pending permission still interrupts the turn as before — refusing one tool call no longer requires the mouse or killing the whole turn. Plan approvals and the agent's multiple-choice questions keep their buttons only, since a reflexive Enter shouldn't pick an answer.
+
 ### Fixed
 
 - The Unterm code editor stays selected as the External Script Editor across package updates — it's now recognized by package identity rather than the exact cached path (which changes each update), so script and link opens keep landing in Unterm instead of silently falling back to another editor.

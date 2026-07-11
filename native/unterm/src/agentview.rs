@@ -597,6 +597,33 @@ impl AgentView {
         }
     }
 
+    /// Escape: deny a pending tool-permission request, else interrupt the turn.
+    /// Keeps Escape's "back out" meaning without killing a whole turn just to
+    /// refuse one tool call.
+    pub fn escape(&mut self) {
+        if self.permission_pending() {
+            self.respond_pending("reject_once");
+        } else {
+            self.interrupt();
+        }
+    }
+
+    /// Answer the pending prompt with option `id` and drop its buttons.
+    fn respond_pending(&mut self, id: &str) {
+        if let Some(d) = &self.driver {
+            d.respond(id);
+        }
+        self.pending_ids.clear();
+        self.panel.set_buttons(Vec::new());
+    }
+
+    /// True when the pending prompt is a tool-permission request — recognized by
+    /// its synthesized `allow_once` first option, so Question/Plan prompts (whose
+    /// options aren't a symmetric allow/deny) never get answered by a bare key.
+    fn permission_pending(&self) -> bool {
+        self.pending_ids.first().is_some_and(|id| id == "allow_once")
+    }
+
     // --- Runtime settings (mode / model / thinking) + follow-up queue ----------
 
     pub fn set_permission_mode(&self, mode: &str) {
@@ -658,11 +685,7 @@ impl AgentView {
             let idx = self.panel.hit_button(x, y);
             if idx >= 0 && (idx as usize) < self.pending_ids.len() {
                 let id = self.pending_ids[idx as usize].clone();
-                if let Some(d) = &self.driver {
-                    d.respond(&id);
-                }
-                self.pending_ids.clear();
-                self.panel.set_buttons(Vec::new());
+                self.respond_pending(&id);
                 return true;
             }
         }
@@ -730,6 +753,13 @@ impl AgentView {
                 if let Some((id, title)) = self.browser.as_ref().and_then(|b| b.first()) {
                     self.browse_open(id, title);
                 }
+                return;
+            }
+            // Enter on an empty composer answers a pending permission (Allow);
+            // with text it keeps its send/queue meaning, so a follow-up typed
+            // while the prompt is up can't be swallowed as an approval.
+            if self.permission_pending() && self.input.text().trim().is_empty() {
+                self.respond_pending("allow_once");
                 return;
             }
             self.send();

@@ -894,6 +894,15 @@ pub extern "C" fn unterm_agentview_interrupt(id: u64) {
     }
 }
 
+/// Escape pressed: deny a pending tool-permission request, else interrupt the
+/// in-flight turn.
+#[no_mangle]
+pub extern "C" fn unterm_agentview_escape(id: u64) {
+    if let Some(v) = lock_views().get_mut(&id) {
+        v.escape();
+    }
+}
+
 // --- session browser ("All Sessions", drawn in place of the transcript) -----
 
 /// Enter/leave the native session browser. While on, the panel texture shows
