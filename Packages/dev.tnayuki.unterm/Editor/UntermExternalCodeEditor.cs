@@ -55,6 +55,14 @@ namespace Unterm.Editor
     [InitializeOnLoad]
     internal sealed class UntermExternalCodeEditor : IExternalCodeEditor
     {
+        // One-shot hint: the next OpenProject should open a Markdown file in preview
+        // (rendered) rather than edit mode. Set by the transcript / preview link
+        // flow just before it routes through the generic OpenProject, and consumed
+        // (cleared) here — so only a link click in a rendered view prefers preview,
+        // while a Project-window double-click (which also lands in OpenProject) opens
+        // in edit mode. A different selected external editor never reads it.
+        internal static bool NextOpenPrefersPreview;
+
         // The "installation path" Unity stores as the selected editor. Unterm is
         // in-editor (no executable), but Unity's dropdown only lists installations
         // whose path exists on disk — so we key off the package's own package.json,
@@ -116,12 +124,15 @@ namespace Unterm.Editor
                 return true;
             }
             if (!File.Exists(filePath)) return false;
+            // Consume the one-shot preview hint (only meaningful for Markdown).
+            bool preview = NextOpenPrefersPreview;
+            NextOpenPrefersPreview = false;
             // Only claim files we consider code/text. Scenes, prefabs, materials and
             // other binary/asset opens Unity routes through here must fall through
             // (return false) so Unity's own handler opens them — otherwise a scene
             // double-click would land in the text editor.
             if (!HandlesExtension(filePath)) return false;
-            UntermCodeEditorWindow.OpenPath(filePath, line);
+            UntermCodeEditorWindow.OpenPath(filePath, line, preview);
             return true;
         }
 

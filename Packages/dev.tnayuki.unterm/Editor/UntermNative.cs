@@ -192,6 +192,8 @@ namespace Unterm.Editor
         private AvUintSetFn _edSetUndoLimit;
         // Git-diff gutter markers (optional: an older native bundle may lack them).
         private AvStrFn _edSetPath; private AvVoidFn _edRefreshDiff; private BoolFn _edPollDiff;
+        // Markdown preview (optional: an older native bundle may lack them).
+        private EdSetBoolFn _edSetPreview; private BoolFn _edPreviewActive; private AvTokenFn _edPreviewTokenAt;
         private AvVoidFn _edRender; private AvPtrFn _edRawTexture; private AvFloatFn _edContentHeight; private AvCaretFn _edCaret;
         private U64IdFn _edEditSerial;
         private AvInputKeyFn _edKey; private SetFocusFn _edSetFocus; private AvStrFn _edInsert; private AvStrFn _edSetPreedit; private AvStrFn _edSetText; private AvStrFn _edAddUsing;
@@ -360,6 +362,9 @@ namespace Unterm.Editor
             _edSetLanguage = Sym<AvStrFn>("unterm_editor_set_language");
             _edSetPath = SymOpt<AvStrFn>("unterm_editor_set_path");
             _edRefreshDiff = SymOpt<AvVoidFn>("unterm_editor_refresh_diff");
+            _edSetPreview = SymOpt<EdSetBoolFn>("unterm_editor_set_preview");
+            _edPreviewActive = SymOpt<BoolFn>("unterm_editor_preview_active");
+            _edPreviewTokenAt = SymOpt<AvTokenFn>("unterm_editor_preview_token_at");
             _edPollDiff = SymOpt<BoolFn>("unterm_editor_poll_diff");
             _edRender = Sym<AvVoidFn>("unterm_editor_render");
             _edRawTexture = Sym<AvPtrFn>("unterm_editor_raw_texture");
@@ -650,6 +655,19 @@ namespace Unterm.Editor
         public void EditorRefreshDiff(ulong id) => _edRefreshDiff?.Invoke(id);
         /// Apply a finished background git fetch; true if new markers arrived (re-render).
         public bool EditorPollDiff(ulong id) => _edPollDiff?.Invoke(id) ?? false;
+        /// Whether the native bundle supports Markdown preview (older bundles don't).
+        public bool EditorPreviewSupported => _edSetPreview != null;
+        /// Toggle Markdown-preview mode (render/texture/scroll/mouse/copy route to it).
+        public void EditorSetPreview(ulong id, bool on) => _edSetPreview?.Invoke(id, on);
+        /// Whether Markdown-preview mode is on.
+        public bool EditorPreviewActive(ulong id) => _edPreviewActive?.Invoke(id) ?? false;
+        /// The existing-file path token under (x,y) in preview mode (empty if none).
+        public string EditorPreviewTokenAt(ulong id, float x, float y)
+        {
+            if (_edPreviewTokenAt == null) return string.Empty;
+            var p = _edPreviewTokenAt(id, x, y, out UIntPtr len);
+            return Utf8(p, len);
+        }
         public void EditorRender(ulong id) => _edRender(id);
         public IntPtr EditorRawTexture(ulong id) => _edRawTexture(id);
         public float EditorContentHeight(ulong id) => _edContentHeight(id);
@@ -768,6 +786,7 @@ namespace Unterm.Editor
             _edCreate = null; _edExists = null; _edDestroy = null; _edResize = null; _edSetScale = null; _edSetUndoLimit = null;
             _edSetFont = null; _edSetTheme = null; _edSetLanguage = null; _edRender = null; _edRawTexture = null;
             _edSetPath = null; _edRefreshDiff = null; _edPollDiff = null;
+            _edSetPreview = null; _edPreviewActive = null; _edPreviewTokenAt = null;
             _edContentHeight = null; _edEditSerial = null; _edCaret = null; _edKey = null; _edSetFocus = null; _edInsert = null; _edSetPreedit = null;
             _edSetText = null; _edAddUsing = null; _edText = null; _edUndo = null; _edRedo = null; _edSelectAll = null;
             _edCopy = null; _edCut = null; _edMouse = null; _edHover = null; _edScroll = null;

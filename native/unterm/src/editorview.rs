@@ -11,6 +11,7 @@ use std::path::PathBuf;
 
 use crate::diff::DiffFetcher;
 use crate::input::InputBox;
+use crate::panel::PanelRenderer;
 
 /// Strip interior NULs so the text round-trips through a C string.
 fn clean(s: &str) -> CString {
@@ -25,6 +26,27 @@ pub struct EditorView {
     word_snap: CString,
     /// Background git-index reader feeding the diff gutter markers.
     diff: DiffFetcher,
+
+    /// Markdown-preview renderer (a [`PanelRenderer`] in document mode), created
+    /// lazily the first time preview is turned on. While `preview_on`, the render /
+    /// texture / scroll / mouse / copy paths route here instead of `edit`, so the
+    /// window blits the rendered Markdown of the LIVE buffer (unsaved edits
+    /// included) without a second copy of the text. `edit` stays the source of
+    /// truth; preview is read-only.
+    preview: Option<PanelRenderer>,
+    preview_on: bool,
+    /// Cached geometry / theme / font / link-root, so a lazily-created preview is
+    /// configured to match `edit` and stays in sync as the host pushes changes.
+    width: u32,
+    height: u32,
+    scale: f32,
+    clear: (f64, f64, f64, f64),
+    fg: (u8, u8, u8),
+    font_path: String,
+    root: PathBuf,
+    /// Preview vertical scroll in physical px (0 = top); its own offset so
+    /// toggling preview doesn't disturb the editor's scroll position.
+    pv_scroll: f32,
 }
 
 impl EditorView {
@@ -41,7 +63,59 @@ impl EditorView {
             cut_snap: CString::default(),
             word_snap: CString::default(),
             diff: DiffFetcher::new(),
+            preview: None,
+            preview_on: false,
+            width,
+            height,
+            scale,
+            clear: (0.051, 0.051, 0.051, 1.0),
+            fg: (210, 210, 214),
+            font_path: String::new(),
+            root: PathBuf::new(),
+            pv_scroll: 0.0,
         }
+    }
+
+    /// Build + configure the preview renderer from the cached geometry/theme/font,
+    /// if it doesn't exist yet.
+    fn ensure_preview(&mut self) {
+        if self.preview.is_some() {
+            return;
+        }
+        let mut p = PanelRenderer::new(self.width, self.height);
+        p.set_document(true);
+        p.set_scale(self.scale);
+        p.set_clear_color(self.clear.0, self.clear.1, self.clear.2, self.clear.3);
+        p.set_text_color(self.fg.0, self.fg.1, self.fg.2, 255);
+        if !self.font_path.is_empty() {
+            p.set_fonts(&self.font_path, &self.font_path, &self.font_path, &self.font_path);
+        }
+        p.set_root(self.root.clone());
+        self.preview = Some(p);
+    }
+
+    /// Toggle Markdown-preview mode (the window feeds the current buffer text).
+    pub fn set_preview(&mut self, on: bool) {
+        self.preview_on = on;
+        if on {
+            self.ensure_preview();
+        }
+    }
+
+    pub fn preview_active(&self) -> bool {
+        self.preview_on
+    }
+
+    /// The (existing-file) path token under a physical-px point in preview mode,
+    /// for click-to-open; empty when not over one or not previewing.
+    pub fn preview_token_at(&mut self, x: f32, y: f32) -> &CString {
+        let tok = if self.preview_on {
+            self.preview.as_ref().and_then(|p| p.token_at(x, y)).unwrap_or_default()
+        } else {
+            String::new()
+        };
+        self.word_snap = clean(&tok);
+        &self.word_snap
     }
 
     /// Point the diff gutter at `path` (empty = clear) and kick a background fetch
@@ -49,6 +123,16 @@ impl EditorView {
     pub fn set_path(&mut self, path: &str) {
         let p = path.trim();
         self.diff.set_path(if p.is_empty() { None } else { Some(PathBuf::from(p)) });
+        // Preview link resolution: a Markdown file's relative paths resolve against
+        // its own directory. Empty path → project cwd (empty root).
+        self.root = if p.is_empty() {
+            PathBuf::new()
+        } else {
+            PathBuf::from(p).parent().map(|d| d.to_path_buf()).unwrap_or_default()
+        };
+        if let Some(pr) = self.preview.as_mut() {
+            pr.set_root(self.root.clone());
+        }
     }
 
     /// Re-fetch the git texts (call on focus / after save / branch change).
@@ -68,12 +152,23 @@ impl EditorView {
     }
 
     pub fn resize(&mut self, w: u32, h: u32, scale: f32) {
+        self.width = w.max(1);
+        self.height = h.max(1);
+        self.scale = scale;
         self.edit.set_scale(scale);
         self.edit.resize(w, h);
+        if let Some(p) = self.preview.as_mut() {
+            p.set_scale(scale);
+            p.resize(self.width, self.height);
+        }
     }
 
     pub fn set_scale(&mut self, scale: f32) {
+        self.scale = scale;
         self.edit.set_scale(scale);
+        if let Some(p) = self.preview.as_mut() {
+            p.set_scale(scale);
+        }
     }
 
     pub fn set_undo_limit(&mut self, limit: usize) {
@@ -81,14 +176,26 @@ impl EditorView {
     }
 
     pub fn set_font(&mut self, path: &str) {
+        self.font_path = path.to_string();
         self.edit.set_font(path);
+        if !path.is_empty() {
+            if let Some(p) = self.preview.as_mut() {
+                p.set_fonts(path, path, path, path);
+            }
+        }
     }
 
     /// Background rgba + foreground rgb, plus the syntect-vs-dark highlight theme.
     pub fn set_theme(&mut self, br: f64, bg: f64, bb: f64, ba: f64, fr: u8, fg: u8, fb: u8, dark: bool) {
+        self.clear = (br, bg, bb, ba);
+        self.fg = (fr, fg, fb);
         self.edit.set_clear_color(br, bg, bb, ba);
         self.edit.set_text_color(fr, fg, fb, 255);
         self.edit.set_dark(dark);
+        if let Some(p) = self.preview.as_mut() {
+            p.set_clear_color(br, bg, bb, ba);
+            p.set_text_color(fr, fg, fb, 255);
+        }
     }
 
     /// Tree-sitter language token (e.g. "cs"); empty = plain.
@@ -98,14 +205,36 @@ impl EditorView {
     }
 
     pub fn render(&mut self) {
-        self.edit.render();
+        if self.preview_on {
+            self.ensure_preview();
+            let text = self.edit.text();
+            if let Some(p) = self.preview.as_mut() {
+                // Clamp before rendering so the scrollbar and the layout agree.
+                let max = (p.content_height() - self.height as f32).max(0.0);
+                self.pv_scroll = self.pv_scroll.clamp(0.0, max);
+                p.set_scroll(self.pv_scroll);
+                p.render(&text);
+            }
+        } else {
+            self.edit.render();
+        }
     }
 
     pub fn raw_texture(&self) -> *mut c_void {
+        if self.preview_on {
+            if let Some(p) = self.preview.as_ref() {
+                return p.raw_texture();
+            }
+        }
         self.edit.raw_texture()
     }
 
     pub fn content_height(&self) -> f32 {
+        if self.preview_on {
+            if let Some(p) = self.preview.as_ref() {
+                return p.content_height();
+            }
+        }
         self.edit.content_height()
     }
 
@@ -146,10 +275,29 @@ impl EditorView {
     }
 
     pub fn select_all(&mut self) {
+        if self.preview_on {
+            if let Some(p) = self.preview.as_mut() {
+                p.select_all();
+            }
+            return;
+        }
         self.edit.select_all();
     }
 
     pub fn mouse(&mut self, x: f32, y: f32, kind: u8) {
+        if self.preview_on {
+            // Read-only text selection: a press starts it, a drag extends it (the
+            // window doesn't forward mouse-up to native). Double/triple-click fall
+            // back to a plain press.
+            if let Some(p) = self.preview.as_mut() {
+                if kind == 1 {
+                    p.selection_update(x, y);
+                } else {
+                    p.selection_begin(x, y);
+                }
+            }
+            return;
+        }
         self.edit.mouse(x, y, kind);
     }
 
@@ -206,18 +354,40 @@ impl EditorView {
     }
 
     pub fn scroll(&mut self, dy: f32) {
+        if self.preview_on {
+            let max = self
+                .preview
+                .as_ref()
+                .map_or(0.0, |p| (p.content_height() - self.height as f32).max(0.0));
+            self.pv_scroll = (self.pv_scroll + dy).clamp(0.0, max);
+            return;
+        }
         self.edit.scroll_by(dy);
     }
 
     pub fn scroll_h(&mut self, dx: f32) {
+        if self.preview_on {
+            return; // document preview doesn't scroll horizontally
+        }
         self.edit.scroll_h_by(dx);
     }
 
     pub fn set_scroll(&mut self, px: f32) {
+        if self.preview_on {
+            let max = self
+                .preview
+                .as_ref()
+                .map_or(0.0, |p| (p.content_height() - self.height as f32).max(0.0));
+            self.pv_scroll = px.clamp(0.0, max);
+            return;
+        }
         self.edit.set_scroll_v(px);
     }
 
     pub fn scroll_offset(&self) -> f32 {
+        if self.preview_on {
+            return self.pv_scroll;
+        }
         self.edit.scroll_offset()
     }
 
@@ -298,6 +468,15 @@ impl EditorView {
     }
 
     pub fn copy(&mut self) -> &CString {
+        if self.preview_on {
+            let sel = self
+                .preview
+                .as_ref()
+                .map(|p| p.selected_text())
+                .unwrap_or_default();
+            self.copy_snap = clean(&sel);
+            return &self.copy_snap;
+        }
         self.copy_snap = clean(&self.edit.copy().unwrap_or_default());
         &self.copy_snap
     }

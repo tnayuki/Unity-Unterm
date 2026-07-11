@@ -257,8 +257,13 @@ pub struct PanelRenderer {
     /// HiDPI factor: the panel renders at physical pixels and scales all sizes
     /// by this so text is crisp (no upscaling blur) on Retina displays.
     scale: f32,
-    /// Vertical scroll offset in physical px (0 = bottom-anchored / latest).
+    /// Vertical scroll offset in physical px. Chat: 0 = bottom-anchored (latest).
+    /// Document mode: 0 = top, increasing reveals content below.
     scroll: f32,
+    /// Document-viewer mode: content is TOP-anchored (a Markdown file read
+    /// top-down) rather than the chat's bottom-anchored transcript. No buttons /
+    /// tools / plan box / stamps appear for a plain file, so those paths stay inert.
+    document: bool,
     /// Laid-out content height in physical px (for the host's scrollbar).
     content_h: f32,
     /// Action buttons (e.g. permission options) drawn pinned at the bottom.
@@ -356,6 +361,7 @@ impl PanelRenderer {
             font_bold_italic: None,
             scale: 1.0,
             scroll: 0.0,
+            document: false,
             content_h: 0.0,
             plan_scroll: 0.0,
             plan_max: 0.0,
@@ -442,6 +448,12 @@ impl PanelRenderer {
     /// Scroll offset in physical px (0 = bottom). Clamped during layout.
     pub fn set_scroll(&mut self, scroll: f32) {
         self.scroll = scroll.max(0.0);
+    }
+
+    /// Document-viewer mode: top-anchor the content (0 = top) instead of the
+    /// chat transcript's bottom anchor. Used by the code editor's Markdown preview.
+    pub fn set_document(&mut self, on: bool) {
+        self.document = on;
     }
 
     /// Total laid-out content height in physical px (from the last render).
@@ -1089,7 +1101,12 @@ impl PanelRenderer {
             + buttons_h;
         self.content_h = total + pad * 2.0;
         let viewport_h = content_bottom - pad;
-        let mut y = if total <= viewport_h {
+        let mut y = if self.document {
+            // Document viewer: top-anchored. `scroll` (0 = top) reveals content
+            // below; clamped so the last line can't scroll past the bottom.
+            let max_scroll = (total - viewport_h).max(0.0);
+            pad - self.scroll.min(max_scroll)
+        } else if total <= viewport_h {
             pad
         } else {
             let max_scroll = total - viewport_h;

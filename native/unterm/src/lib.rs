@@ -1605,6 +1605,34 @@ pub extern "C" fn unterm_editor_refresh_diff(id: u64) {
     with_editor(id, (), |e| e.refresh_diff());
 }
 
+/// Toggle Markdown-preview mode: while on, `render`/`raw_texture`/scroll/mouse/
+/// copy operate on a rendered-Markdown view of the live buffer (read-only).
+#[no_mangle]
+pub extern "C" fn unterm_editor_set_preview(id: u64, on: bool) {
+    with_editor(id, (), |e| e.set_preview(on));
+}
+
+/// Whether Markdown-preview mode is currently on.
+#[no_mangle]
+pub extern "C" fn unterm_editor_preview_active(id: u64) -> bool {
+    with_editor(id, false, |e| e.preview_active())
+}
+
+/// The existing-file path token under (x, y) in preview mode (for click-to-open),
+/// or an empty string. The pointer is valid until the next call on this editor.
+///
+/// # Safety
+/// `out_len` must be a valid pointer or null.
+#[no_mangle]
+pub unsafe extern "C" fn unterm_editor_preview_token_at(
+    id: u64,
+    x: f32,
+    y: f32,
+    out_len: *mut usize,
+) -> *const c_char {
+    editor_string(id, out_len, |e| e.preview_token_at(x, y))
+}
+
 /// Apply any finished background git fetch; returns true when new diff markers were
 /// applied (the host should re-render). Cheap to poll each editor tick.
 #[no_mangle]

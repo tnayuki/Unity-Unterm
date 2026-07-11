@@ -65,6 +65,9 @@ notify = { version = "6", default-features = false, features = ["macos_fsevent"]
 timeago = { version = "0.6.1", default-features = false, features = ["isolang", "translations"] }
 isolang = { version = "2.4.0", default-features = false }
 
+# Markdown syntax highlighting / preview in the code editor.
+tree-sitter-md = "0.5.3"
+
 # Graceful child shutdown: SIGTERM the `claude` process before falling back to
 # SIGKILL, so it can finalize its transcript (std's Child::kill is SIGKILL-only).
 [target.'cfg(unix)'.dependencies]

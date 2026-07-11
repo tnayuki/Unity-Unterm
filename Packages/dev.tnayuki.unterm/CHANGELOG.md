@@ -4,6 +4,8 @@
 
 ### Added
 
+- The code editor now syntax-highlights Markdown while editing and can render it (toggle Preview with ⇧⌘V, or the tab ⋮ / right-click menu); a `.md` opened from a transcript or preview link opens rendered by default, while a Project double-click opens for editing.
+
 - The set of file extensions the code editor opens is now its own preference (Preferences ▸ Unterm ▸ Code Editor, semicolon-separated, with a reset button) instead of borrowing Unity's C# project-generation extension settings — Unterm never generates `.csproj` files, so tying "what opens" to a generation setting that never runs was misleading. The default covers Unity's code and text formats plus the docs, configs, and native-plugin sources an agent transcript typically links (`md`, `yml`, `toml`, `rs`, `c`/`cpp`, `java`/`kt`, `swift`, shell scripts, …), so those open in-editor out of the box.
 
 ### Fixed

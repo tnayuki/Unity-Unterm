@@ -97,6 +97,16 @@ namespace Unterm.Editor
         private GUIStyle _imeHidden;
         private bool _mouseDragging;
 
+        // Markdown preview: a read-only rendered view of the LIVE buffer (unsaved
+        // edits included), served by the native EditorView's document-mode panel.
+        // Only offered for Markdown files. Serialized so a domain reload keeps the
+        // mode; re-applied to the native view in LoadNative.
+        [SerializeField] private bool _preview;
+        // Preview click-to-open: the file-path token under the press, opened on a
+        // release that didn't drag (a drag is a text selection instead).
+        private bool _pvMoved;
+        private string _pvDownToken = "";
+
         // Find / replace / goto bar overlay.
         private enum BarMode { None, Find, Replace, Goto }
         private BarMode _bar = BarMode.None;
@@ -205,8 +215,21 @@ namespace Unterm.Editor
                 path = Path.Combine(root, path);
             if (Directory.Exists(path) || !File.Exists(path)) return;
             string full = Path.GetFullPath(path);
-            if (CodeEditor.Editor.CurrentCodeEditor?.OpenProject(full, -1, -1) == true)
-                return;
+            // A link clicked in a rendered view (the agent transcript or a Markdown
+            // preview) is a reading action, so a linked Markdown file opens in
+            // preview by default. The hint is honored only by Unterm's OpenProject
+            // (a different selected external editor ignores it and opens normally);
+            // clear it afterwards so it can't leak into a later, unrelated open.
+            UntermExternalCodeEditor.NextOpenPrefersPreview = IsMarkdownPath(full);
+            try
+            {
+                if (CodeEditor.Editor.CurrentCodeEditor?.OpenProject(full, -1, -1) == true)
+                    return;
+            }
+            finally
+            {
+                UntermExternalCodeEditor.NextOpenPrefersPreview = false;
+            }
             string rel = FileUtil.GetProjectRelativePath(full.Replace('\\', '/'));
             var asset = string.IsNullOrEmpty(rel) ? null : AssetDatabase.LoadMainAssetAtPath(rel);
             if (asset != null) AssetDatabase.OpenAsset(asset);
@@ -215,7 +238,9 @@ namespace Unterm.Editor
 
         // Reuse an already-open window for the same file; otherwise a new one. `line`
         // is 1-based (-1 = none) and jumps the caret once the editor is ready.
-        internal static void OpenPath(string path, int line = -1)
+        // `preview` opens a new Markdown window rendered rather than in edit mode; an
+        // already-open window keeps whatever mode it's in (it may be mid-edit).
+        internal static void OpenPath(string path, int line = -1, bool preview = false)
         {
             string full = Path.GetFullPath(path);
             foreach (var w in Resources.FindObjectsOfTypeAll<UntermCodeEditorWindow>())
@@ -234,6 +259,9 @@ namespace Unterm.Editor
             var win = CreateInstance<UntermCodeEditorWindow>();
             win.minSize = new Vector2(320, 200);
             DockIntoCenter(win);
+            // Set the preview intent before LoadFile: LoadFile applies it (gated to
+            // Markdown via CanPreview) once the native view is ready.
+            win._preview = preview;
             win.LoadFile(path);
             win._pendingLine = line; // applied once the native editor is ready
             win.Focus();
@@ -317,15 +345,62 @@ namespace Unterm.Editor
             return new Rect(x, y, xMax - x, yMax - y);
         }
 
-        // Extension -> tree-sitter language token (null = no grammar / plain). The
-        // first milestone only bundles C#; others fall through to plain.
+        // Extension -> tree-sitter language token (null = no grammar / plain). We
+        // bundle C# and Markdown grammars; others fall through to plain.
         private static string LangTokenFor(string path)
         {
             switch (Path.GetExtension(path).ToLowerInvariant())
             {
                 case ".cs": return "cs";
+                case ".md":
+                case ".markdown": return "md";
                 default: return null;
             }
+        }
+
+        // Whether `path` is a Markdown file (the preview toggle is offered only then).
+        internal static bool IsMarkdownPath(string path)
+        {
+            switch (Path.GetExtension(path ?? "").ToLowerInvariant())
+            {
+                case ".md":
+                case ".markdown": return true;
+                default: return false;
+            }
+        }
+
+        private bool CanPreview =>
+            _native != null && _native.EditorPreviewSupported && IsMarkdownPath(_filePath);
+
+        // Flip Markdown preview on/off. Preview is read-only, so it also drops the
+        // completion popup / signature hint and closes the find bar.
+        private void TogglePreview()
+        {
+            if (!CanPreview && !_preview) return;
+            SetPreview(!_preview);
+        }
+
+        private void SetPreview(bool on)
+        {
+            if (_native == null || _editorId == 0) return;
+            _preview = on && CanPreview;
+            _native.EditorSetPreview(Eid, _preview);
+            if (_preview)
+            {
+                CloseCompletion();
+                CloseSignatureHelp();
+                if (_bar != BarMode.None) CloseBar();
+            }
+            else
+            {
+                _refocus = true; // hand focus back to the editing surface
+                // Diff polling paused while previewing: re-read HEAD + index now so
+                // the gutter reflects any commits / staging done in the meantime.
+                _native.EditorRefreshDiff(Eid);
+            }
+            UpdateTitle();
+            RenderView();
+            Repaint();
         }
 
         // Decide the line ending to preserve: keep the file's if it has one
@@ -359,6 +434,10 @@ namespace Unterm.Editor
                 _native.EditorSetText(Eid, text);
                 _savedSerial = _native.EditorEditSerial(Eid); // baseline: just-loaded = clean
                 _native.EditorSetPath(Eid, _filePath); // fetch git texts for diff gutter markers
+                // A non-Markdown file can't be previewed: drop the mode carried over
+                // from a previously-open Markdown file in this window.
+                if (_preview && !CanPreview) _preview = false;
+                _native.EditorSetPreview(Eid, _preview);
                 RenderView();
                 Repaint();
             }
@@ -483,6 +562,11 @@ namespace Unterm.Editor
                     // made mid-compile).
                     _native.EditorRefreshDiff(Eid);
                 }
+
+                // Re-apply preview mode after a reload / re-adopt (the serialized flag
+                // is the intent; a re-adopted native view keeps its own, which may drift).
+                if (_preview && !CanPreview) _preview = false;
+                _native.EditorSetPreview(Eid, _preview);
 
                 _refocus = true;
                 RenderView();
@@ -674,13 +758,18 @@ namespace Unterm.Editor
 
             DrawBar();
 
-            DrawImeField(rect);
-            SyncIme();
-            // Don't steal focus from the find bar's field while it's open.
-            if (_bar == BarMode.None && _refocus && Event.current.type == EventType.Repaint)
+            // Preview is read-only: no hidden IME field (its commit would mutate the
+            // buffer) and no focus grab.
+            if (!_preview)
             {
-                EditorGUI.FocusTextInControl(InputControl);
-                _refocus = false;
+                DrawImeField(rect);
+                SyncIme();
+                // Don't steal focus from the find bar's field while it's open.
+                if (_bar == BarMode.None && _refocus && Event.current.type == EventType.Repaint)
+                {
+                    EditorGUI.FocusTextInControl(InputControl);
+                    _refocus = false;
+                }
             }
         }
 
@@ -695,6 +784,10 @@ namespace Unterm.Editor
             float ppp = EditorGUIUtility.pixelsPerPoint;
             float lx = (e.mousePosition.x - rect.x) * ppp;
             float ly = (e.mousePosition.y - rect.y) * ppp;
+
+            // Preview: read-only text selection + click-to-open file paths; none of
+            // the editing / gutter / breakpoint / hover-tooltip handling applies.
+            if (_preview) { HandlePreviewMouse(rect, e, lx, ly); return; }
 
             switch (e.type)
             {
@@ -732,6 +825,56 @@ namespace Unterm.Editor
                     e.Use();
                     break;
             }
+        }
+
+        // Mouse in Markdown preview: drag selects text; a click (no drag) on an
+        // underlined file-path token opens it (the same targets the transcript
+        // opens); a context click offers copy / select-all / exit.
+        private void HandlePreviewMouse(Rect rect, Event e, float lx, float ly)
+        {
+            switch (e.type)
+            {
+                case EventType.MouseDown when e.button == 0 && rect.Contains(e.mousePosition):
+                    _pvDownToken = _native.EditorPreviewTokenAt(Eid, lx, ly) ?? "";
+                    _pvMoved = false;
+                    _native.EditorMouse(Eid, lx, ly, 0); // begin selection
+                    _mouseDragging = true;
+                    RenderView(); Repaint(); e.Use();
+                    break;
+                case EventType.MouseDrag when _mouseDragging:
+                    _pvMoved = true;
+                    _native.EditorMouse(Eid, lx, ly, 1); // extend selection
+                    RenderView(); Repaint(); e.Use();
+                    break;
+                case EventType.MouseUp when _mouseDragging:
+                    _mouseDragging = false;
+                    if (!_pvMoved && !string.IsNullOrEmpty(_pvDownToken))
+                        OpenFromAgent(_pvDownToken, Path.GetDirectoryName(_filePath) ?? "");
+                    _pvDownToken = "";
+                    e.Use();
+                    break;
+                case EventType.ContextClick when rect.Contains(e.mousePosition):
+                    ShowPreviewContextMenu();
+                    e.Use();
+                    break;
+            }
+        }
+
+        private void ShowPreviewContextMenu()
+        {
+            var menu = new GenericMenu();
+            menu.AddItem(new GUIContent("Copy"), false, () =>
+            {
+                string s = _native.EditorCopy(Eid);
+                if (!string.IsNullOrEmpty(s)) EditorGUIUtility.systemCopyBuffer = s;
+            });
+            menu.AddItem(new GUIContent("Select All"), false, () =>
+            {
+                _native.EditorSelectAll(Eid); RenderView(); Repaint();
+            });
+            menu.AddSeparator("");
+            menu.AddItem(new GUIContent($"Edit (exit preview)   {KCmd}{KSep}{KShift}{KSep}V"), false, () => SetPreview(false));
+            menu.ShowAsContext();
         }
 
         private Vector2 _lastHoverPos = new Vector2(float.NaN, float.NaN);
@@ -822,6 +965,11 @@ namespace Unterm.Editor
             {
                 _native.EditorToggleComment(Eid); MarkDirty(); RenderView(); Repaint();
             });
+            if (CanPreview)
+            {
+                menu.AddSeparator("");
+                menu.AddItem(new GUIContent($"Preview Markdown   {KCmd}{KSep}{KShift}{KSep}V"), false, TogglePreview);
+            }
             menu.AddSeparator("");
             menu.AddItem(new GUIContent($"Save   {KCmd}{KSep}S"), false, Save);
             menu.ShowAsContext();
@@ -832,6 +980,11 @@ namespace Unterm.Editor
         public void AddItemsToMenu(GenericMenu menu)
         {
             if (_native == null || _editorId == 0) return;
+            if (CanPreview || _preview)
+            {
+                menu.AddItem(new GUIContent($"Preview Markdown   {KCmd}{KSep}{KShift}{KSep}V"), _preview, TogglePreview);
+                menu.AddSeparator("");
+            }
             menu.AddItem(new GUIContent($"Find…   {KCmd}{KSep}F"), false, () => OpenBar(BarMode.Find));
             menu.AddItem(new GUIContent($"Replace…   {KCmd}{KSep}{KAlt}{KSep}F"), false, () => OpenBar(BarMode.Replace));
             menu.AddItem(new GUIContent($"Go to Line…   {KCmd}{KSep}L"), false, () => OpenBar(BarMode.Goto));
@@ -863,6 +1016,29 @@ namespace Unterm.Editor
                 if ((e.command || e.control) && e.keyCode == KeyCode.G)
                 {
                     DoFind(!e.shift); e.Use(); return;
+                }
+                return;
+            }
+
+            // Markdown preview is read-only: allow copy / select-all / toggle / exit,
+            // and swallow every editing key so nothing reaches the buffer.
+            if (_preview)
+            {
+                if ((e.command || e.control) && e.shift && e.keyCode == KeyCode.V) { TogglePreview(); e.Use(); return; }
+                if (e.keyCode == KeyCode.Escape) { SetPreview(false); e.Use(); return; }
+                if (e.command || e.control)
+                {
+                    switch (e.keyCode)
+                    {
+                        case KeyCode.C:
+                        {
+                            string s = _native.EditorCopy(Eid);
+                            if (!string.IsNullOrEmpty(s)) EditorGUIUtility.systemCopyBuffer = s;
+                            e.Use(); return;
+                        }
+                        case KeyCode.A:
+                            _native.EditorSelectAll(Eid); RenderView(); Repaint(); e.Use(); return;
+                    }
                 }
                 return;
             }
@@ -970,6 +1146,8 @@ namespace Unterm.Editor
                 {
                     case KeyCode.S:
                         Save(); e.Use(); return;
+                    case KeyCode.V when e.shift && CanPreview:
+                        TogglePreview(); e.Use(); return;
                     case KeyCode.V:
                         _native.EditorInsert(Eid, EditorGUIUtility.systemCopyBuffer);
                         MarkDirty(); RenderView(); Repaint(); e.Use(); return;
@@ -1477,13 +1655,16 @@ namespace Unterm.Editor
             if (EditorApplication.timeSinceStartup - _lastExtCheck > 1.0)
             {
                 _lastExtCheck = EditorApplication.timeSinceStartup;
-                CheckExternalChange();
-                _native.EditorRefreshDiff(Eid); // background re-read of HEAD + index
+                CheckExternalChange(); // still needed in preview (file may change on disk)
+                // The diff gutter is an edit-mode surface: don't re-read git while
+                // previewing (SetPreview refreshes it again on exit).
+                if (!_preview) _native.EditorRefreshDiff(Eid); // background HEAD + index
             }
             // A background git fetch may have finished: poll every tick (cheap bool);
             // native applies it and returns true only when the git texts actually
-            // changed, so the steady-state 1s refresh doesn't cause re-renders.
-            if (_native.EditorPollDiff(Eid)) { RenderView(); Repaint(); }
+            // changed, so the steady-state 1s refresh doesn't cause re-renders. Skipped
+            // in preview (the gutter isn't shown, so there's nothing to apply).
+            if (!_preview && _native.EditorPollDiff(Eid)) { RenderView(); Repaint(); }
             PollSignatureTask();
             // While a hint is shown, re-evaluate whenever the caret moved by ANY means
             // (arrows, click, edits) so it tracks the active parameter and closes once
@@ -2037,7 +2218,8 @@ namespace Unterm.Editor
         {
             // No manual dirty marker — Unity overlays the unsaved indicator from
             // hasUnsavedChanges.
-            titleContent = new GUIContent(string.IsNullOrEmpty(_filePath) ? "Untitled" : Path.GetFileName(_filePath));
+            string name = string.IsNullOrEmpty(_filePath) ? "Untitled" : Path.GetFileName(_filePath);
+            titleContent = new GUIContent(_preview ? name + " (Preview)" : name);
         }
 
         // Cmd/Ctrl+S while this window is focused saves the file (a window-context
