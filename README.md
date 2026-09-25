@@ -1,5 +1,11 @@
 # Unity-Unterm
 
+> [!NOTE]
+> **This project is archived and no longer maintained.** I now use
+> [Hukan](https://github.com/tnayuki/hukan) — a macOS app for supervising
+> coding agents running in parallel, from a single window — together with the
+> [Unity CLI](https://docs.unity.com/en-us/unity-cli) instead.
+
 A native terminal window for the Unity Editor on macOS and Windows — a real
 PTY-backed shell rendered by a Rust/wgpu engine (zero-copy: IOSurface/Metal on
 macOS, a shared D3D12 texture on Windows) and hosted inside an `EditorWindow`.
